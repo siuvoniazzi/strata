@@ -132,10 +132,10 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
             <Sparkles size={16} />
             <strong>Structure &amp; Extract — Review Before Applying</strong>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
             <button type="button" className="btn btn-xs" onClick={handleCopyCopilotPrompt}>
               {copiedPrompt ? <Check size={12} /> : <Copy size={12} />}
-              {copiedPrompt ? 'Copied for Copilot/Chat' : 'Copy Prompt for Corporate Chat'}
+              {copiedPrompt ? 'Copied' : 'Copy Prompt'}
             </button>
             <button type="button" className="btn btn-xs btn-ghost" onClick={onOpenAiSettings}>
               <KeyRound size={12} /> AI Engine
@@ -158,6 +158,8 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
                   display: 'flex',
                   justifyContent: 'space-between',
                   alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: 8,
                   padding: '8px 12px',
                   borderRadius: 'var(--radius-sm)',
                   background: 'var(--bg-surface-subtle)',

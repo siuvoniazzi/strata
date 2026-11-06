@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
   CheckSquare,
+  ChevronLeft,
   ChevronRight,
   Compass,
   Download,
@@ -121,9 +122,17 @@ export function App() {
     person?: string;
   }>({});
 
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [isMobile, setIsMobile] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth <= 860 : false
+  );
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth > 860 : true
+  );
   const [noteListOpen, setNoteListOpen] = useState(true);
-  const [radarOpen, setRadarOpen] = useState(true);
+  const [radarOpen, setRadarOpen] = useState<boolean>(() =>
+    typeof window !== 'undefined' ? window.innerWidth > 1180 : true
+  );
+  const [mobileNotesPane, setMobileNotesPane] = useState<'list' | 'editor'>('editor');
   const [radarRequestedTab, setRadarRequestedTab] = useState<'context' | 'ask' | 'outline' | null>(null);
 
   // Sidebar inline quick-add state
@@ -178,6 +187,23 @@ export function App() {
     }
   }, [theme]);
 
+  // Track mobile viewport breakpoint and auto-close overlay drawers when entering mobile
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(max-width: 860px)');
+    const onChange = (e: MediaQueryListEvent) => {
+      setIsMobile(e.matches);
+      if (e.matches) {
+        setSidebarOpen(false);
+        setRadarOpen(false);
+      } else {
+        setSidebarOpen(true);
+      }
+    };
+    mq.addEventListener('change', onChange);
+    return () => mq.removeEventListener('change', onChange);
+  }, []);
+
   // Hydrate workspace from IndexedDB + one-time purge of v1 demo records
   useEffect(() => {
     let mounted = true;
@@ -198,6 +224,13 @@ export function App() {
             setNotes(purged.notes);
             setDirectory(purged.directory);
             setActiveNoteId(purged.notes[0]?.id || '');
+            if (
+              typeof window !== 'undefined' &&
+              window.innerWidth <= 860 &&
+              (purged.notes.length > 1 || purged.notes[0]?.title.trim() || purged.notes[0]?.body.trim())
+            ) {
+              setMobileNotesPane('list');
+            }
             await idbSet('notes', purged.notes);
             await idbSet('directory', purged.directory);
             await idbSet('demoPurgedV2', true);
@@ -216,6 +249,15 @@ export function App() {
             setNotes(hydratedNotes);
             setDirectory(savedDir);
             setActiveNoteId(hydratedNotes[0].id);
+            if (
+              typeof window !== 'undefined' &&
+              window.innerWidth <= 860 &&
+              (hydratedNotes.length > 1 ||
+                hydratedNotes[0]?.title.trim() ||
+                hydratedNotes[0]?.body.trim())
+            ) {
+              setMobileNotesPane('list');
+            }
           }
         } else {
           await idbSet('notes', seed.notes);
@@ -283,6 +325,35 @@ export function App() {
     }
   }, [undoSnapshot, dirHandle, dirPermission]);
 
+  const openNoteEditor = useCallback((id: string) => {
+    setActiveNoteId(id);
+    setMainView('notes');
+    setMobileNotesPane('editor');
+    if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+      setSidebarOpen(false);
+      setRadarOpen(false);
+    }
+  }, []);
+
+  const applyNotesFilter = useCallback((nextFilter: NoteFilter) => {
+    setMainView('notes');
+    setNoteFilter(nextFilter);
+    setNoteListOpen(true);
+    setMobileNotesPane('list');
+    if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+      setSidebarOpen(false);
+      setRadarOpen(false);
+    }
+  }, []);
+
+  const switchPrimaryView = useCallback((view: ActiveMainView) => {
+    setMainView(view);
+    if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+      setSidebarOpen(false);
+      setRadarOpen(false);
+    }
+  }, []);
+
   // Global keyboard shortcuts: Ctrl/Cmd+K (Command Palette), Alt+N (Instant New Note)
   const handleSpinUpNote = useCallback(() => {
     const inheritedScope =
@@ -303,6 +374,11 @@ export function App() {
     setNotes((prev) => [fresh, ...prev]);
     setActiveNoteId(fresh.id);
     setMainView('notes');
+    setMobileNotesPane('editor');
+    if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+      setSidebarOpen(false);
+      setRadarOpen(false);
+    }
     setTimeout(() => {
       document.getElementById('note-title-input')?.focus();
     }, 30);
@@ -414,9 +490,13 @@ export function App() {
         const fresh = makeFreshNote();
         setNotes([fresh]);
         setActiveNoteId(fresh.id);
+        setMobileNotesPane('editor');
       } else {
         setNotes(remaining);
         if (activeNoteId === noteId) setActiveNoteId(remaining[0].id);
+        if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+          setMobileNotesPane('list');
+        }
       }
       if (target.filePath && dirHandle && dirPermission === 'granted') {
         removeNestedFileIfExists(dirHandle, target.filePath);
@@ -804,6 +884,17 @@ export function App() {
 
   return (
     <div className={shellClass}>
+      {/* Mobile Slide-Over Drawer Backdrop */}
+      {isMobile && (sidebarOpen || (mainView === 'notes' && radarOpen)) && (
+        <div
+          className="mobile-drawer-backdrop no-print"
+          onClick={() => {
+            setSidebarOpen(false);
+            setRadarOpen(false);
+          }}
+        />
+      )}
+
       {/* Left Navigation Sidebar */}
       {sidebarOpen && (
         <nav className="sidebar" aria-label="Workspace Navigation">
@@ -835,14 +926,28 @@ export function App() {
               </svg>
               <span>Strata</span>
             </div>
-            <button
-              type="button"
-              className="btn btn-icon btn-ghost"
-              title="Command Palette (Ctrl+K)"
-              onClick={() => setShowCommandPalette(true)}
-            >
-              <Search size={15} />
-            </button>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <button
+                type="button"
+                className="btn btn-icon btn-ghost"
+                title="Command Palette (Ctrl+K)"
+                onClick={() => {
+                  if (isMobile) setSidebarOpen(false);
+                  setShowCommandPalette(true);
+                }}
+              >
+                <Search size={15} />
+              </button>
+              <button
+                type="button"
+                className="btn btn-icon btn-ghost mobile-only"
+                title="Close Sidebar"
+                aria-label="Close Sidebar"
+                onClick={() => setSidebarOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
           </div>
 
           <div className="sidebar-actions">
@@ -857,7 +962,7 @@ export function App() {
               <FilePlus2 size={14} />
               New Note
               <span
-                className="kbd"
+                className="kbd desktop-only"
                 style={{ background: 'rgba(255,255,255,0.2)', color: '#fff', borderColor: 'transparent' }}
               >
                 Alt+N
@@ -871,10 +976,7 @@ export function App() {
               <button
                 type="button"
                 className={`nav-item ${mainView === 'notes' && noteFilter.kind === 'all' ? 'active' : ''}`}
-                onClick={() => {
-                  setMainView('notes');
-                  setNoteFilter({ kind: 'all' });
-                }}
+                onClick={() => applyNotesFilter({ kind: 'all' })}
               >
                 <span className="nav-item-left">
                   <Layers size={14} /> All Notes
@@ -885,10 +987,7 @@ export function App() {
               <button
                 type="button"
                 className={`nav-item ${mainView === 'notes' && noteFilter.kind === 'inbox' ? 'active' : ''}`}
-                onClick={() => {
-                  setMainView('notes');
-                  setNoteFilter({ kind: 'inbox' });
-                }}
+                onClick={() => applyNotesFilter({ kind: 'inbox' })}
               >
                 <span className="nav-item-left">
                   <Inbox size={14} /> Inbox
@@ -901,7 +1000,7 @@ export function App() {
               <button
                 type="button"
                 className={`nav-item ${mainView === 'tasks' ? 'active' : ''}`}
-                onClick={() => setMainView('tasks')}
+                onClick={() => switchPrimaryView('tasks')}
               >
                 <span className="nav-item-left">
                   <CheckSquare size={14} /> Tasks
@@ -912,7 +1011,7 @@ export function App() {
               <button
                 type="button"
                 className={`nav-item ${mainView === 'decisions' ? 'active' : ''}`}
-                onClick={() => setMainView('decisions')}
+                onClick={() => switchPrimaryView('decisions')}
               >
                 <span className="nav-item-left">
                   <Gavel size={14} /> Decisions
@@ -926,7 +1025,7 @@ export function App() {
                 className={`nav-item ${mainView === 'reports' ? 'active' : ''}`}
                 onClick={() => {
                   setReportInitialFilter({});
-                  setMainView('reports');
+                  switchPrimaryView('reports');
                 }}
               >
                 <span className="nav-item-left">
@@ -937,7 +1036,7 @@ export function App() {
               <button
                 type="button"
                 className={`nav-item ${mainView === 'people' ? 'active' : ''}`}
-                onClick={() => setMainView('people')}
+                onClick={() => switchPrimaryView('people')}
               >
                 <span className="nav-item-left">
                   <Users size={14} /> Directory
@@ -974,8 +1073,7 @@ export function App() {
                     const cId = handleAddClient(sidebarClientInput.trim());
                     setSidebarClientInput('');
                     setSidebarAddingClient(false);
-                    setMainView('notes');
-                    setNoteFilter({ kind: 'client', clientId: cId });
+                    applyNotesFilter({ kind: 'client', clientId: cId });
                   }}
                 >
                   <input
@@ -1014,10 +1112,7 @@ export function App() {
                             ? 'active'
                             : ''
                         }`}
-                        onClick={() => {
-                          setMainView('notes');
-                          setNoteFilter({ kind: 'client', clientId: client.id });
-                        }}
+                        onClick={() => applyNotesFilter({ kind: 'client', clientId: client.id })}
                       >
                         <span className="nav-item-left">
                           <span className="client-dot" style={{ background: client.color }} />
@@ -1068,8 +1163,7 @@ export function App() {
                           );
                           setSidebarProjectInput('');
                           setSidebarAddingProjectFor(null);
-                          setMainView('notes');
-                          setNoteFilter({ kind: 'project', clientId: client.id, projectId: pId });
+                          applyNotesFilter({ kind: 'project', clientId: client.id, projectId: pId });
                         }}
                       >
                         <input
@@ -1104,14 +1198,13 @@ export function App() {
                               ? 'active'
                               : ''
                           }`}
-                          onClick={() => {
-                            setMainView('notes');
-                            setNoteFilter({
+                          onClick={() =>
+                            applyNotesFilter({
                               kind: 'project',
                               clientId: client.id,
                               projectId: proj.id,
-                            });
-                          }}
+                            })
+                          }
                         >
                           <span className="nav-item-left">
                             <ChevronRight size={12} />
@@ -1144,10 +1237,7 @@ export function App() {
                   className={`nav-item ${
                     mainView === 'notes' && noteFilter.kind === 'internal' ? 'active' : ''
                   }`}
-                  onClick={() => {
-                    setMainView('notes');
-                    setNoteFilter({ kind: 'internal' });
-                  }}
+                  onClick={() => applyNotesFilter({ kind: 'internal' })}
                 >
                   <span className="nav-item-left">
                     <span className="client-dot" style={{ background: 'var(--text-muted)' }} />
@@ -1182,8 +1272,7 @@ export function App() {
                     const pId = handleAddProject(sidebarProjectInput.trim(), 'internal', null);
                     setSidebarProjectInput('');
                     setSidebarAddingProjectFor(null);
-                    setMainView('notes');
-                    setNoteFilter({ kind: 'project', projectId: pId });
+                    applyNotesFilter({ kind: 'project', projectId: pId });
                   }}
                 >
                   <input
@@ -1218,13 +1307,12 @@ export function App() {
                         ? 'active'
                         : ''
                     }`}
-                    onClick={() => {
-                      setMainView('notes');
-                      setNoteFilter({
+                    onClick={() =>
+                      applyNotesFilter({
                         kind: 'project',
                         projectId: proj.id,
-                      });
-                    }}
+                      })
+                    }
                   >
                     <span className="nav-item-left">
                       <ChevronRight size={12} />
@@ -1308,13 +1396,10 @@ export function App() {
                     <span
                       key={lbl}
                       className="pill pill-label"
-                      onClick={() => {
-                        setMainView('notes');
-                        setNoteFilter({ kind: 'label', label: lbl });
-                      }}
+                      onClick={() => applyNotesFilter({ kind: 'label', label: lbl })}
                       onDoubleClick={() => {
                         setReportInitialFilter({ label: lbl });
-                        setMainView('reports');
+                        switchPrimaryView('reports');
                       }}
                       title="Click to filter notes · Double-click to open Topic Report"
                     >
@@ -1403,81 +1488,182 @@ export function App() {
       {/* Center Workspace Column */}
       <main className="main-column">
         <header className="topbar">
-          <div className="topbar-left">
-            <button
-              type="button"
-              className="btn btn-icon btn-ghost"
-              onClick={() => setSidebarOpen((v) => !v)}
-              title="Toggle Navigation Sidebar"
-            >
-              <PanelLeft size={16} />
-            </button>
+          {isMobile ? (
+            <>
+              <div className="topbar-left">
+                <button
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => {
+                    setRadarOpen(false);
+                    setSidebarOpen((v) => !v);
+                  }}
+                  title="Spaces, Clients & Sync"
+                  aria-label="Open Workspace Spaces & Sync"
+                >
+                  <PanelLeft size={17} />
+                </button>
 
-            {mainView === 'notes' && (
-              <button
-                type="button"
-                className="btn btn-xs btn-ghost"
-                onClick={() => setNoteListOpen((v) => !v)}
-              >
-                {noteListOpen ? 'Hide List' : 'Show List'}
-              </button>
-            )}
+                {mainView === 'notes' && mobileNotesPane === 'editor' ? (
+                  <button
+                    type="button"
+                    className="mobile-back-btn"
+                    onClick={() => setMobileNotesPane('list')}
+                  >
+                    <ChevronLeft size={15} />
+                    {noteFilter.kind === 'all' ? `Notes (${notes.length})` : activeBreadcrumbLabel}
+                  </button>
+                ) : (
+                  <span className="mobile-topbar-title">{activeBreadcrumbLabel}</span>
+                )}
+              </div>
 
-            <div className="breadcrumbs">
-              <span>{activeBreadcrumbLabel}</span>
-              {mainView === 'notes' && activeNote && (
-                <>
-                  <ChevronRight size={13} />
-                  <span className="breadcrumb-active">{activeNote.title || 'Untitled Note'}</span>
-                </>
-              )}
-            </div>
-          </div>
+              <div className="topbar-right">
+                {!(mainView === 'notes' && mobileNotesPane === 'list') && (
+                  <button
+                    type="button"
+                    className="btn btn-icon btn-ghost"
+                    onClick={handleSpinUpNote}
+                    title="New Note"
+                    aria-label="New Note"
+                  >
+                    <FilePlus2 size={16} />
+                  </button>
+                )}
 
-          <div className="topbar-right">
-            <button
-              type="button"
-              className="btn btn-xs"
-              onClick={() => setShowCommandPalette(true)}
-            >
-              <Search size={12} /> Quick Jump <span className="kbd">Ctrl+K</span>
-            </button>
+                <button
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => setShowCommandPalette(true)}
+                  title="Search & Quick Jump"
+                  aria-label="Search & Quick Jump"
+                >
+                  <Search size={16} />
+                </button>
 
-            <button
-              type="button"
-              className="btn btn-xs btn-ghost"
-              onClick={() => setShowAiSettings(true)}
-              title="Configure AI Provider (Local Smart Engine, Azure OpenAI, Gemini, OpenAI, Anthropic)"
-            >
-              <KeyRound size={13} />
-              {aiConfig.provider === 'local' ? 'AI: Local' : `AI: ${aiConfig.provider.toUpperCase()}`}
-            </button>
+                {mainView === 'notes' && mobileNotesPane === 'editor' && (
+                  <button
+                    type="button"
+                    className={`btn btn-icon ${radarOpen ? 'btn-soft' : 'btn-ghost'}`}
+                    onClick={() => {
+                      setSidebarOpen(false);
+                      setRadarOpen((v) => !v);
+                    }}
+                    title="Context Radar"
+                    aria-label="Toggle Context Radar"
+                  >
+                    <Compass size={16} />
+                  </button>
+                )}
 
-            <button
-              type="button"
-              className="btn btn-icon btn-ghost"
-              onClick={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
-              title="Toggle Light / Dark Theme"
-            >
-              {theme === 'light' ? <Moon size={15} /> : <Sun size={15} />}
-            </button>
+                <button
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => setShowAiSettings(true)}
+                  title="Configure AI Engine"
+                  aria-label="Configure AI Engine"
+                >
+                  <KeyRound size={15} />
+                </button>
 
-            {mainView === 'notes' && (
-              <button
-                type="button"
-                className={`btn btn-xs ${radarOpen ? 'btn-soft' : ''}`}
-                onClick={() => setRadarOpen((v) => !v)}
-                title="Toggle Context Radar Sidebar"
-              >
-                <Compass size={13} /> Context Radar
-              </button>
-            )}
-          </div>
+                <button
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
+                  title="Toggle Light / Dark Theme"
+                  aria-label="Toggle Theme"
+                >
+                  {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="topbar-left">
+                <button
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => setSidebarOpen((v) => !v)}
+                  title="Toggle Navigation Sidebar"
+                >
+                  <PanelLeft size={16} />
+                </button>
+
+                {mainView === 'notes' && (
+                  <button
+                    type="button"
+                    className="btn btn-xs btn-ghost"
+                    onClick={() => setNoteListOpen((v) => !v)}
+                  >
+                    {noteListOpen ? 'Hide List' : 'Show List'}
+                  </button>
+                )}
+
+                <div className="breadcrumbs">
+                  <span>{activeBreadcrumbLabel}</span>
+                  {mainView === 'notes' && activeNote && (
+                    <>
+                      <ChevronRight size={13} />
+                      <span className="breadcrumb-active">{activeNote.title || 'Untitled Note'}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="topbar-right">
+                <button
+                  type="button"
+                  className="btn btn-xs"
+                  onClick={() => setShowCommandPalette(true)}
+                >
+                  <Search size={12} /> Quick Jump <span className="kbd">Ctrl+K</span>
+                </button>
+
+                <button
+                  type="button"
+                  className="btn btn-xs btn-ghost"
+                  onClick={() => setShowAiSettings(true)}
+                  title="Configure AI Provider (Local Smart Engine, Azure OpenAI, Gemini, OpenAI, Anthropic)"
+                >
+                  <KeyRound size={13} />
+                  {aiConfig.provider === 'local' ? 'AI: Local' : `AI: ${aiConfig.provider.toUpperCase()}`}
+                </button>
+
+                <button
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
+                  title="Toggle Light / Dark Theme"
+                >
+                  {theme === 'light' ? <Moon size={15} /> : <Sun size={15} />}
+                </button>
+
+                {mainView === 'notes' && (
+                  <button
+                    type="button"
+                    className={`btn btn-xs ${radarOpen ? 'btn-soft' : ''}`}
+                    onClick={() => setRadarOpen((v) => !v)}
+                    title="Toggle Context Radar Sidebar"
+                  >
+                    <Compass size={13} /> Context Radar
+                  </button>
+                )}
+              </div>
+            </>
+          )}
         </header>
 
         {mainView === 'notes' && (
-          <div className={`notes-workspace ${!noteListOpen ? 'list-hidden' : ''}`}>
-            {noteListOpen && (
+          <div
+            className={[
+              'notes-workspace',
+              !isMobile && !noteListOpen ? 'list-hidden' : '',
+              isMobile ? (mobileNotesPane === 'list' ? 'mobile-pane-list' : 'mobile-pane-editor') : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+          >
+            {(isMobile || noteListOpen) && (
               <section className="note-list-pane" aria-label="Notes List">
                 <div className="note-list-header">
                   <div className="search-input-wrap">
@@ -1509,7 +1695,7 @@ export function App() {
                             className="btn btn-xs btn-soft"
                             onClick={() => {
                               setReportInitialFilter({ label: noteFilter.label });
-                              setMainView('reports');
+                              switchPrimaryView('reports');
                             }}
                           >
                             Topic Report
@@ -1562,7 +1748,7 @@ export function App() {
                           <button
                             type="button"
                             className={`note-card-item ${n.id === activeNote.id ? 'active' : ''}`}
-                            onClick={() => setActiveNoteId(n.id)}
+                            onClick={() => openNoteEditor(n.id)}
                           >
                             <div className="note-card-title">{n.title || 'Untitled Note'}</div>
                             <div className="note-card-meta">
@@ -1609,18 +1795,15 @@ export function App() {
               onEnsurePerson={handleEnsurePerson}
               onNavigateLabel={(lbl) => {
                 setReportInitialFilter({ label: lbl });
-                setMainView('reports');
+                switchPrimaryView('reports');
               }}
-              onNavigatePerson={(pName) => {
-                setNoteFilter({ kind: 'person', personName: pName });
-                setNoteListOpen(true);
-              }}
+              onNavigatePerson={(pName) => applyNotesFilter({ kind: 'person', personName: pName })}
               onNavigateOrCreateNoteByTitle={(targetTitle) => {
                 const found = notes.find(
                   (x) => x.title.toLowerCase() === targetTitle.toLowerCase()
                 );
                 if (found) {
-                  setActiveNoteId(found.id);
+                  openNoteEditor(found.id);
                 } else {
                   const created = makeFreshNote({
                     title: targetTitle,
@@ -1629,11 +1812,12 @@ export function App() {
                     projectId: activeNote.projectId,
                   });
                   setNotes((prev) => [created, ...prev]);
-                  setActiveNoteId(created.id);
+                  openNoteEditor(created.id);
                 }
               }}
               onOpenAiStructure={() => setShowAiStructure(true)}
               onOpenQuickAsk={() => {
+                setSidebarOpen(false);
                 setRadarOpen(true);
                 setRadarRequestedTab('ask');
                 setTimeout(() => {
@@ -1654,10 +1838,7 @@ export function App() {
             initialLabelFilter={reportInitialFilter.label}
             initialClientFilter={reportInitialFilter.clientId}
             initialPersonFilter={reportInitialFilter.person}
-            onOpenNote={(id) => {
-              setActiveNoteId(id);
-              setMainView('notes');
-            }}
+            onOpenNote={openNoteEditor}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
             onDeleteTask={handleDeleteRemoteTask}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
@@ -1672,8 +1853,7 @@ export function App() {
                 labels: ['report'],
               });
               setNotes((prev) => [saved, ...prev]);
-              setActiveNoteId(saved.id);
-              setMainView('notes');
+              openNoteEditor(saved.id);
             }}
           />
         )}
@@ -1682,10 +1862,7 @@ export function App() {
           <TasksGlobalView
             notes={notes}
             directory={directory}
-            onOpenNote={(id) => {
-              setActiveNoteId(id);
-              setMainView('notes');
-            }}
+            onOpenNote={openNoteEditor}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
             onDeleteTask={handleDeleteRemoteTask}
           />
@@ -1695,10 +1872,7 @@ export function App() {
           <DecisionsGlobalView
             notes={notes}
             directory={directory}
-            onOpenNote={(id) => {
-              setActiveNoteId(id);
-              setMainView('notes');
-            }}
+            onOpenNote={openNoteEditor}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
             onDeleteDecision={handleDeleteRemoteDecision}
           />
@@ -1728,33 +1902,107 @@ export function App() {
             onDeleteProject={handleDeleteProject}
             onAddLabel={handleAddLabel}
             onDeleteLabel={handleDeleteLabel}
-            onFilterNotesByPerson={(name) => {
-              setNoteFilter({ kind: 'person', personName: name });
-              setMainView('notes');
-              setNoteListOpen(true);
-            }}
-            onFilterNotesByClient={(cId) => {
-              setNoteFilter({ kind: 'client', clientId: cId });
-              setMainView('notes');
-              setNoteListOpen(true);
-            }}
-            onFilterNotesByProject={(proj) => {
-              setNoteFilter({
+            onFilterNotesByPerson={(name) => applyNotesFilter({ kind: 'person', personName: name })}
+            onFilterNotesByClient={(cId) => applyNotesFilter({ kind: 'client', clientId: cId })}
+            onFilterNotesByProject={(proj) =>
+              applyNotesFilter({
                 kind: 'project',
                 clientId: proj.clientId || undefined,
                 projectId: proj.id,
-              });
-              setMainView('notes');
-              setNoteListOpen(true);
-            }}
-            onFilterNotesByLabel={(lbl) => {
-              setNoteFilter({ kind: 'label', label: lbl });
-              setMainView('notes');
-              setNoteListOpen(true);
-            }}
+              })
+            }
+            onFilterNotesByLabel={(lbl) => applyNotesFilter({ kind: 'label', label: lbl })}
           />
         )}
       </main>
+
+      {/* Mobile Floating New-Note Action on Notes List */}
+      {isMobile && mainView === 'notes' && mobileNotesPane === 'list' && (
+        <button
+          type="button"
+          className="mobile-fab no-print"
+          onClick={handleSpinUpNote}
+          aria-label="Create new note"
+        >
+          <Plus size={18} />
+          New Note
+        </button>
+      )}
+
+      {/* Mobile Bottom Navigation Bar */}
+      <nav className="mobile-bottom-nav no-print" aria-label="Primary Mobile Navigation">
+        <button
+          type="button"
+          className={`mobile-nav-item ${mainView === 'notes' ? 'active' : ''}`}
+          onClick={() => {
+            setSidebarOpen(false);
+            setRadarOpen(false);
+            if (mainView === 'notes') {
+              setMobileNotesPane((p) => (p === 'editor' ? 'list' : 'editor'));
+            } else {
+              setMainView('notes');
+            }
+          }}
+        >
+          <span className="mobile-nav-icon-wrap">
+            <Layers size={18} />
+          </span>
+          <span>Notes</span>
+        </button>
+
+        <button
+          type="button"
+          className={`mobile-nav-item ${mainView === 'tasks' ? 'active' : ''}`}
+          onClick={() => switchPrimaryView('tasks')}
+        >
+          <span className="mobile-nav-icon-wrap">
+            <CheckSquare size={18} />
+            {globalCounts.openTasks > 0 && (
+              <span className="mobile-nav-badge">{globalCounts.openTasks}</span>
+            )}
+          </span>
+          <span>Tasks</span>
+        </button>
+
+        <button
+          type="button"
+          className={`mobile-nav-item ${mainView === 'decisions' ? 'active' : ''}`}
+          onClick={() => switchPrimaryView('decisions')}
+        >
+          <span className="mobile-nav-icon-wrap">
+            <Gavel size={18} />
+            {globalCounts.totalDecisions > 0 && (
+              <span className="mobile-nav-badge">{globalCounts.totalDecisions}</span>
+            )}
+          </span>
+          <span>Decisions</span>
+        </button>
+
+        <button
+          type="button"
+          className={`mobile-nav-item ${mainView === 'reports' ? 'active' : ''}`}
+          onClick={() => {
+            setReportInitialFilter({});
+            switchPrimaryView('reports');
+          }}
+        >
+          <span className="mobile-nav-icon-wrap">
+            <BarChart3 size={18} />
+          </span>
+          <span>Reports</span>
+        </button>
+
+        <button
+          type="button"
+          className={`mobile-nav-item ${mainView === 'people' ? 'active' : ''}`}
+          onClick={() => switchPrimaryView('people')}
+        >
+          <span className="mobile-nav-icon-wrap">
+            <Users size={18} />
+          </span>
+          <span>Directory</span>
+        </button>
+      </nav>
 
       {/* Right Sidebar: Live Context Radar */}
       {mainView === 'notes' && radarOpen && (
@@ -1772,8 +2020,9 @@ export function App() {
               body: base ? `${base}\n\n${snippet}` : snippet,
               updatedAt: new Date().toISOString(),
             });
+            if (isMobile) setRadarOpen(false);
           }}
-          onOpenNote={(id) => setActiveNoteId(id)}
+          onOpenNote={openNoteEditor}
           onToggleRemoteTaskStatus={handleUpdateRemoteTaskStatus}
           onCollapse={() => setRadarOpen(false)}
         />
@@ -1836,21 +2085,16 @@ export function App() {
           onClose={() => setShowCommandPalette(false)}
           onNewNote={handleSpinUpNote}
           onDeleteCurrentNote={() => handleDeleteNote(activeNote.id)}
-          onSelectNote={(id) => {
-            setActiveNoteId(id);
-            setMainView('notes');
-          }}
+          onSelectNote={openNoteEditor}
           onOpenReportForLabel={(lbl) => {
             setReportInitialFilter({ label: lbl });
-            setMainView('reports');
+            switchPrimaryView('reports');
           }}
-          onOpenPersonNotes={(name) => {
-            setNoteFilter({ kind: 'person', personName: name });
-            setMainView('notes');
-          }}
-          onSwitchMainView={(view) => setMainView(view)}
+          onOpenPersonNotes={(name) => applyNotesFilter({ kind: 'person', personName: name })}
+          onSwitchMainView={switchPrimaryView}
           onTriggerAiStructure={() => {
-            setMainView('notes');
+            switchPrimaryView('notes');
+            setMobileNotesPane('editor');
             setShowAiStructure(true);
           }}
           onToggleTheme={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}

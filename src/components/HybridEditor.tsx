@@ -95,6 +95,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const [newClientName, setNewClientName] = useState('');
   const [newProjectPrompt, setNewProjectPrompt] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
+  const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
 
   const [autocomplete, setAutocomplete] = useState<AutocompleteTrigger | null>(null);
   const [acIndex, setAcIndex] = useState(0);
@@ -547,11 +548,18 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       ? 'internal'
       : 'inbox';
 
+  const activeClientObj = note.clientId
+    ? directory.clients.find((c) => c.id === note.clientId)
+    : undefined;
+  const activeProjectObj = note.projectId
+    ? directory.projects.find((p) => p.id === note.projectId)
+    : undefined;
+
   return (
     <div className="editor-scroll" onClick={() => setAutocomplete(null)}>
       <div className="editor-container">
         {/* Quick Starter & Outlook/Teams Invite Strip */}
-        <div className="quick-starter-strip">
+        <div className={`quick-starter-strip ${!mobilePropsOpen ? 'mobile-collapsed' : ''}`}>
           <div className="quick-starter-group">
             <span style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-muted)' }}>Quick Start:</span>
             {NOTE_TEMPLATES.filter((t) => t.id !== 'blank').map((tpl) => (
@@ -601,8 +609,39 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           />
         </h1>
 
+        {/* Mobile Compact Context & Properties Toggle Bar */}
+        <button
+          type="button"
+          className="mobile-props-bar"
+          onClick={() => setMobilePropsOpen((v) => !v)}
+          aria-expanded={mobilePropsOpen}
+        >
+          <span className="mobile-props-summary">
+            <span>{note.date}</span>
+            <span>·</span>
+            {activeClientObj ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontWeight: 600, color: 'var(--text-primary)' }}>
+                <span className="client-dot" style={{ background: activeClientObj.color }} />
+                {activeClientObj.name}
+                {activeProjectObj ? ` / ${activeProjectObj.name}` : ''}
+              </span>
+            ) : note.scope === 'internal' ? (
+              <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                Internal{activeProjectObj ? ` / ${activeProjectObj.name}` : ''}
+              </span>
+            ) : (
+              <span>Inbox</span>
+            )}
+            {note.participants.length > 0 && <span>· @{note.participants.length}</span>}
+            {combinedLabels.length > 0 && <span>· #{combinedLabels.length}</span>}
+          </span>
+          <span style={{ fontWeight: 600, color: 'var(--accent-text)', flexShrink: 0 }}>
+            {mobilePropsOpen ? 'Hide ▴' : 'Details & Templates ▾'}
+          </span>
+        </button>
+
         {/* Structured Metadata Properties Grid */}
-        <div className="meta-grid">
+        <div className={`meta-grid ${!mobilePropsOpen ? 'mobile-collapsed' : ''}`}>
           <div className="meta-row">
             <span className="meta-label">
               <Calendar size={13} /> Date &amp; Space
@@ -869,13 +908,21 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             </button>
             <button
               type="button"
+              className="btn btn-xs btn-soft mobile-only"
+              onClick={onOpenAiStructure}
+              title="Structure & Extract Tasks/Decisions"
+            >
+              <Sparkles size={12} /> Structure
+            </button>
+            <button
+              type="button"
               className="btn btn-xs btn-ghost"
               onClick={onOpenQuickAsk}
               title="Ask across past notes and pull citations into this note"
             >
-              <Link2 size={13} /> /Ask &amp; Pull Context
+              <Link2 size={13} /> /Ask &amp; Pull
             </button>
-            <span style={{ fontSize: 11.5, color: 'var(--text-muted)', marginLeft: 4 }}>
+            <span className="desktop-only" style={{ fontSize: 11.5, color: 'var(--text-muted)', marginLeft: 4 }}>
               Type <span className="kbd">@</span> person · <span className="kbd">#</span> label ·{' '}
               <span className="kbd">[[</span> note · <span className="kbd">/</span> commands
             </span>

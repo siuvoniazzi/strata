@@ -680,7 +680,7 @@ export const PeopleDirectoryView: React.FC<{
         </div>
 
         {/* Quick-Add Forms: Clients, Projects, People */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(290px, 1fr))', gap: 14 }}>
+        <div className="directory-cards-grid">
           <form className="surface-panel" onSubmit={handleAddClientSubmit}>
             <strong style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <Building2 size={15} /> Add Client
@@ -740,7 +740,7 @@ export const PeopleDirectoryView: React.FC<{
             <strong style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <UserCheck size={15} /> Add Person
             </strong>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+            <div className="person-form-grid">
               <input
                 type="text"
                 className="form-input"
@@ -799,15 +799,15 @@ export const PeopleDirectoryView: React.FC<{
                       <span className="client-dot" style={{ background: client.color }} />
                       <input
                         type="text"
-                        className="meta-select"
-                        style={{ fontWeight: 600, minWidth: 160 }}
+                        className="meta-select directory-inline-field"
+                        style={{ fontWeight: 600 }}
                         value={client.name}
                         onChange={(e) => onUpdateClient({ ...client, name: e.target.value })}
                         aria-label="Client name"
                       />
                       <input
                         type="text"
-                        className="meta-select"
+                        className="meta-select directory-inline-field"
                         placeholder="Email domain…"
                         value={client.domain || ''}
                         onChange={(e) =>
@@ -857,14 +857,14 @@ export const PeopleDirectoryView: React.FC<{
                     <div className="task-left" style={{ gap: 10 }}>
                       <input
                         type="text"
-                        className="meta-select"
-                        style={{ fontWeight: 600, minWidth: 170 }}
+                        className="meta-select directory-inline-field"
+                        style={{ fontWeight: 600 }}
                         value={proj.name}
                         onChange={(e) => onUpdateProject({ ...proj, name: e.target.value })}
                         aria-label="Project name"
                       />
                       <select
-                        className="meta-select"
+                        className="meta-select directory-inline-field"
                         value={proj.scope === 'client' && proj.clientId ? `client:${proj.clientId}` : 'internal'}
                         onChange={(e) => {
                           if (e.target.value === 'internal') {
@@ -945,28 +945,28 @@ export const PeopleDirectoryView: React.FC<{
                     <div className="task-left" style={{ gap: 8 }}>
                       <input
                         type="text"
-                        className="meta-select"
-                        style={{ fontWeight: 600, minWidth: 140 }}
+                        className="meta-select directory-inline-field"
+                        style={{ fontWeight: 600 }}
                         value={person.name}
                         onChange={(e) => onUpdatePerson({ ...person, name: e.target.value }, person.name)}
                         aria-label="Person name"
                       />
                       <input
                         type="text"
-                        className="meta-select"
+                        className="meta-select directory-inline-field"
                         placeholder="Role…"
                         value={person.role || ''}
                         onChange={(e) => onUpdatePerson({ ...person, role: e.target.value })}
                       />
                       <input
                         type="email"
-                        className="meta-select"
+                        className="meta-select directory-inline-field"
                         placeholder="Email…"
                         value={person.email || ''}
                         onChange={(e) => onUpdatePerson({ ...person, email: e.target.value || undefined })}
                       />
                       <select
-                        className="meta-select"
+                        className="meta-select directory-inline-field"
                         value={person.clientId || ''}
                         onChange={(e) =>
                           onUpdatePerson({
