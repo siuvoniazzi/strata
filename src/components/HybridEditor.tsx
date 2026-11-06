@@ -40,6 +40,7 @@ import {
   parseMeetingInviteText,
   parseNoteItems,
   removeLabelFromNote,
+  resolveKnownPersonName,
   slugify,
 } from '../utils/markdown';
 import {
@@ -258,6 +259,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const isComposingRef = useRef<boolean>(false);
   const noteRef = useRef<Note>(note);
   noteRef.current = note;
+  const peopleRef = useRef<Person[]>(directory.people);
+  peopleRef.current = directory.people;
+  const labelsRef = useRef<string[]>(allWorkspaceLabels);
+  labelsRef.current = allWorkspaceLabels;
 
   const parsedItems = useMemo(
     () => parseNoteItems(note, directory.people),
@@ -407,7 +412,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const top = Math.min(window.innerHeight - 56, rect.bottom + 6);
       const left = Math.max(12, Math.min(window.innerWidth - 240, rect.left));
       if (foundToken.classList.contains('doc-person')) {
-        const name = (foundToken.textContent || '').replace(/^@+/, '').trim();
+        const name = (foundToken.getAttribute('data-person') || foundToken.textContent || '').replace(/^@+/, '').trim();
         if (name) {
           setActiveToken({ kind: 'person', value: name, rect: { top, left } });
           return;
@@ -573,24 +578,36 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
-    const personMatch = uptoCursor.match(/(?:^|[\s(])@([\p{L}\p{N}\s._-]{0,28})$/u);
-    if (personMatch && !personMatch[1].includes('  ')) {
-      const atIdx = uptoCursor.lastIndexOf('@');
-      setAutocomplete({
-        kind: 'person',
-        query: personMatch[1],
-        tokenStart: atIdx,
-        cursorPos,
-        textNode,
-        rect: popRect,
-      });
-      setAcIndex(0);
-      return;
+    const personMatch = uptoCursor.match(/(?:^|[\s(])@([\p{L}\p{N}._-]{0,28}(?:\s[\p{L}\p{N}._-]{0,28})?)$/u);
+    if (personMatch) {
+      const rawQuery = personMatch[1];
+      const qLower = rawQuery.toLowerCase();
+      const validAcrossSpace =
+        !/\s/.test(rawQuery) ||
+        peopleRef.current.some((p) => p.name.toLowerCase().startsWith(qLower));
+      if (validAcrossSpace) {
+        const atIdx = uptoCursor.lastIndexOf('@');
+        const hasDirectoryMatch = peopleRef.current.some(
+          (p) => !qLower.trim() || p.name.toLowerCase().includes(qLower.trim()) || (p.role || '').toLowerCase().includes(qLower.trim())
+        );
+        setAutocomplete({
+          kind: 'person',
+          query: rawQuery,
+          tokenStart: atIdx,
+          cursorPos,
+          textNode,
+          rect: popRect,
+        });
+        setAcIndex(hasDirectoryMatch ? 0 : -1);
+        return;
+      }
     }
 
     const labelMatch = uptoCursor.match(/(?:^|[\s(])#([\p{L}\p{N}_-]{0,28})$/u);
     if (labelMatch) {
       const hashIdx = uptoCursor.lastIndexOf('#');
+      const qLower = labelMatch[1].toLowerCase();
+      const hasLabelMatch = labelsRef.current.some((l) => !qLower || l.includes(qLower));
       setAutocomplete({
         kind: 'label',
         query: labelMatch[1],
@@ -599,7 +616,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         textNode,
         rect: popRect,
       });
-      setAcIndex(0);
+      setAcIndex(hasLabelMatch ? 0 : -1);
       return;
     }
 
@@ -643,22 +660,34 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
-    const personMatch = uptoCursor.match(/(?:^|[\s(])@([\p{L}\p{N}\s._-]{0,28})$/u);
-    if (personMatch && !personMatch[1].includes('  ')) {
-      setAutocomplete({
-        kind: 'person',
-        query: personMatch[1],
-        tokenStart: uptoCursor.lastIndexOf('@'),
-        cursorPos,
-        textNode: null,
-        rect: popRect,
-      });
-      setAcIndex(0);
-      return;
+    const personMatch = uptoCursor.match(/(?:^|[\s(])@([\p{L}\p{N}._-]{0,28}(?:\s[\p{L}\p{N}._-]{0,28})?)$/u);
+    if (personMatch) {
+      const rawQuery = personMatch[1];
+      const qLower = rawQuery.toLowerCase();
+      const validAcrossSpace =
+        !/\s/.test(rawQuery) ||
+        peopleRef.current.some((p) => p.name.toLowerCase().startsWith(qLower));
+      if (validAcrossSpace) {
+        const hasDirectoryMatch = peopleRef.current.some(
+          (p) => !qLower.trim() || p.name.toLowerCase().includes(qLower.trim()) || (p.role || '').toLowerCase().includes(qLower.trim())
+        );
+        setAutocomplete({
+          kind: 'person',
+          query: rawQuery,
+          tokenStart: uptoCursor.lastIndexOf('@'),
+          cursorPos,
+          textNode: null,
+          rect: popRect,
+        });
+        setAcIndex(hasDirectoryMatch ? 0 : -1);
+        return;
+      }
     }
 
     const labelMatch = uptoCursor.match(/(?:^|[\s(])#([\p{L}\p{N}_-]{0,28})$/u);
     if (labelMatch) {
+      const qLower = labelMatch[1].toLowerCase();
+      const hasLabelMatch = labelsRef.current.some((l) => !qLower || l.includes(qLower));
       setAutocomplete({
         kind: 'label',
         query: labelMatch[1],
@@ -667,7 +696,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         textNode: null,
         rect: popRect,
       });
-      setAcIndex(0);
+      setAcIndex(hasLabelMatch ? 0 : -1);
       return;
     }
 
@@ -693,12 +722,12 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             createPersonName: null as string | null,
           };
         });
-      if (q.length >= 2 && !directory.people.some((p) => p.name.toLowerCase() === q)) {
+      if (q.length >= 2 && !/\s/.test(autocomplete.query) && !directory.people.some((p) => p.name.toLowerCase() === q)) {
         const displayNew = autocomplete.query.trim();
         matches.push({
           id: '__create_person__',
-          label: `+ Create person "${displayNew}"`,
-          sub: 'Add to directory & mention',
+          label: `+ Add "${displayNew}" to People`,
+          sub: 'Tab or click · Space to keep typing',
           replacement: `${formatPersonMention(displayNew)} `,
           tokenValue: displayNew,
           createPersonName: displayNew,
@@ -724,7 +753,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         matches.push({
           id: '__create_label__',
           label: `+ Create #${normQ}`,
-          sub: 'New frictionless label',
+          sub: 'Tab or click · Space to keep typing',
           replacement: `#${normQ} `,
           tokenValue: normQ,
           createPersonName: null,
@@ -918,11 +947,12 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
-    // Insert rich inline token span + trailing normal space outside the span
+    // Insert rich inline token span + trailing space outside the span
     const span = document.createElement('span');
     if (autocomplete.kind === 'person') {
       span.className = 'doc-token doc-person';
       span.setAttribute('data-person', item.tokenValue);
+      span.setAttribute('data-mention-text', item.tokenValue);
       span.textContent = `@${item.tokenValue}`;
     } else if (autocomplete.kind === 'label') {
       span.className = 'doc-token doc-label';
@@ -937,7 +967,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       span.textContent = item.tokenValue;
     }
 
-    const trailingSpace = document.createTextNode(' ');
+    const endNode = delRange.endContainer;
+    const isAtLineEnd =
+      endNode.nodeType === Node.TEXT_NODE
+        ? delRange.endOffset >= (endNode.nodeValue || '').length &&
+          (!endNode.nextSibling || endNode.nextSibling.nodeName === 'BR')
+        : delRange.endOffset >= endNode.childNodes.length;
+    const trailingSpace = document.createTextNode(isAtLineEnd ? '\u00A0' : ' ');
     delRange.insertNode(trailingSpace);
     delRange.insertNode(span);
 
@@ -950,6 +986,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     }
 
     setAutocomplete(null);
+    setActiveToken(null);
     emitMarkdownFromDom();
   };
 
@@ -1094,6 +1131,289 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     return false;
   };
 
+  const createPersonTokenSpan = (rawName: string): HTMLElement => {
+    const clean = rawName.trim();
+    const exact = peopleRef.current.find((p) => p.name.toLowerCase() === clean.toLowerCase());
+    const display = exact ? exact.name : clean;
+    const resolved = resolveKnownPersonName(clean, peopleRef.current);
+    const span = document.createElement('span');
+    span.className = 'doc-token doc-person';
+    span.setAttribute('data-person', resolved);
+    span.setAttribute('data-mention-text', display);
+    span.textContent = `@${display}`;
+    return span;
+  };
+
+  const createLabelTokenSpan = (rawLbl: string): HTMLElement => {
+    const norm = normalizeLabel(rawLbl);
+    const span = document.createElement('span');
+    span.className = 'doc-token doc-label';
+    span.setAttribute('data-label', norm);
+    span.textContent = `#${norm}`;
+    return span;
+  };
+
+  const replaceSliceInTextNode = (
+    textNode: Text,
+    startOffset: number,
+    endOffset: number,
+    spanEl: HTMLElement,
+    trailingOutsideText: string
+  ) => {
+    const rawVal = textNode.nodeValue || '';
+    const beforeStr = rawVal.slice(0, startOffset);
+    const restAfterEnd = rawVal.slice(endOffset);
+    const isAtLineEnd = !restAfterEnd && (!textNode.nextSibling || textNode.nextSibling.nodeName === 'BR');
+    const safeTrailing =
+      isAtLineEnd && trailingOutsideText.endsWith(' ')
+        ? `${trailingOutsideText.slice(0, -1)}\u00A0`
+        : trailingOutsideText;
+
+    textNode.nodeValue = beforeStr;
+    const afterNode = document.createTextNode(safeTrailing + restAfterEnd);
+    textNode.after(spanEl, afterNode);
+    if (!beforeStr) {
+      textNode.remove();
+    }
+
+    const sel = window.getSelection();
+    if (sel) {
+      const nextRange = document.createRange();
+      nextRange.setStart(afterNode, safeTrailing.length);
+      nextRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(nextRange);
+    }
+  };
+
+  // Ensure spaces, punctuation, or subsequent words (including via mobile IME/composition) never stay trapped inside .doc-token
+  const normalizeInlineTokensInActiveBlock = () => {
+    const root = docRef.current;
+    const sel = window.getSelection();
+    if (!root || !sel || sel.rangeCount === 0) return;
+    const blk = findEditableBlock(sel.anchorNode, root);
+    if (!blk) return;
+
+    const tokens = Array.from(blk.querySelectorAll('span.doc-token')) as HTMLElement[];
+    for (const tokenEl of tokens) {
+      const isPerson = tokenEl.classList.contains('doc-person');
+      const isLabel = tokenEl.classList.contains('doc-label');
+      if (!isPerson && !isLabel) continue;
+
+      let caretOffsetInToken: number | null = null;
+      if (sel.isCollapsed && tokenEl.contains(sel.anchorNode)) {
+        const r = document.createRange();
+        r.selectNodeContents(tokenEl);
+        r.setEnd(sel.anchorNode!, sel.anchorOffset);
+        caretOffsetInToken = r.toString().length;
+      }
+
+      const raw = (tokenEl.textContent || '').replace(/\u00A0/g, ' ');
+      const sigil = isPerson ? '@' : '#';
+
+      if (!raw.startsWith(sigil) || raw.length <= 1 || /^[@#]\s/.test(raw)) {
+        const isAtEnd = !tokenEl.nextSibling || tokenEl.nextSibling.nodeName === 'BR';
+        const safeRaw = isAtEnd && raw.endsWith(' ') ? `${raw.slice(0, -1)}\u00A0` : raw;
+        const plain = document.createTextNode(safeRaw);
+        tokenEl.replaceWith(plain);
+        if (caretOffsetInToken !== null) {
+          const r = document.createRange();
+          r.setStart(plain, Math.min(plain.length, caretOffsetInToken));
+          r.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(r);
+        }
+        continue;
+      }
+
+      const body = raw.slice(1);
+      let validLen = body.length;
+
+      if (isPerson) {
+        const expected = (tokenEl.getAttribute('data-mention-text') || tokenEl.getAttribute('data-person') || '').trim();
+        if (expected.includes(' ')) {
+          if (
+            body.toLowerCase().startsWith(expected.toLowerCase()) &&
+            (body.length === expected.length || /^[ \t\n,.;:!?)[\]]/.test(body.slice(expected.length)))
+          ) {
+            validLen = expected.length;
+          } else if (expected.toLowerCase().startsWith(body.toLowerCase())) {
+            validLen = body.length;
+          } else {
+            const bIdx = body.search(/[ \t\n,.;:!?)[\]]/);
+            validLen = bIdx === -1 ? body.length : bIdx;
+          }
+        } else {
+          const bIdx = body.search(/[ \t\n,.;:!?)[\]]/);
+          validLen = bIdx === -1 ? body.length : bIdx;
+        }
+      } else {
+        const bIdx = body.search(/[ \t\n,.;:!?)[\]]/);
+        validLen = bIdx === -1 ? body.length : bIdx;
+      }
+
+      if (1 + validLen < raw.length) {
+        const kept = body.slice(0, validLen);
+        const overflowRaw = raw.slice(1 + validLen);
+        const isAtEnd = !tokenEl.nextSibling || tokenEl.nextSibling.nodeName === 'BR';
+        const safeOverflow =
+          isAtEnd && overflowRaw.endsWith(' ')
+            ? `${overflowRaw.slice(0, -1)}\u00A0`
+            : overflowRaw;
+
+        tokenEl.textContent = `${sigil}${kept}`;
+        if (isPerson) {
+          tokenEl.setAttribute('data-mention-text', kept);
+          tokenEl.setAttribute('data-person', resolveKnownPersonName(kept, peopleRef.current));
+        } else {
+          tokenEl.setAttribute('data-label', normalizeLabel(kept));
+        }
+
+        const outNode = document.createTextNode(safeOverflow);
+        tokenEl.after(outNode);
+
+        if (caretOffsetInToken !== null) {
+          const r = document.createRange();
+          if (caretOffsetInToken <= 1 + validLen && tokenEl.firstChild) {
+            r.setStart(tokenEl.firstChild, Math.min((tokenEl.firstChild.nodeValue || '').length, caretOffsetInToken));
+          } else {
+            r.setStart(outNode, Math.min(outNode.length, Math.max(0, caretOffsetInToken - (1 + validLen))));
+          }
+          r.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(r);
+        }
+      }
+    }
+  };
+
+  // Automatically detect when a typed @mention, #label, @[Full Name], or [[Note]] is finished (on Space, punctuation, or closing bracket)
+  const tryFinalizeInlineTriggerAtCaret = (): boolean => {
+    const root = docRef.current;
+    const sel = window.getSelection();
+    if (!root || !sel || !sel.isCollapsed || sel.rangeCount === 0 || !root.contains(sel.anchorNode)) {
+      return false;
+    }
+
+    const range = sel.getRangeAt(0);
+    if (range.startContainer.nodeType !== Node.TEXT_NODE) return false;
+    const parentEl = range.startContainer.parentElement;
+    if (parentEl && (parentEl.classList.contains('doc-token') || parentEl.tagName.toUpperCase() === 'CODE')) {
+      return false;
+    }
+
+    const textNode = range.startContainer as Text;
+    const cursorPos = range.startOffset;
+    const uptoCursor = (textNode.nodeValue || '').slice(0, cursorPos).replace(/\u00A0/g, ' ');
+    const afterCursor = (textNode.nodeValue || '').slice(cursorPos);
+
+    // 1. Bracketed person mention @[Full Name]
+    const bracketPerson = uptoCursor.match(/(?:^|[\s(])(@\[([^\][\n]{1,50})\])$/);
+    if (bracketPerson && bracketPerson[2].trim()) {
+      const fullToken = bracketPerson[1];
+      const startIdx = cursorPos - fullToken.length;
+      const span = createPersonTokenSpan(bracketPerson[2].trim());
+      replaceSliceInTextNode(textNode, startIdx, cursorPos, span, afterCursor.startsWith(' ') ? '' : ' ');
+      return true;
+    }
+
+    // 2. Wiki note link [[Note Title]]
+    const wikiLink = uptoCursor.match(/(\[\[([^\][\n]{1,80})\]\])$/);
+    if (wikiLink && wikiLink[2].trim()) {
+      const fullToken = wikiLink[1];
+      const title = wikiLink[2].trim();
+      const startIdx = cursorPos - fullToken.length;
+      const span = document.createElement('span');
+      span.className = 'doc-token doc-link';
+      span.setAttribute('data-link', title);
+      span.textContent = title;
+      replaceSliceInTextNode(textNode, startIdx, cursorPos, span, afterCursor.startsWith(' ') ? '' : ' ');
+      return true;
+    }
+
+    // 3. #label followed by space or punctuation
+    const labelDone = uptoCursor.match(/(?:^|[\s(])(#([\p{L}][\p{L}\p{N}_-]{1,38}))([ \t,.;:!?)])$/u);
+    if (labelDone) {
+      const hashToken = labelDone[1];
+      const lblName = labelDone[2];
+      const delim = labelDone[3];
+      const startIdx = cursorPos - hashToken.length - delim.length;
+      const span = createLabelTokenSpan(lblName);
+      replaceSliceInTextNode(textNode, startIdx, cursorPos, span, delim);
+      return true;
+    }
+
+    // 4. Unbracketed @person followed by punctuation (@daniel, / @daniel. / @daniel:)
+    const personPunct = uptoCursor.match(/(?:^|[\s(])(@([\p{L}][\p{L}\p{N}\s._-]{0,40}?[\p{L}\p{N}._-]))([,.;:!?)])$/u);
+    if (personPunct) {
+      const candidate = personPunct[2];
+      const delim = personPunct[3];
+      const isValidCandidate =
+        !/\s/.test(candidate) ||
+        peopleRef.current.some((p) => p.name.toLowerCase() === candidate.replace(/\s+/g, ' ').toLowerCase());
+      if (isValidCandidate) {
+        const atToken = personPunct[1];
+        const startIdx = cursorPos - atToken.length - delim.length;
+        const span = createPersonTokenSpan(candidate.replace(/\s+/g, ' '));
+        replaceSliceInTextNode(textNode, startIdx, cursorPos, span, delim);
+        return true;
+      }
+    }
+
+    // 5. Unbracketed @person followed by space (or space + next word when no known multi-word person matches)
+    const personSpace = uptoCursor.match(/(?:^|[\s(])(@([\p{L}][\p{L}\p{N}._-]{0,30}(?:\s+[\p{L}\p{N}._-]{0,30})*\s?))$/u);
+    if (personSpace && /\s/.test(personSpace[2])) {
+      const atTokenWithTrail = personSpace[1]; // starts with '@'
+      const segment = personSpace[2]; // text after '@'
+      const segNorm = segment.replace(/\s+/g, ' ');
+      const segLower = segNorm.toLowerCase();
+      const startIdx = cursorPos - atTokenWithTrail.length;
+
+      if (segment.endsWith(' ')) {
+        const trimmed = segNorm.trimEnd();
+        const trimmedLower = trimmed.toLowerCase();
+        const hasLongerKnownPerson = peopleRef.current.some((p) =>
+          p.name.toLowerCase().startsWith(`${trimmedLower} `)
+        );
+        const isKnownOrSingleWord =
+          !/\s/.test(trimmed) ||
+          peopleRef.current.some((p) => p.name.toLowerCase() === trimmedLower);
+
+        if (!hasLongerKnownPerson && isKnownOrSingleWord && trimmed.length >= 1) {
+          const trailingSpaces = segment.slice( segment.trimEnd().length ) || ' ';
+          const span = createPersonTokenSpan(trimmed);
+          replaceSliceInTextNode(textNode, startIdx, cursorPos, span, trailingSpaces);
+          return true;
+        }
+      } else {
+        const stillMatchesKnownPerson = peopleRef.current.some((p) =>
+          p.name.toLowerCase().startsWith(segLower)
+        );
+        if (!stillMatchesKnownPerson) {
+          // Find longest prefix of words before the last space that is a known person, else take first word
+          const words = segment.split(/(\s+)/); // preserves exact whitespace separators
+          let bestName = words[0];
+          let acc = words[0];
+          for (let i = 2; i < words.length - 1; i += 2) {
+            acc += words[i - 1] + words[i];
+            const normAcc = acc.replace(/\s+/g, ' ').toLowerCase();
+            if (peopleRef.current.some((p) => p.name.toLowerCase() === normAcc)) {
+              bestName = acc;
+            }
+          }
+          if (bestName.trim().length >= 1) {
+            const overflowSuffix = segment.slice(bestName.length);
+            const span = createPersonTokenSpan(bestName.replace(/\s+/g, ' '));
+            replaceSliceInTextNode(textNode, startIdx, cursorPos, span, overflowSuffix);
+            return true;
+          }
+        }
+      }
+    }
+
+    return false;
+  };
+
   // Prevent typing spaces/punctuation at the right edge of an inline token from bleeding token color
   const handleDocBeforeInput = (e: React.FormEvent<HTMLDivElement>) => {
     const native = e.nativeEvent as InputEvent;
@@ -1121,13 +1441,16 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     endProbe.setStart(range.startContainer, range.startOffset);
     if (endProbe.toString().length === 0) {
       e.preventDefault();
-      const textNode = document.createTextNode(native.data);
+      const isAtLineEnd = !tokenEl.nextSibling || tokenEl.nextSibling.nodeName === 'BR';
+      const outChar = native.data === ' ' && isAtLineEnd ? '\u00A0' : native.data;
+      const textNode = document.createTextNode(outChar);
       tokenEl.after(textNode);
       const nextRange = document.createRange();
       nextRange.setStart(textNode, textNode.length);
       nextRange.collapse(true);
       sel.removeAllRanges();
       sel.addRange(nextRange);
+      setActiveToken(null);
       emitMarkdownFromDom();
     }
   };
@@ -1138,6 +1461,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       setAutocomplete(null);
       return;
     }
+    normalizeInlineTokensInActiveBlock();
+    if (tryFinalizeInlineTriggerAtCaret()) {
+      setAutocomplete(null);
+      setActiveToken(null);
+      emitMarkdownFromDom();
+      return;
+    }
     emitMarkdownFromDom();
     detectDocAutocomplete();
   };
@@ -1146,18 +1476,44 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     if (autocomplete && autocompleteItems.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setAcIndex((i) => (i + 1) % autocompleteItems.length);
+        setAcIndex((i) => (i < 0 ? 0 : (i + 1) % autocompleteItems.length));
         return;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setAcIndex((i) => (i - 1 + autocompleteItems.length) % autocompleteItems.length);
+        setAcIndex((i) => (i <= 0 ? autocompleteItems.length - 1 : i - 1));
         return;
       }
-      if (e.key === 'Enter' || e.key === 'Tab') {
+      if (e.key === 'Tab') {
         e.preventDefault();
-        applyAutocompleteItem(autocompleteItems[acIndex] || autocompleteItems[0]);
+        applyAutocompleteItem(autocompleteItems[acIndex >= 0 ? acIndex : 0]);
         return;
+      }
+      if (e.key === 'Enter') {
+        if (acIndex >= 0 && autocompleteItems[acIndex]) {
+          e.preventDefault();
+          applyAutocompleteItem(autocompleteItems[acIndex]);
+          return;
+        }
+        // User pressed Enter at the end of a line after typing a new @person or #label without selecting '+ Add':
+        // finalize the mention/label token cleanly and allow Enter to create the next line normally!
+        if (
+          autocomplete.textNode &&
+          docRef.current?.contains(autocomplete.textNode) &&
+          autocomplete.query.trim().length >= 1
+        ) {
+          if (autocomplete.kind === 'person' && !/\s/.test(autocomplete.query.trim())) {
+            const span = createPersonTokenSpan(autocomplete.query.trim());
+            replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
+            emitMarkdownFromDom();
+          } else if (autocomplete.kind === 'label') {
+            const span = createLabelTokenSpan(autocomplete.query.trim());
+            replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
+            emitMarkdownFromDom();
+          }
+        }
+        setAutocomplete(null);
+        setActiveToken(null);
       }
       if (e.key === 'Escape') {
         e.preventDefault();

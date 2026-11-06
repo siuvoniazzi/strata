@@ -1,4 +1,4 @@
-const CACHE_NAME = 'strata-pwa-v5';
+const CACHE_NAME = 'strata-pwa-v6';
 
 self.addEventListener('install', (event) => {
   self.skipWaiting();

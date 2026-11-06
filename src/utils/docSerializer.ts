@@ -83,13 +83,15 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
       const rawName = raw.slice(2, -1).trim();
       const resolved = resolveKnownPersonName(rawName, knownPeople);
       out.push(
-        `<span class="doc-token doc-person" data-person="${escAttr(resolved)}">@${escHtml(resolved)}</span>`
+        `<span class="doc-token doc-person" data-person="${escAttr(resolved)}" data-mention-text="${escAttr(resolved)}">@${escHtml(resolved)}</span>`
       );
     } else if (raw.startsWith('@')) {
       const rawName = raw.slice(1).trim();
+      const exact = knownPeople.find((p) => p.name.toLowerCase() === rawName.toLowerCase());
+      const display = exact ? exact.name : rawName;
       const resolved = resolveKnownPersonName(rawName, knownPeople);
       out.push(
-        `<span class="doc-token doc-person" data-person="${escAttr(resolved)}">@${escHtml(resolved)}</span>`
+        `<span class="doc-token doc-person" data-person="${escAttr(resolved)}" data-mention-text="${escAttr(display)}">@${escHtml(display)}</span>`
       );
     } else if (raw.startsWith('#')) {
       const lbl = raw.slice(1).toLowerCase();
@@ -281,17 +283,38 @@ function serializeInlineNode(node: Node): string {
 
   if (tag === 'SPAN') {
     if (el.classList.contains('doc-person')) {
-      const txt = (el.textContent || '').replace(/\u00A0/g, ' ').trim();
-      if (!txt) return '';
-      if (txt.startsWith('@')) {
-        const name = txt.slice(1).trim();
-        return name ? formatPersonMention(name) : '@';
+      const rawTxt = (el.textContent || '').replace(/\u00A0/g, ' ');
+      const lead = rawTxt.match(/^\s*/)?.[0] || '';
+      const rest = rawTxt.slice(lead.length);
+      if (!rest) return lead;
+      if (rest.startsWith('@')) {
+        const afterAt = rest.slice(1);
+        const expected = (el.getAttribute('data-mention-text') || el.getAttribute('data-person') || '').trim();
+        if (
+          expected.includes(' ') &&
+          afterAt.toLowerCase().startsWith(expected.toLowerCase()) &&
+          (afterAt.length === expected.length || /^[ \t\n,.;:!?)[\]]/.test(afterAt.slice(expected.length)))
+        ) {
+          const namePart = afterAt.slice(0, expected.length);
+          const tail = afterAt.slice(expected.length);
+          return `${lead}${formatPersonMention(namePart)}${tail}`;
+        }
+        const bIdx = afterAt.search(/[ \t\n,.;:!?)[\]]/);
+        if (bIdx === -1) {
+          return afterAt ? `${lead}${formatPersonMention(afterAt)}` : `${lead}@`;
+        }
+        const namePart = afterAt.slice(0, bIdx);
+        const tail = afterAt.slice(bIdx);
+        return namePart ? `${lead}${formatPersonMention(namePart)}${tail}` : `${lead}@${tail}`;
       }
-      return txt;
+      return rawTxt;
     }
     if (el.classList.contains('doc-link')) {
-      const txt = (el.textContent || '').replace(/\u00A0/g, ' ').trim();
-      return txt ? `[[${txt}]]` : '';
+      const rawTxt = (el.textContent || '').replace(/\u00A0/g, ' ');
+      const lead = rawTxt.match(/^\s*/)?.[0] || '';
+      const trail = rawTxt.match(/\s*$/)?.[0] || '';
+      const core = rawTxt.trim();
+      return core ? `${lead}[[${core}]]${trail}` : rawTxt;
     }
     if (el.classList.contains('doc-label')) {
       return (el.textContent || '').replace(/\u00A0/g, ' ');
