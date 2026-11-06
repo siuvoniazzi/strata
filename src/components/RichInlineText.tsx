@@ -20,8 +20,9 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
   onClickLabel,
   onClickNoteLink,
 }) => {
-  // Match @[Full Name], [[Note Title]], #label, or @SingleWord
-  const tokenRegex = /(@\[[^\]]+\]|\[\[[^\]]+\]\]|(?<=^|[\s(])#[\p{L}][\p{L}\p{N}_-]{1,38}|(?<=^|[\s(])@[\p{L}][\p{L}\p{N}._-]{1,30})/gu;
+  // Match @[Full Name], [[Note Title]], #label, @SingleWord, `code`, **bold**, *italic*, ~~strike~~
+  const tokenRegex =
+    /(@\[[^\]]+\]|\[\[[^\]]+\]\]|(?<=^|[\s(])#[\p{L}][\p{L}\p{N}_-]{1,38}|(?<=^|[\s(])@[\p{L}][\p{L}\p{N}._-]{1,30}|`[^`]+`|\*\*[^*]+\*\*|(?<!\*)\*(?!\s)[^*]+(?<!\s)\*(?!\*)|~~[^~]+~~)/gu;
 
   const parts: React.ReactNode[] = [];
   let lastIdx = 0;
@@ -107,6 +108,14 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
           #{lbl}
         </button>
       );
+    } else if (raw.startsWith('`') && raw.endsWith('`')) {
+      parts.push(<code key={key}>{raw.slice(1, -1)}</code>);
+    } else if (raw.startsWith('**') && raw.endsWith('**')) {
+      parts.push(<strong key={key}>{raw.slice(2, -2)}</strong>);
+    } else if (raw.startsWith('~~') && raw.endsWith('~~')) {
+      parts.push(<s key={key}>{raw.slice(2, -2)}</s>);
+    } else if (raw.startsWith('*') && raw.endsWith('*')) {
+      parts.push(<em key={key}>{raw.slice(1, -1)}</em>);
     }
 
     lastIdx = match.index + raw.length;

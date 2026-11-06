@@ -1,16 +1,24 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Bold,
   Calendar,
   CheckSquare,
   Code2,
+  ExternalLink,
   Eye,
   FilePlus2,
   FolderKanban,
   Gavel,
   Hash,
+  Italic,
   Link2,
+  List,
+  ListOrdered,
   MailPlus,
+  Plus,
+  Quote,
   Sparkles,
+  Strikethrough,
   Trash2,
   UserCheck,
   UserPlus,
@@ -25,8 +33,6 @@ import type {
   WorkspaceDirectory,
 } from '../types';
 import {
-  deleteDecisionFromBody,
-  deleteTaskFromBody,
   detectUnlinkedPeopleInText,
   formatPersonMention,
   getAllNoteLabels,
@@ -35,11 +41,13 @@ import {
   parseNoteItems,
   removeLabelFromNote,
   slugify,
-  updateDecisionInBody,
-  updateTaskInBody,
 } from '../utils/markdown';
+import {
+  domToMarkdown,
+  markdownToHtml,
+  sanitizePastedHtml,
+} from '../utils/docSerializer';
 import { NOTE_TEMPLATES } from '../utils/seedData';
-import { RichInlineText } from './RichInlineText';
 
 interface HybridEditorProps {
   note: Note;
@@ -63,11 +71,146 @@ type AutocompleteTrigger = {
   query: string;
   tokenStart: number;
   cursorPos: number;
+  textNode: Text | null;
   rect: { top: number; left: number };
+};
+
+type ActiveTokenPopover = {
+  kind: 'person' | 'label' | 'link';
+  value: string;
+  rect: { top: number; left: number };
+};
+
+type ActiveFormatState = {
+  block: 'p' | 'h1' | 'h2' | 'h3' | 'ul' | 'ol' | 'blockquote' | 'task' | 'decision';
+  bold: boolean;
+  italic: boolean;
+  strike: boolean;
 };
 
 const TASK_CYCLE: TaskStatus[] = ['todo', 'doing', 'waiting', 'done'];
 const DECISION_CYCLE: DecisionStatus[] = ['agreed', 'proposed', 'superseded'];
+
+function placeCaretAtStart(el: HTMLElement) {
+  const sel = window.getSelection();
+  if (!sel) return;
+  const range = document.createRange();
+  if (el.firstChild && el.firstChild.nodeType === Node.TEXT_NODE) {
+    range.setStart(el.firstChild, 0);
+  } else {
+    range.setStart(el, 0);
+  }
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function placeCaretAtEnd(el: HTMLElement) {
+  const sel = window.getSelection();
+  if (!sel) return;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function isCaretAtStartOfBlock(block: HTMLElement, range: Range): boolean {
+  if (!range.collapsed) return false;
+  const probe = document.createRange();
+  probe.selectNodeContents(block);
+  probe.setEnd(range.startContainer, range.startOffset);
+  return probe.toString().length === 0;
+}
+
+function replaceBlockElement(target: HTMLElement, replacement: HTMLElement): HTMLElement {
+  const parent = target.parentElement;
+  if (!parent) return replacement;
+
+  // If replacing an <li> inside a <ul> or <ol>, split or unwrap the list cleanly
+  if (target.tagName === 'LI' && (parent.tagName === 'UL' || parent.tagName === 'OL')) {
+    const list = parent;
+    const prevItems: Element[] = [];
+    const nextItems: Element[] = [];
+    let seenTarget = false;
+    Array.from(list.children).forEach((child) => {
+      if (child === target) {
+        seenTarget = true;
+      } else if (!seenTarget) {
+        prevItems.push(child);
+      } else {
+        nextItems.push(child);
+      }
+    });
+
+    const frag = document.createDocumentFragment();
+    if (prevItems.length > 0) {
+      const beforeList = document.createElement(list.tagName.toLowerCase());
+      prevItems.forEach((item) => beforeList.appendChild(item));
+      frag.appendChild(beforeList);
+    }
+    frag.appendChild(replacement);
+    if (nextItems.length > 0) {
+      const afterList = document.createElement(list.tagName.toLowerCase());
+      nextItems.forEach((item) => afterList.appendChild(item));
+      frag.appendChild(afterList);
+    }
+    list.replaceWith(frag);
+    return replacement;
+  }
+
+  target.replaceWith(replacement);
+  return replacement;
+}
+
+function findEditableBlock(node: Node | null, root: HTMLElement): HTMLElement | null {
+  let curr: Node | null = node;
+  while (curr && curr !== root) {
+    if (curr.nodeType === Node.ELEMENT_NODE) {
+      const el = curr as HTMLElement;
+      const tag = el.tagName.toUpperCase();
+      if (
+        tag === 'P' ||
+        tag === 'H1' ||
+        tag === 'H2' ||
+        tag === 'H3' ||
+        tag === 'LI' ||
+        tag === 'BLOCKQUOTE' ||
+        tag === 'DIV'
+      ) {
+        return el;
+      }
+    }
+    curr = curr.parentNode;
+  }
+  return null;
+}
+
+function getSelectedEditableBlocks(root: HTMLElement): HTMLElement[] {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return [];
+  const range = sel.getRangeAt(0);
+  if (!root.contains(range.commonAncestorContainer)) return [];
+
+  if (range.collapsed) {
+    const single = findEditableBlock(range.startContainer, root);
+    return single ? [single] : [];
+  }
+
+  const candidates: HTMLElement[] = [];
+  Array.from(root.children).forEach((child) => {
+    const el = child as HTMLElement;
+    const tag = el.tagName.toUpperCase();
+    if (tag === 'UL' || tag === 'OL') {
+      Array.from(el.children).forEach((li) => {
+        if (range.intersectsNode(li)) candidates.push(li as HTMLElement);
+      });
+    } else if (range.intersectsNode(el)) {
+      candidates.push(el);
+    }
+  });
+  return candidates;
+}
 
 export const HybridEditor: React.FC<HybridEditorProps> = ({
   note,
@@ -86,7 +229,6 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   onOpenQuickAsk,
 }) => {
   const [rawMode, setRawMode] = useState(false);
-  const [activeLineIdx, setActiveLineIdx] = useState<number | null>(null);
   const [participantInput, setParticipantInput] = useState('');
   const [labelInput, setLabelInput] = useState('');
   const [showInviteModal, setShowInviteModal] = useState(false);
@@ -96,38 +238,31 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const [newProjectPrompt, setNewProjectPrompt] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+  const [showInsertMenu, setShowInsertMenu] = useState(false);
 
   const [autocomplete, setAutocomplete] = useState<AutocompleteTrigger | null>(null);
   const [acIndex, setAcIndex] = useState(0);
+  const [activeToken, setActiveToken] = useState<ActiveTokenPopover | null>(null);
+  const [activeFormat, setActiveFormat] = useState<ActiveFormatState>({
+    block: 'p',
+    bold: false,
+    italic: false,
+    strike: false,
+  });
 
-  const lineInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const docRef = useRef<HTMLDivElement | null>(null);
   const rawTextareaRef = useRef<HTMLTextAreaElement | null>(null);
-
-  const lines = useMemo(() => {
-    const arr = note.body.split('\n');
-    return arr.length === 0 ? [''] : arr;
-  }, [note.body]);
+  const titleInputRef = useRef<HTMLInputElement | null>(null);
+  const lastSyncedNoteIdRef = useRef<string>('');
+  const lastEmittedMarkdownRef = useRef<string>(note.body);
+  const isComposingRef = useRef<boolean>(false);
+  const noteRef = useRef<Note>(note);
+  noteRef.current = note;
 
   const parsedItems = useMemo(
     () => parseNoteItems(note, directory.people),
     [note, directory.people]
   );
-
-  const tasksByLine = useMemo(() => {
-    const m = new Map<number, (typeof parsedItems.tasks)[number]>();
-    for (const t of parsedItems.tasks) m.set(t.lineIndex, t);
-    return m;
-  }, [parsedItems.tasks]);
-
-  const decisionsByLine = useMemo(() => {
-    const m = new Map<number, (typeof parsedItems.decisions)[number]>();
-    const rationaleLines = new Set<number>();
-    for (const d of parsedItems.decisions) {
-      m.set(d.lineIndex, d);
-      if (d.rationaleLineIndex !== null) rationaleLines.add(d.rationaleLineIndex);
-    }
-    return { map: m, rationaleLines };
-  }, [parsedItems.decisions]);
 
   const combinedLabels = useMemo(() => getAllNoteLabels(note), [note]);
 
@@ -135,15 +270,6 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     () => detectUnlinkedPeopleInText(note.body, directory.people),
     [note.body, directory.people]
   );
-
-  useEffect(() => {
-    if (activeLineIdx !== null && lineInputRef.current) {
-      const el = lineInputRef.current;
-      el.focus();
-      el.style.height = 'auto';
-      el.style.height = `${el.scrollHeight}px`;
-    }
-  }, [activeLineIdx]);
 
   const availableProjects = useMemo(() => {
     if (note.scope === 'client') {
@@ -155,13 +281,161 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     return [];
   }, [directory.projects, note.scope, note.clientId]);
 
-  const patchNote = (partial: Partial<Note>) => {
-    onUpdateNote({
-      ...note,
-      ...partial,
-      updatedAt: new Date().toISOString(),
-    });
-  };
+  const patchNote = useCallback(
+    (partial: Partial<Note>) => {
+      const current = noteRef.current;
+      onUpdateNote({
+        ...current,
+        ...partial,
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    [onUpdateNote]
+  );
+
+  const syncEmptyAttr = useCallback(() => {
+    const el = docRef.current;
+    if (!el) return;
+    const singleChild = el.children.length <= 1 ? (el.firstElementChild as HTMLElement | null) : null;
+    const isPlainEmpty =
+      !el.textContent?.trim() &&
+      (!singleChild ||
+        (singleChild.tagName === 'P' &&
+          !singleChild.classList.contains('doc-task') &&
+          !singleChild.classList.contains('doc-decision')));
+    el.setAttribute('data-empty', isPlainEmpty ? 'true' : 'false');
+  }, []);
+
+  // Hydrate contentEditable DOM ONLY when switching notes, leaving rawMode, or when note.body changed externally
+  useEffect(() => {
+    if (rawMode) return;
+    const el = docRef.current;
+    if (!el) return;
+
+    const noteChanged = lastSyncedNoteIdRef.current !== note.id;
+    const externalBodyChanged = note.body !== lastEmittedMarkdownRef.current;
+
+    if (noteChanged || externalBodyChanged || el.innerHTML === '') {
+      el.innerHTML = markdownToHtml(note.body, directory.people);
+      lastSyncedNoteIdRef.current = note.id;
+      lastEmittedMarkdownRef.current = note.body;
+      syncEmptyAttr();
+    }
+  }, [note.id, note.body, rawMode, directory.people, syncEmptyAttr]);
+
+  const emitMarkdownFromDom = useCallback(() => {
+    const el = docRef.current;
+    if (!el) return;
+    const rawTrimmed = el.innerHTML.trim();
+    if (rawTrimmed === '' || /^<br\s*\/?>$/i.test(rawTrimmed)) {
+      el.innerHTML = '<p><br></p>';
+      placeCaretAtStart(el.firstElementChild as HTMLElement);
+    } else if (el.childNodes.length === 1 && el.firstChild?.nodeType === Node.TEXT_NODE) {
+      const txtNode = el.firstChild as Text;
+      const sel = window.getSelection();
+      const savedOffset = sel && sel.anchorNode === txtNode ? sel.anchorOffset : txtNode.length;
+      const p = document.createElement('p');
+      el.replaceChild(p, txtNode);
+      p.appendChild(txtNode);
+      if (sel) {
+        const r = document.createRange();
+        r.setStart(txtNode, savedOffset);
+        r.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(r);
+      }
+    }
+    syncEmptyAttr();
+    const md = domToMarkdown(el);
+    if (md !== lastEmittedMarkdownRef.current) {
+      lastEmittedMarkdownRef.current = md;
+      patchNote({ body: md });
+    }
+  }, [patchNote, syncEmptyAttr]);
+
+  // Refresh active toolbar button state & token link chip when selection moves
+  const refreshSelectionToolbarState = useCallback(() => {
+    const root = docRef.current;
+    if (!root) return;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0 || !root.contains(sel.anchorNode)) {
+      setActiveToken(null);
+      return;
+    }
+
+    const blockEl = findEditableBlock(sel.anchorNode, root);
+    let blockType: ActiveFormatState['block'] = 'p';
+    if (blockEl) {
+      const tag = blockEl.tagName.toUpperCase();
+      if (blockEl.classList.contains('doc-task')) blockType = 'task';
+      else if (blockEl.classList.contains('doc-decision')) blockType = 'decision';
+      else if (tag === 'H1') blockType = 'h1';
+      else if (tag === 'H2') blockType = 'h2';
+      else if (tag === 'H3') blockType = 'h3';
+      else if (tag === 'BLOCKQUOTE') blockType = 'blockquote';
+      else if (tag === 'LI') {
+        blockType = blockEl.parentElement?.tagName.toUpperCase() === 'OL' ? 'ol' : 'ul';
+      }
+    }
+
+    let bold = false;
+    let italic = false;
+    let strike = false;
+    try {
+      bold = document.queryCommandState('bold');
+      italic = document.queryCommandState('italic');
+      strike = document.queryCommandState('strikeThrough');
+    } catch {
+      // Ignore queryCommandState exceptions in non-standard contexts
+    }
+
+    setActiveFormat({ block: blockType, bold, italic, strike });
+
+    // Check if cursor rests inside an inline @person, #label, or [[note]] token
+    let node: Node | null = sel.anchorNode;
+    let foundToken: HTMLElement | null = null;
+    while (node && node !== root) {
+      if (node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).classList.contains('doc-token')) {
+        foundToken = node as HTMLElement;
+        break;
+      }
+      node = node.parentNode;
+    }
+
+    if (foundToken && sel.isCollapsed) {
+      const rect = foundToken.getBoundingClientRect();
+      const top = Math.min(window.innerHeight - 56, rect.bottom + 6);
+      const left = Math.max(12, Math.min(window.innerWidth - 240, rect.left));
+      if (foundToken.classList.contains('doc-person')) {
+        const name = (foundToken.textContent || '').replace(/^@+/, '').trim();
+        if (name) {
+          setActiveToken({ kind: 'person', value: name, rect: { top, left } });
+          return;
+        }
+      } else if (foundToken.classList.contains('doc-label')) {
+        const lbl = normalizeLabel(foundToken.textContent || '');
+        if (lbl) {
+          setActiveToken({ kind: 'label', value: lbl, rect: { top, left } });
+          return;
+        }
+      } else if (foundToken.classList.contains('doc-link')) {
+        const title = (foundToken.textContent || '').trim();
+        if (title) {
+          setActiveToken({ kind: 'link', value: title, rect: { top, left } });
+          return;
+        }
+      }
+    }
+    setActiveToken(null);
+  }, []);
+
+  useEffect(() => {
+    const onSelectionChange = () => {
+      if (!rawMode) refreshSelectionToolbarState();
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
+  }, [rawMode, refreshSelectionToolbarState]);
 
   const handleScopeOrClientChange = (val: string) => {
     if (val === '__new_client__') {
@@ -191,7 +465,6 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       ? note.participants
       : [...note.participants, person.name];
 
-    // Smart Client Inference: if note is still in Inbox and this person belongs to a Client, infer that Client!
     const inferredPatch: Partial<Note> = { participants: nextParticipants };
     if (note.scope === 'inbox' && !note.clientId && person.clientId) {
       inferredPatch.scope = 'client';
@@ -235,15 +508,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     if (!tpl) return;
     const nextBody = note.body.trim() ? `${note.body.trim()}\n\n${tpl.body}` : tpl.body;
     const nextTitle = !note.title.trim() && tpl.titlePrefix ? tpl.titlePrefix : note.title;
+    lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
     patchNote({ title: nextTitle, body: nextBody });
-  };
-
-  const appendBlockSnippet = (snippet: string) => {
-    const base = note.body.trimEnd();
-    const nextBody = base ? `${base}\n${snippet}` : snippet;
-    patchNote({ body: nextBody });
-    const nextLines = nextBody.split('\n');
-    setActiveLineIdx(nextLines.length - 1);
+    setShowInsertMenu(false);
   };
 
   const linkNaturalPersonEverywhere = (person: Person) => {
@@ -252,14 +519,45 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       new RegExp(`(?<!@\\[?)\\b${esc}\\b`, 'g'),
       formatPersonMention(person.name)
     );
+    lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
     patchNote({ body: updatedBody });
   };
 
-  // Detect @, #, [[, or / autocomplete triggers on active input/textarea
-  const detectAutocomplete = (value: string, cursorPos: number, el: HTMLTextAreaElement) => {
-    const uptoCursor = value.slice(0, cursorPos);
-    const rect = el.getBoundingClientRect();
-    const popRect = { top: Math.min(window.innerHeight - 250, rect.bottom + 4), left: Math.min(window.innerWidth - 300, rect.left + 16) };
+  // Detect @, #, [[, or / autocomplete triggers at exact caret location in contentEditable or raw textarea
+  const detectDocAutocomplete = useCallback(() => {
+    const root = docRef.current;
+    if (!root) return;
+    const sel = window.getSelection();
+    if (!sel || !sel.isCollapsed || sel.rangeCount === 0 || !root.contains(sel.anchorNode)) {
+      setAutocomplete(null);
+      return;
+    }
+
+    const range = sel.getRangeAt(0);
+    if (range.startContainer.nodeType !== Node.TEXT_NODE) {
+      setAutocomplete(null);
+      return;
+    }
+
+    // Do not re-trigger autocomplete inside an already-created token span
+    const parentEl = range.startContainer.parentElement;
+    if (parentEl && parentEl.classList.contains('doc-token')) {
+      setAutocomplete(null);
+      return;
+    }
+
+    const textNode = range.startContainer as Text;
+    const cursorPos = range.startOffset;
+    const uptoCursor = (textNode.nodeValue || '').slice(0, cursorPos).replace(/\u00A0/g, ' ');
+
+    const rawRect = range.getBoundingClientRect();
+    const fallbackRect = parentEl ? parentEl.getBoundingClientRect() : root.getBoundingClientRect();
+    const anchorTop = rawRect.top > 0 ? rawRect.bottom : fallbackRect.bottom;
+    const anchorLeft = rawRect.left > 0 ? rawRect.left : fallbackRect.left;
+    const popRect = {
+      top: Math.min(window.innerHeight - 250, anchorTop + 6),
+      left: Math.max(12, Math.min(window.innerWidth - 300, anchorLeft)),
+    };
 
     const linkMatch = uptoCursor.match(/\[\[([^\]]{0,35})$/);
     if (linkMatch) {
@@ -268,6 +566,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         query: linkMatch[1],
         tokenStart: cursorPos - linkMatch[0].length,
         cursorPos,
+        textNode,
         rect: popRect,
       });
       setAcIndex(0);
@@ -282,6 +581,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         query: personMatch[1],
         tokenStart: atIdx,
         cursorPos,
+        textNode,
         rect: popRect,
       });
       setAcIndex(0);
@@ -296,6 +596,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         query: labelMatch[1],
         tokenStart: hashIdx,
         cursorPos,
+        textNode,
         rect: popRect,
       });
       setAcIndex(0);
@@ -310,6 +611,60 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         query: slashMatch[1].toLowerCase(),
         tokenStart: slashIdx,
         cursorPos,
+        textNode,
+        rect: popRect,
+      });
+      setAcIndex(0);
+      return;
+    }
+
+    setAutocomplete(null);
+  }, []);
+
+  const detectRawAutocomplete = (value: string, cursorPos: number, el: HTMLTextAreaElement) => {
+    const uptoCursor = value.slice(0, cursorPos);
+    const rect = el.getBoundingClientRect();
+    const popRect = {
+      top: Math.min(window.innerHeight - 250, rect.top + 48),
+      left: Math.max(12, Math.min(window.innerWidth - 300, rect.left + 16)),
+    };
+
+    const linkMatch = uptoCursor.match(/\[\[([^\]]{0,35})$/);
+    if (linkMatch) {
+      setAutocomplete({
+        kind: 'link',
+        query: linkMatch[1],
+        tokenStart: cursorPos - linkMatch[0].length,
+        cursorPos,
+        textNode: null,
+        rect: popRect,
+      });
+      setAcIndex(0);
+      return;
+    }
+
+    const personMatch = uptoCursor.match(/(?:^|[\s(])@([\p{L}\p{N}\s._-]{0,28})$/u);
+    if (personMatch && !personMatch[1].includes('  ')) {
+      setAutocomplete({
+        kind: 'person',
+        query: personMatch[1],
+        tokenStart: uptoCursor.lastIndexOf('@'),
+        cursorPos,
+        textNode: null,
+        rect: popRect,
+      });
+      setAcIndex(0);
+      return;
+    }
+
+    const labelMatch = uptoCursor.match(/(?:^|[\s(])#([\p{L}\p{N}_-]{0,28})$/u);
+    if (labelMatch) {
+      setAutocomplete({
+        kind: 'label',
+        query: labelMatch[1],
+        tokenStart: uptoCursor.lastIndexOf('#'),
+        cursorPos,
+        textNode: null,
         rect: popRect,
       });
       setAcIndex(0);
@@ -334,6 +689,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             label: `@${p.name}`,
             sub: [p.role, clientName].filter(Boolean).join(' · '),
             replacement: `${formatPersonMention(p.name)} `,
+            tokenValue: p.name,
             createPersonName: null as string | null,
           };
         });
@@ -344,6 +700,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           label: `+ Create person "${displayNew}"`,
           sub: 'Add to directory & mention',
           replacement: `${formatPersonMention(displayNew)} `,
+          tokenValue: displayNew,
           createPersonName: displayNew,
         });
       }
@@ -359,6 +716,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           label: `#${l}`,
           sub: 'Topic / Label',
           replacement: `#${l} `,
+          tokenValue: l,
           createPersonName: null as string | null,
         }));
       const normQ = normalizeLabel(q);
@@ -368,6 +726,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           label: `+ Create #${normQ}`,
           sub: 'New frictionless label',
           replacement: `#${normQ} `,
+          tokenValue: normQ,
           createPersonName: null,
         });
       }
@@ -383,18 +742,23 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           label: n.title || 'Untitled',
           sub: n.date,
           replacement: `[[${n.title}]] `,
+          tokenValue: n.title || 'Untitled',
           createPersonName: null as string | null,
         }));
     }
 
     if (autocomplete.kind === 'slash') {
+      const dueStr = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
       const commands = [
-        { id: 'task', label: '/task — Action item checkbox', sub: '- [ ] Task', replacement: '- [ ] ' },
-        { id: 'decision', label: '/decision — Agreed decision', sub: '- [D:agreed]', replacement: '- [D:agreed] ' },
-        { id: 'proposed', label: '/proposed — Proposed decision', sub: '- [D:proposed]', replacement: '- [D:proposed] ' },
-        { id: 'due', label: '/due — Add due date ( +3d )', sub: 'due:YYYY-MM-DD', replacement: `due:${new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10)} ` },
-        { id: 'h2', label: '/h2 — Section heading', sub: '## Heading', replacement: '## ' },
-        { id: 'ask', label: '/ask — Query past notes context', sub: 'Open Context Ask', replacement: '__OPEN_ASK__' },
+        { id: 'task', label: '/task — Action item checkbox', sub: 'Checklist task', replacement: '__BLOCK_TASK__', tokenValue: '' },
+        { id: 'decision', label: '/decision — Agreed decision', sub: 'Decision record', replacement: '__BLOCK_DECISION__', tokenValue: '' },
+        { id: 'proposed', label: '/proposed — Proposed decision', sub: 'Proposed status', replacement: '__BLOCK_PROPOSED__', tokenValue: '' },
+        { id: 'h1', label: '/h1 — Large section heading', sub: 'Heading 1', replacement: '__BLOCK_H1__', tokenValue: '' },
+        { id: 'h2', label: '/h2 — Section heading', sub: 'Heading 2', replacement: '__BLOCK_H2__', tokenValue: '' },
+        { id: 'bullet', label: '/bullet — Bullet list', sub: 'Unordered list', replacement: '__BLOCK_UL__', tokenValue: '' },
+        { id: 'quote', label: '/quote — Callout / Rationale quote', sub: 'Blockquote', replacement: '__BLOCK_QUOTE__', tokenValue: '' },
+        { id: 'due', label: '/due — Insert due date (+3d)', sub: `due:${dueStr}`, replacement: `due:${dueStr} `, tokenValue: `due:${dueStr}` },
+        { id: 'ask', label: '/ask — Query past notes context', sub: 'Open Context Ask', replacement: '__OPEN_ASK__', tokenValue: '' },
       ];
       return commands
         .filter((c) => !q || c.id.includes(q) || c.label.toLowerCase().includes(q))
@@ -404,13 +768,108 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     return [];
   }, [autocomplete, directory.people, directory.clients, allWorkspaceLabels, allNotes, note.id]);
 
+  // Toolbar & Slash block conversion on continuous document page
+  const applyBlockStyle = useCallback(
+    (targetStyle: 'p' | 'h1' | 'h2' | 'h3' | 'ul' | 'ol' | 'blockquote' | 'task' | 'decision' | 'proposed') => {
+      const root = docRef.current;
+      if (!root) return;
+      root.focus();
+
+      if (targetStyle === 'ul' || targetStyle === 'ol') {
+        // Clear custom task/decision classes first so native list toggle works cleanly
+        getSelectedEditableBlocks(root).forEach((blk) => {
+          blk.classList.remove('doc-task', 'doc-decision', 'doc-rationale');
+          blk.removeAttribute('data-status');
+        });
+        document.execCommand(targetStyle === 'ul' ? 'insertUnorderedList' : 'insertOrderedList');
+        emitMarkdownFromDom();
+        refreshSelectionToolbarState();
+        return;
+      }
+
+      let blocks = getSelectedEditableBlocks(root);
+      if (blocks.length === 0) {
+        const first = (root.firstElementChild as HTMLElement) || document.createElement('p');
+        if (!first.parentElement) {
+          first.innerHTML = '<br>';
+          root.appendChild(first);
+        }
+        blocks = [first];
+      }
+
+      const allAlreadySame = blocks.every((b) => {
+        if (targetStyle === 'task') return b.classList.contains('doc-task');
+        if (targetStyle === 'decision' || targetStyle === 'proposed') return b.classList.contains('doc-decision');
+        if (targetStyle === 'blockquote') return b.tagName.toUpperCase() === 'BLOCKQUOTE';
+        return (
+          b.tagName.toUpperCase() === targetStyle.toUpperCase() &&
+          !b.classList.contains('doc-task') &&
+          !b.classList.contains('doc-decision')
+        );
+      });
+
+      let lastCreated: HTMLElement | null = null;
+
+      blocks.forEach((blk) => {
+        const inner = blk.innerHTML || '<br>';
+        let nextEl: HTMLElement;
+
+        if (allAlreadySame && targetStyle !== 'p') {
+          nextEl = document.createElement('p');
+        } else if (targetStyle === 'task') {
+          nextEl = document.createElement('p');
+          nextEl.className = 'doc-task';
+          nextEl.setAttribute('data-status', 'todo');
+        } else if (targetStyle === 'decision' || targetStyle === 'proposed') {
+          nextEl = document.createElement('p');
+          nextEl.className = 'doc-decision';
+          nextEl.setAttribute('data-status', targetStyle === 'proposed' ? 'proposed' : 'agreed');
+        } else if (targetStyle === 'blockquote') {
+          nextEl = document.createElement('blockquote');
+          if (blk.previousElementSibling?.classList.contains('doc-decision')) {
+            nextEl.className = 'doc-rationale';
+          }
+        } else {
+          nextEl = document.createElement(targetStyle);
+        }
+
+        nextEl.innerHTML = inner;
+        lastCreated = replaceBlockElement(blk, nextEl);
+      });
+
+      if (lastCreated) {
+        placeCaretAtEnd(lastCreated);
+      }
+      emitMarkdownFromDom();
+      refreshSelectionToolbarState();
+    },
+    [emitMarkdownFromDom, refreshSelectionToolbarState]
+  );
+
+  const applyInlineCommand = (cmd: 'bold' | 'italic' | 'strikeThrough') => {
+    const root = docRef.current;
+    if (!root) return;
+    root.focus();
+    document.execCommand(cmd);
+    emitMarkdownFromDom();
+    refreshSelectionToolbarState();
+  };
+
   const applyAutocompleteItem = (item: (typeof autocompleteItems)[number]) => {
     if (!autocomplete) return;
     if (item.replacement === '__OPEN_ASK__') {
+      if (autocomplete.textNode) {
+        const r = document.createRange();
+        r.setStart(autocomplete.textNode, autocomplete.tokenStart);
+        r.setEnd(autocomplete.textNode, autocomplete.cursorPos);
+        r.deleteContents();
+        emitMarkdownFromDom();
+      }
       setAutocomplete(null);
       onOpenQuickAsk();
       return;
     }
+
     if (item.createPersonName) {
       onEnsurePerson(item.createPersonName, note.clientId);
     }
@@ -419,45 +878,271 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const full = note.body;
       const updated =
         full.slice(0, autocomplete.tokenStart) + item.replacement + full.slice(autocomplete.cursorPos);
+      lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
       patchNote({ body: updated });
       setAutocomplete(null);
       return;
     }
 
-    if (activeLineIdx !== null) {
-      const currentLine = lines[activeLineIdx] || '';
-      // If slash command inserts a block prefix at start of line, replace leading bullet cleanly
-      let nextLine: string;
-      if (autocomplete.kind === 'slash' && item.replacement.startsWith('- [')) {
-        nextLine = item.replacement + currentLine.slice(autocomplete.cursorPos).trimStart();
-      } else {
-        nextLine =
-          currentLine.slice(0, autocomplete.tokenStart) +
-          item.replacement +
-          currentLine.slice(autocomplete.cursorPos);
-      }
-      const nextLines = [...lines];
-      nextLines[activeLineIdx] = nextLine;
-      patchNote({ body: nextLines.join('\n') });
+    const root = docRef.current;
+    if (!root || !autocomplete.textNode || !root.contains(autocomplete.textNode)) {
       setAutocomplete(null);
-    }
-  };
-
-  const updateSingleLine = (idx: number, value: string) => {
-    const nextLines = [...lines];
-    // If multi-line text was pasted into a single block, split cleanly into lines!
-    if (value.includes('\n')) {
-      const splitPasted = value.split(/\r?\n/);
-      nextLines.splice(idx, 1, ...splitPasted);
-      patchNote({ body: nextLines.join('\n') });
-      setActiveLineIdx(idx + splitPasted.length - 1);
       return;
     }
-    nextLines[idx] = value;
-    patchNote({ body: nextLines.join('\n') });
+
+    const delRange = document.createRange();
+    delRange.setStart(autocomplete.textNode, autocomplete.tokenStart);
+    delRange.setEnd(autocomplete.textNode, autocomplete.cursorPos);
+    delRange.deleteContents();
+
+    const sel = window.getSelection();
+    if (sel) {
+      sel.removeAllRanges();
+      sel.addRange(delRange);
+    }
+
+    // Handle slash block conversions cleanly in-place
+    if (item.replacement.startsWith('__BLOCK_')) {
+      const blk = findEditableBlock(delRange.startContainer, root);
+      if (blk && !blk.textContent?.trim()) {
+        blk.innerHTML = '<br>';
+      }
+      setAutocomplete(null);
+      if (item.replacement === '__BLOCK_TASK__') applyBlockStyle('task');
+      else if (item.replacement === '__BLOCK_DECISION__') applyBlockStyle('decision');
+      else if (item.replacement === '__BLOCK_PROPOSED__') applyBlockStyle('proposed');
+      else if (item.replacement === '__BLOCK_H1__') applyBlockStyle('h1');
+      else if (item.replacement === '__BLOCK_H2__') applyBlockStyle('h2');
+      else if (item.replacement === '__BLOCK_UL__') applyBlockStyle('ul');
+      else if (item.replacement === '__BLOCK_QUOTE__') applyBlockStyle('blockquote');
+      return;
+    }
+
+    // Insert rich inline token span + trailing normal space outside the span
+    const span = document.createElement('span');
+    if (autocomplete.kind === 'person') {
+      span.className = 'doc-token doc-person';
+      span.setAttribute('data-person', item.tokenValue);
+      span.textContent = `@${item.tokenValue}`;
+    } else if (autocomplete.kind === 'label') {
+      span.className = 'doc-token doc-label';
+      span.setAttribute('data-label', item.tokenValue);
+      span.textContent = `#${item.tokenValue}`;
+    } else if (autocomplete.kind === 'link') {
+      span.className = 'doc-token doc-link';
+      span.setAttribute('data-link', item.tokenValue);
+      span.textContent = item.tokenValue;
+    } else {
+      span.className = 'doc-token doc-due';
+      span.textContent = item.tokenValue;
+    }
+
+    const trailingSpace = document.createTextNode(' ');
+    delRange.insertNode(trailingSpace);
+    delRange.insertNode(span);
+
+    if (sel) {
+      const afterRange = document.createRange();
+      afterRange.setStart(trailingSpace, 1);
+      afterRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(afterRange);
+    }
+
+    setAutocomplete(null);
+    emitMarkdownFromDom();
   };
 
-  const handleLineKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>, idx: number) => {
+  // Auto-convert Markdown prefixes (# , ## , - , 1. , [] , [d] , > ) into live WYSIWYG blocks on Space
+  const tryApplyAutoMarkdownPrefix = (): boolean => {
+    const root = docRef.current;
+    if (!root) return false;
+    const sel = window.getSelection();
+    if (!sel || !sel.isCollapsed || sel.rangeCount === 0) return false;
+    const range = sel.getRangeAt(0);
+    if (range.startContainer.nodeType !== Node.TEXT_NODE) return false;
+
+    const blk = findEditableBlock(range.startContainer, root);
+    if (!blk) return false;
+
+    const probe = document.createRange();
+    probe.selectNodeContents(blk);
+    probe.setEnd(range.startContainer, range.startOffset);
+    const prefix = probe.toString().replace(/\u00A0/g, ' ');
+
+    const stripPrefixAndConvert = (createNewBlock: () => HTMLElement) => {
+      probe.deleteContents();
+      const next = createNewBlock();
+      next.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
+      const mounted = replaceBlockElement(blk, next);
+      placeCaretAtStart(mounted);
+      emitMarkdownFromDom();
+      refreshSelectionToolbarState();
+      return true;
+    };
+
+    const tag = blk.tagName.toUpperCase();
+    const isPlainParagraph =
+      (tag === 'P' || tag === 'DIV') &&
+      !blk.classList.contains('doc-task') &&
+      !blk.classList.contains('doc-decision');
+
+    // Inside a fresh <li> (e.g. user typed "- " which became <li>, then typed "[ ] " or "[D] ")
+    if (tag === 'LI') {
+      const liTaskMatch = prefix.match(/^\[([ /?xX])\]\s$/);
+      if (liTaskMatch) {
+        const ch = liTaskMatch[1].toLowerCase();
+        const st: TaskStatus = ch === 'x' ? 'done' : ch === '/' ? 'doing' : ch === '?' ? 'waiting' : 'todo';
+        return stripPrefixAndConvert(() => {
+          const p = document.createElement('p');
+          p.className = 'doc-task';
+          p.setAttribute('data-status', st);
+          return p;
+        });
+      }
+      const liDecMatch = prefix.match(/^\[D(?::(agreed|proposed|superseded))?\]\s$/i);
+      if (liDecMatch) {
+        const st = (liDecMatch[1] || 'agreed').toLowerCase();
+        return stripPrefixAndConvert(() => {
+          const p = document.createElement('p');
+          p.className = 'doc-decision';
+          p.setAttribute('data-status', st);
+          return p;
+        });
+      }
+      return false;
+    }
+
+    if (!isPlainParagraph) return false;
+
+    if (prefix === '# ') {
+      return stripPrefixAndConvert(() => document.createElement('h1'));
+    }
+    if (prefix === '## ') {
+      return stripPrefixAndConvert(() => document.createElement('h2'));
+    }
+    if (prefix === '### ') {
+      return stripPrefixAndConvert(() => document.createElement('h3'));
+    }
+    if (prefix === '> ') {
+      return stripPrefixAndConvert(() => {
+        const bq = document.createElement('blockquote');
+        if (blk.previousElementSibling?.classList.contains('doc-decision')) {
+          bq.className = 'doc-rationale';
+        }
+        return bq;
+      });
+    }
+    if (/^(?:[-*]\s*)?\[([ /?xX])?\]\s$/.test(prefix)) {
+      const m = prefix.match(/\[([ /?xX])?\]/);
+      const ch = (m?.[1] || ' ').toLowerCase();
+      const st: TaskStatus = ch === 'x' ? 'done' : ch === '/' ? 'doing' : ch === '?' ? 'waiting' : 'todo';
+      return stripPrefixAndConvert(() => {
+        const p = document.createElement('p');
+        p.className = 'doc-task';
+        p.setAttribute('data-status', st);
+        return p;
+      });
+    }
+    if (/^(?:[-*]\s*)?\[D(?::(agreed|proposed|superseded))?\]\s$/i.test(prefix)) {
+      const m = prefix.match(/\[D(?::(agreed|proposed|superseded))?\]/i);
+      const st = (m?.[1] || 'agreed').toLowerCase();
+      return stripPrefixAndConvert(() => {
+        const p = document.createElement('p');
+        p.className = 'doc-decision';
+        p.setAttribute('data-status', st);
+        return p;
+      });
+    }
+    if (prefix === '- ' || prefix === '* ') {
+      probe.deleteContents();
+      const li = document.createElement('li');
+      li.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
+      const prev = blk.previousElementSibling;
+      if (prev && prev.tagName.toUpperCase() === 'UL') {
+        prev.appendChild(li);
+        blk.remove();
+      } else {
+        const ul = document.createElement('ul');
+        ul.appendChild(li);
+        blk.replaceWith(ul);
+      }
+      placeCaretAtStart(li);
+      emitMarkdownFromDom();
+      refreshSelectionToolbarState();
+      return true;
+    }
+    if (prefix === '1. ') {
+      probe.deleteContents();
+      const li = document.createElement('li');
+      li.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
+      const prev = blk.previousElementSibling;
+      if (prev && prev.tagName.toUpperCase() === 'OL') {
+        prev.appendChild(li);
+        blk.remove();
+      } else {
+        const ol = document.createElement('ol');
+        ol.appendChild(li);
+        blk.replaceWith(ol);
+      }
+      placeCaretAtStart(li);
+      emitMarkdownFromDom();
+      refreshSelectionToolbarState();
+      return true;
+    }
+
+    return false;
+  };
+
+  // Prevent typing spaces/punctuation at the right edge of an inline token from bleeding token color
+  const handleDocBeforeInput = (e: React.FormEvent<HTMLDivElement>) => {
+    const native = e.nativeEvent as InputEvent;
+    if (native.inputType !== 'insertText' || !native.data) return;
+    if (!/^[ \t,.;:!?)]/.test(native.data)) return;
+
+    const root = docRef.current;
+    const sel = window.getSelection();
+    if (!root || !sel || !sel.isCollapsed || sel.rangeCount === 0) return;
+
+    const range = sel.getRangeAt(0);
+    let tokenEl: HTMLElement | null = null;
+    let curr: Node | null = range.startContainer;
+    while (curr && curr !== root) {
+      if (curr.nodeType === Node.ELEMENT_NODE && (curr as HTMLElement).classList.contains('doc-token')) {
+        tokenEl = curr as HTMLElement;
+        break;
+      }
+      curr = curr.parentNode;
+    }
+    if (!tokenEl) return;
+
+    const endProbe = document.createRange();
+    endProbe.selectNodeContents(tokenEl);
+    endProbe.setStart(range.startContainer, range.startOffset);
+    if (endProbe.toString().length === 0) {
+      e.preventDefault();
+      const textNode = document.createTextNode(native.data);
+      tokenEl.after(textNode);
+      const nextRange = document.createRange();
+      nextRange.setStart(textNode, textNode.length);
+      nextRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(nextRange);
+      emitMarkdownFromDom();
+    }
+  };
+
+  const handleDocInput = () => {
+    if (isComposingRef.current) return;
+    if (tryApplyAutoMarkdownPrefix()) {
+      setAutocomplete(null);
+      return;
+    }
+    emitMarkdownFromDom();
+    detectDocAutocomplete();
+  };
+
+  const handleDocKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (autocomplete && autocompleteItems.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -481,64 +1166,183 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       }
     }
 
-    const line = lines[idx] || '';
+    const root = docRef.current;
+    const sel = window.getSelection();
+    if (!root || !sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    const blk = findEditableBlock(range.startContainer, root);
 
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      // Auto-continue markdown bullets/tasks, or terminate list if current bullet is empty
-      const emptyListMatch = line.match(/^\s*(?:[-*]\s*\[(?:[ /?xX]|D(?::[a-z]+)?)\]\s*|[-*]\s+)$/i);
-      if (emptyListMatch) {
-        const nextLines = [...lines];
-        nextLines[idx] = '';
-        patchNote({ body: nextLines.join('\n') });
-        return;
-      }
-
-      let nextPrefix = '';
-      if (/^\s*[-*]\s*\[[ /?xX]\]\s+/.test(line)) {
-        nextPrefix = '- [ ] ';
-      } else if (/^\s*[-*]\s+/.test(line)) {
-        nextPrefix = '- ';
-      }
-
-      const pos = e.currentTarget.selectionStart ?? line.length;
-      const before = line.slice(0, pos);
-      const after = line.slice(pos);
-      const nextLines = [...lines];
-      nextLines.splice(idx, 1, before, `${nextPrefix}${after}`);
-      patchNote({ body: nextLines.join('\n') });
-      setActiveLineIdx(idx + 1);
-      return;
-    }
-
-    if (e.key === 'Backspace' && line === '' && lines.length > 1) {
-      e.preventDefault();
-      const nextLines = [...lines];
-      nextLines.splice(idx, 1);
-      patchNote({ body: nextLines.join('\n') });
-      setActiveLineIdx(Math.max(0, idx - 1));
-      return;
-    }
-
-    if (e.key === 'ArrowUp' && (e.currentTarget.selectionStart ?? 0) === 0 && idx > 0) {
-      e.preventDefault();
-      setActiveLineIdx(idx - 1);
-      return;
-    }
-
+    // Smooth ArrowUp from very top of document into Note Title
     if (
-      e.key === 'ArrowDown' &&
-      (e.currentTarget.selectionStart ?? 0) >= line.length &&
-      idx < lines.length - 1
+      e.key === 'ArrowUp' &&
+      !e.shiftKey &&
+      blk &&
+      blk === root.firstElementChild &&
+      isCaretAtStartOfBlock(blk, range)
     ) {
       e.preventDefault();
-      setActiveLineIdx(idx + 1);
+      titleInputRef.current?.focus();
       return;
     }
 
-    if (e.key === 'Escape') {
-      setActiveLineIdx(null);
+    // Smooth Enter behavior on Tasks, Decisions, Headings, and Blockquotes
+    if (e.key === 'Enter' && !e.shiftKey && range.collapsed && blk) {
+      const tag = blk.tagName.toUpperCase();
+      const isTask = blk.classList.contains('doc-task');
+      const isDec = blk.classList.contains('doc-decision');
+      const isHeading = tag === 'H1' || tag === 'H2' || tag === 'H3';
+      const isQuote = tag === 'BLOCKQUOTE';
+
+      if (isTask || isDec || isHeading || isQuote) {
+        e.preventDefault();
+        const isEmpty = !(blk.textContent || '').trim();
+
+        // Pressing Enter on an empty Task, Decision, or Quote exits back to normal Paragraph
+        if (isEmpty && (isTask || isDec || isQuote)) {
+          const p = document.createElement('p');
+          p.innerHTML = '<br>';
+          blk.replaceWith(p);
+          placeCaretAtStart(p);
+          emitMarkdownFromDom();
+          refreshSelectionToolbarState();
+          return;
+        }
+
+        // Split content after caret into the next block
+        const tailRange = document.createRange();
+        tailRange.selectNodeContents(blk);
+        tailRange.setStart(range.startContainer, range.startOffset);
+        const tailFrag = tailRange.extractContents();
+
+        if (!blk.innerHTML.trim()) {
+          blk.innerHTML = '<br>';
+        }
+
+        const nextBlock = document.createElement('p');
+        if (isTask) {
+          nextBlock.className = 'doc-task';
+          nextBlock.setAttribute('data-status', 'todo');
+        }
+        nextBlock.appendChild(tailFrag);
+        if (!nextBlock.innerHTML.trim()) {
+          nextBlock.innerHTML = '<br>';
+        }
+
+        blk.after(nextBlock);
+        placeCaretAtStart(nextBlock);
+        emitMarkdownFromDom();
+        refreshSelectionToolbarState();
+        return;
+      }
     }
+
+    // Smooth Backspace at start of Task, Decision, Heading, or Quote converts to normal Paragraph
+    if (e.key === 'Backspace' && range.collapsed && blk && isCaretAtStartOfBlock(blk, range)) {
+      const tag = blk.tagName.toUpperCase();
+      const isTask = blk.classList.contains('doc-task');
+      const isDec = blk.classList.contains('doc-decision');
+      const isHeading = tag === 'H1' || tag === 'H2' || tag === 'H3';
+      const isQuote = tag === 'BLOCKQUOTE';
+
+      if (isTask || isDec || isHeading || isQuote) {
+        e.preventDefault();
+        const p = document.createElement('p');
+        p.innerHTML = blk.innerHTML || '<br>';
+        blk.replaceWith(p);
+        placeCaretAtStart(p);
+        emitMarkdownFromDom();
+        refreshSelectionToolbarState();
+      }
+    }
+  };
+
+  // Interactive left-gutter click on Task Checkbox or Decision Status Badge + Ctrl/Cmd+Click on links
+  const handleDocMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+
+    // Ctrl/Cmd + Click on @person, #label, or [[note]] navigates immediately (just like Microsoft Word!)
+    const tokenEl = target.closest('.doc-token') as HTMLElement | null;
+    if (tokenEl && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      if (tokenEl.classList.contains('doc-person')) {
+        onNavigatePerson((tokenEl.textContent || '').replace(/^@+/, '').trim());
+      } else if (tokenEl.classList.contains('doc-label')) {
+        onNavigateLabel(normalizeLabel(tokenEl.textContent || ''));
+      } else if (tokenEl.classList.contains('doc-link')) {
+        onNavigateOrCreateNoteByTitle((tokenEl.textContent || '').trim());
+      }
+      return;
+    }
+
+    const taskEl = target.closest('.doc-task') as HTMLElement | null;
+    if (taskEl) {
+      const rect = taskEl.getBoundingClientRect();
+      if (e.clientX - rect.left <= 30) {
+        e.preventDefault();
+        const curr = (taskEl.getAttribute('data-status') || 'todo') as TaskStatus;
+        const next = TASK_CYCLE[(TASK_CYCLE.indexOf(curr) + 1) % TASK_CYCLE.length];
+        taskEl.setAttribute('data-status', next);
+        emitMarkdownFromDom();
+        return;
+      }
+    }
+
+    const decEl = target.closest('.doc-decision') as HTMLElement | null;
+    if (decEl) {
+      const rect = decEl.getBoundingClientRect();
+      if (e.clientX - rect.left <= 98) {
+        e.preventDefault();
+        const curr = (decEl.getAttribute('data-status') || 'agreed') as DecisionStatus;
+        const next = DECISION_CYCLE[(DECISION_CYCLE.indexOf(curr) + 1) % DECISION_CYCLE.length];
+        decEl.setAttribute('data-status', next);
+        emitMarkdownFromDom();
+      }
+    }
+  };
+
+  const handleDocMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const root = docRef.current;
+    if (!root) return;
+    const target = e.target as HTMLElement;
+    const taskEl = target.closest('.doc-task') as HTMLElement | null;
+    if (taskEl && e.clientX - taskEl.getBoundingClientRect().left <= 30) {
+      root.style.cursor = 'pointer';
+      return;
+    }
+    const decEl = target.closest('.doc-decision') as HTMLElement | null;
+    if (decEl && e.clientX - decEl.getBoundingClientRect().left <= 98) {
+      root.style.cursor = 'pointer';
+      return;
+    }
+    if (root.style.cursor) {
+      root.style.cursor = '';
+    }
+  };
+
+  const handleDocPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    const root = docRef.current;
+    if (!root) return;
+    e.preventDefault();
+
+    const htmlData = e.clipboardData.getData('text/html');
+    const plainData = e.clipboardData.getData('text/plain');
+
+    const looksLikeMarkdown =
+      /(?:^|\n)\s*(?:#{1,3}\s|[-*]\s*\[(?:[ /?xX]|D)|[-*]\s+|\d+\.\s+|>\s)/i.test(plainData) ||
+      /@\[[^\]]+\]|\[\[[^\]]+\]\]/.test(plainData);
+
+    let cleanHtml = '';
+    if (htmlData && !looksLikeMarkdown) {
+      cleanHtml = sanitizePastedHtml(htmlData, directory.people);
+    }
+    if (!cleanHtml && plainData) {
+      cleanHtml = markdownToHtml(plainData.replace(/\r\n/g, '\n'), directory.people);
+    }
+    if (!cleanHtml) return;
+
+    document.execCommand('insertHTML', false, cleanHtml);
+    emitMarkdownFromDom();
+    refreshSelectionToolbarState();
   };
 
   const scopeSelectValue =
@@ -556,56 +1360,257 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     : undefined;
 
   return (
-    <div className="editor-scroll" onClick={() => setAutocomplete(null)}>
-      <div className="editor-container">
-        {/* Quick Starter & Outlook/Teams Invite Strip */}
-        <div className={`quick-starter-strip ${!mobilePropsOpen ? 'mobile-collapsed' : ''}`}>
-          <div className="quick-starter-group">
-            <span style={{ fontSize: 11.5, fontWeight: 600, color: 'var(--text-muted)' }}>Quick Start:</span>
-            {NOTE_TEMPLATES.filter((t) => t.id !== 'blank').map((tpl) => (
-              <button
-                key={tpl.id}
-                type="button"
-                className="btn btn-xs"
-                onClick={() => handleApplyTemplate(tpl.id)}
+    <div
+      className="editor-scroll"
+      onClick={() => {
+        setAutocomplete(null);
+        setShowInsertMenu(false);
+      }}
+    >
+      {/* Unified Sticky Word-Style Formatting & Actions Ribbon */}
+      <div className="doc-ribbon no-print" onClick={(e) => e.stopPropagation()}>
+        <div className="doc-ribbon-group">
+          {!rawMode && (
+            <>
+              <select
+                className="doc-block-select"
+                aria-label="Paragraph style"
+                value={
+                  activeFormat.block === 'h1' ||
+                  activeFormat.block === 'h2' ||
+                  activeFormat.block === 'h3' ||
+                  activeFormat.block === 'blockquote'
+                    ? activeFormat.block
+                    : 'p'
+                }
+                onChange={(e) =>
+                  applyBlockStyle(e.target.value as 'p' | 'h1' | 'h2' | 'h3' | 'blockquote')
+                }
               >
-                <FilePlus2 size={12} />
-                {tpl.label}
+                <option value="p">Normal text</option>
+                <option value="h1">Heading 1</option>
+                <option value="h2">Heading 2</option>
+                <option value="h3">Heading 3</option>
+                <option value="blockquote">Quote</option>
+              </select>
+
+              <span className="doc-ribbon-sep" />
+
+              <button
+                type="button"
+                className={`doc-fmt-btn ${activeFormat.bold ? 'active' : ''}`}
+                title="Bold (Ctrl+B)"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyInlineCommand('bold');
+                }}
+              >
+                <Bold size={14} />
               </button>
-            ))}
-            <button
-              type="button"
-              className="btn btn-xs"
-              onClick={() => setShowInviteModal(true)}
-              title="Paste calendar header or attendee list from Outlook or Microsoft Teams"
-            >
-              <MailPlus size={12} />
-              Paste Teams / Outlook Invite
-            </button>
-          </div>
-          <div className="quick-starter-group">
-            <button
-              id="btn-ai-structure"
-              type="button"
-              className="btn btn-xs btn-soft"
-              onClick={onOpenAiStructure}
-              title="Infer metadata, extract Tasks & Decisions, and preview structured cleanup"
-            >
-              <Sparkles size={12} />
-              Structure &amp; Extract
-            </button>
-          </div>
+              <button
+                type="button"
+                className={`doc-fmt-btn ${activeFormat.italic ? 'active' : ''}`}
+                title="Italic (Ctrl+I)"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyInlineCommand('italic');
+                }}
+              >
+                <Italic size={14} />
+              </button>
+              <button
+                type="button"
+                className={`doc-fmt-btn ${activeFormat.strike ? 'active' : ''}`}
+                title="Strikethrough"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyInlineCommand('strikeThrough');
+                }}
+              >
+                <Strikethrough size={14} />
+              </button>
+
+              <span className="doc-ribbon-sep" />
+
+              <button
+                type="button"
+                className={`doc-fmt-btn ${activeFormat.block === 'ul' ? 'active' : ''}`}
+                title="Bullet List (- )"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyBlockStyle('ul');
+                }}
+              >
+                <List size={14} />
+              </button>
+              <button
+                type="button"
+                className={`doc-fmt-btn ${activeFormat.block === 'ol' ? 'active' : ''}`}
+                title="Numbered List (1. )"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyBlockStyle('ol');
+                }}
+              >
+                <ListOrdered size={14} />
+              </button>
+              <button
+                type="button"
+                className={`doc-fmt-btn ${activeFormat.block === 'blockquote' ? 'active' : ''}`}
+                title="Quote / Decision Rationale (> )"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyBlockStyle('blockquote');
+                }}
+              >
+                <Quote size={13} />
+              </button>
+
+              <span className="doc-ribbon-sep" />
+
+              <button
+                type="button"
+                className={`doc-fmt-btn doc-fmt-chip ${activeFormat.block === 'task' ? 'active' : ''}`}
+                title="Toggle Action Item Checkbox ([] )"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyBlockStyle('task');
+                }}
+              >
+                <CheckSquare size={13} />
+                <span>Task</span>
+              </button>
+              <button
+                type="button"
+                className={`doc-fmt-btn doc-fmt-chip ${activeFormat.block === 'decision' ? 'active' : ''}`}
+                title="Toggle Decision Line ([D] )"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  applyBlockStyle('decision');
+                }}
+              >
+                <Gavel size={13} />
+                <span>Decision</span>
+              </button>
+            </>
+          )}
         </div>
 
-        {/* Note Title */}
-        <h1>
+        <div className="doc-ribbon-group">
+          <div style={{ position: 'relative' }}>
+            <button
+              type="button"
+              className="btn btn-xs btn-ghost"
+              onClick={() => setShowInsertMenu((v) => !v)}
+              title="Templates, Meeting Invite Parser & Context Ask"
+            >
+              <Plus size={13} /> Insert ▾
+            </button>
+            {showInsertMenu && (
+              <div className="doc-insert-popover">
+                <div className="doc-insert-section-title">Page Templates</div>
+                {NOTE_TEMPLATES.filter((t) => t.id !== 'blank').map((tpl) => (
+                  <button
+                    key={tpl.id}
+                    type="button"
+                    className="doc-insert-item"
+                    onClick={() => handleApplyTemplate(tpl.id)}
+                  >
+                    <FilePlus2 size={13} />
+                    <span>{tpl.label}</span>
+                  </button>
+                ))}
+                <div className="doc-insert-divider" />
+                <button
+                  type="button"
+                  className="doc-insert-item"
+                  onClick={() => {
+                    setShowInsertMenu(false);
+                    setShowInviteModal(true);
+                  }}
+                >
+                  <MailPlus size={13} />
+                  <span>Paste Teams / Outlook Invite…</span>
+                </button>
+                <button
+                  type="button"
+                  className="doc-insert-item"
+                  onClick={() => {
+                    setShowInsertMenu(false);
+                    onOpenQuickAsk();
+                  }}
+                >
+                  <Link2 size={13} />
+                  <span>Ask &amp; Pull Citations…</span>
+                </button>
+              </div>
+            )}
+          </div>
+
+          <button
+            id="btn-ai-structure"
+            type="button"
+            className="btn btn-xs btn-soft"
+            onClick={onOpenAiStructure}
+            title="Infer metadata, extract Tasks & Decisions, and preview structured cleanup"
+          >
+            <Sparkles size={12} />
+            <span>Structure</span>
+          </button>
+
+          <button
+            type="button"
+            className={`btn btn-xs ${rawMode ? 'btn-primary' : 'btn-ghost'}`}
+            onClick={() => {
+              setRawMode((v) => !v);
+              setAutocomplete(null);
+              setActiveToken(null);
+            }}
+            title="Switch between smooth Page View and Raw Markdown source"
+          >
+            {rawMode ? <Eye size={13} /> : <Code2 size={13} />}
+            <span>{rawMode ? 'Page View' : 'Raw .md'}</span>
+          </button>
+
+          <button
+            type="button"
+            className="btn btn-xs btn-danger-ghost"
+            onClick={() => onDeleteNote(note.id)}
+            title="Delete this note"
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      </div>
+
+      {/* Continuous Word-Like Document Sheet */}
+      <div
+        className="word-page-sheet"
+        onClick={(e) => {
+          if (e.target === e.currentTarget && docRef.current && !rawMode) {
+            docRef.current.focus();
+            placeCaretAtEnd(docRef.current);
+          }
+        }}
+      >
+        {/* Document Title */}
+        <h1 style={{ margin: 0 }}>
           <input
+            ref={titleInputRef}
             id="note-title-input"
             type="text"
             className="note-title-input"
-            placeholder="Untitled note — start typing immediately…"
+            placeholder="Untitled document"
             value={note.title}
             onChange={(e) => patchNote({ title: e.target.value })}
+            onKeyDown={(e) => {
+              if ((e.key === 'Enter' || e.key === 'ArrowDown') && docRef.current) {
+                e.preventDefault();
+                docRef.current.focus();
+                const first = docRef.current.firstElementChild as HTMLElement | null;
+                if (first) placeCaretAtStart(first);
+              }
+            }}
           />
         </h1>
 
@@ -636,11 +1641,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             {combinedLabels.length > 0 && <span>· #{combinedLabels.length}</span>}
           </span>
           <span style={{ fontWeight: 600, color: 'var(--accent-text)', flexShrink: 0 }}>
-            {mobilePropsOpen ? 'Hide ▴' : 'Details & Templates ▾'}
+            {mobilePropsOpen ? 'Hide ▴' : 'Properties ▾'}
           </span>
         </button>
 
-        {/* Structured Metadata Properties Grid */}
+        {/* Subtle Document Properties Header */}
         <div className={`meta-grid ${!mobilePropsOpen ? 'mobile-collapsed' : ''}`}>
           <div className="meta-row">
             <span className="meta-label">
@@ -749,9 +1754,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             </div>
           </div>
 
-          {/* Participants Row */}
           <div className="meta-row">
-            <span className="meta-label" title="Meeting attendees (distinct from inline @mentions in the note body)">
+            <span className="meta-label" title="Meeting attendees">
               <UserPlus size={13} /> Participants
             </span>
             <div className="meta-value">
@@ -798,9 +1802,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             </div>
           </div>
 
-          {/* Unified Labels Row (Header + Inline Rollup) */}
           <div className="meta-row">
-            <span className="meta-label" title="Note-level labels plus any #labels typed inline in your note">
+            <span className="meta-label" title="Note-level labels plus any #labels typed inline">
               <Hash size={13} /> Labels
             </span>
             <div className="meta-value">
@@ -813,6 +1816,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     title="Remove #label from this note"
                     onClick={(e) => {
                       e.stopPropagation();
+                      lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
                       onUpdateNote(removeLabelFromNote(note, lbl));
                     }}
                   >
@@ -850,12 +1854,12 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           </div>
         </div>
 
-        {/* Natural Name Detection Banner (when a known person is typed without @) */}
+        {/* Natural Name Detection Banner */}
         {unlinkedPeople.length > 0 && (
           <div className="unlinked-banner no-print">
             <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text-secondary)' }}>
               <UserCheck size={14} />
-              Recognized people in text:
+              Recognized in page:
               {unlinkedPeople.map((p) => (
                 <strong key={p.id} style={{ color: 'var(--text-primary)' }}>
                   {p.name}
@@ -887,73 +1891,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           </div>
         )}
 
-        {/* Inline Insert & Mode Toolbar */}
-        <div className="editor-toolbar">
-          <div className="editor-toolbar-left">
-            <button
-              type="button"
-              className="btn btn-xs btn-ghost"
-              onClick={() => appendBlockSnippet('- [ ] ')}
-              title="Insert inline Task (- [ ])"
-            >
-              <CheckSquare size={13} /> + Task
-            </button>
-            <button
-              type="button"
-              className="btn btn-xs btn-ghost"
-              onClick={() => appendBlockSnippet('- [D:agreed] ')}
-              title="Insert inline Decision (- [D:agreed])"
-            >
-              <Gavel size={13} /> + Decision
-            </button>
-            <button
-              type="button"
-              className="btn btn-xs btn-soft mobile-only"
-              onClick={onOpenAiStructure}
-              title="Structure & Extract Tasks/Decisions"
-            >
-              <Sparkles size={12} /> Structure
-            </button>
-            <button
-              type="button"
-              className="btn btn-xs btn-ghost"
-              onClick={onOpenQuickAsk}
-              title="Ask across past notes and pull citations into this note"
-            >
-              <Link2 size={13} /> /Ask &amp; Pull
-            </button>
-            <span className="desktop-only" style={{ fontSize: 11.5, color: 'var(--text-muted)', marginLeft: 4 }}>
-              Type <span className="kbd">@</span> person · <span className="kbd">#</span> label ·{' '}
-              <span className="kbd">[[</span> note · <span className="kbd">/</span> commands
-            </span>
-          </div>
-
-          <div className="editor-toolbar-right">
-            <button
-              type="button"
-              className={`btn btn-xs ${rawMode ? 'btn-primary' : 'btn-ghost'}`}
-              onClick={() => {
-                setRawMode((v) => !v);
-                setActiveLineIdx(null);
-                setAutocomplete(null);
-              }}
-              title="Toggle between Interactive Hybrid Blocks and Raw Markdown"
-            >
-              {rawMode ? <Eye size={13} /> : <Code2 size={13} />}
-              {rawMode ? 'Hybrid View' : 'Raw .md'}
-            </button>
-            <button
-              type="button"
-              className="btn btn-xs btn-danger-ghost"
-              onClick={() => onDeleteNote(note.id)}
-              title="Delete this note"
-            >
-              <Trash2 size={13} /> Delete Note
-            </button>
-          </div>
-        </div>
-
-        {/* Editor Body: Raw Markdown Mode vs Hybrid Interactive Live-Preview */}
+        {/* Document Body: Continuous Word-Like Editable Surface vs Raw Markdown */}
         {rawMode ? (
           <textarea
             ref={rawTextareaRef}
@@ -961,319 +1899,45 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             value={note.body}
             placeholder="Write plain Markdown… Use @[Name], #label, [[Note Title]], - [ ] Task, or - [D:agreed] Decision"
             onChange={(e) => {
+              lastEmittedMarkdownRef.current = e.target.value;
               patchNote({ body: e.target.value });
-              detectAutocomplete(e.target.value, e.target.selectionStart ?? 0, e.target);
+              detectRawAutocomplete(e.target.value, e.target.selectionStart ?? 0, e.target);
             }}
           />
         ) : (
           <div
-            className="hybrid-blocks"
-            onClick={(e) => {
-              if (e.target === e.currentTarget) {
-                setActiveLineIdx(lines.length - 1);
+            ref={docRef}
+            className="word-doc-body"
+            contentEditable
+            suppressContentEditableWarning
+            spellCheck
+            data-placeholder="Start typing anywhere on the page… Use @person, #label, [[note]], or / for tasks & decisions"
+            onFocus={() => {
+              try {
+                document.execCommand('defaultParagraphSeparator', false, 'p');
+              } catch {
+                // Ignore if unsupported
               }
+              refreshSelectionToolbarState();
             }}
-          >
-            {lines.map((line, idx) => {
-              // Hide rationale sub-line when rendered inside parent Decision card (unless actively editing it)
-              if (decisionsByLine.rationaleLines.has(idx) && activeLineIdx !== idx) {
-                return null;
-              }
-
-              if (activeLineIdx === idx) {
-                return (
-                  <div key={idx} className="block-row" onClick={(e) => e.stopPropagation()}>
-                    <textarea
-                      ref={lineInputRef}
-                      rows={1}
-                      className="block-line-input"
-                      value={line}
-                      placeholder="Type notes, @person, #label, [[note]], or / for commands…"
-                      onChange={(e) => {
-                        e.target.style.height = 'auto';
-                        e.target.style.height = `${e.target.scrollHeight}px`;
-                        updateSingleLine(idx, e.target.value);
-                        detectAutocomplete(e.target.value, e.target.selectionStart ?? 0, e.target);
-                      }}
-                      onKeyDown={(e) => handleLineKeyDown(e, idx)}
-                      onBlur={() => {
-                        setTimeout(() => {
-                          setActiveLineIdx((curr) => (curr === idx ? null : curr));
-                        }, 160);
-                      }}
-                    />
-                  </div>
-                );
-              }
-
-              // 1. Interactive Task Block
-              const task = tasksByLine.get(idx);
-              if (task) {
-                const nextStatus = TASK_CYCLE[(TASK_CYCLE.indexOf(task.status) + 1) % TASK_CYCLE.length];
-                return (
-                  <div
-                    key={idx}
-                    className={`task-inline-card ${task.status === 'done' ? 'is-done' : ''}`}
-                    onClick={() => setActiveLineIdx(idx)}
-                  >
-                    <div className="task-left">
-                      <button
-                        type="button"
-                        className={`status-badge status-${task.status}`}
-                        title={`Click to cycle status → ${nextStatus.toUpperCase()}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          patchNote({ body: updateTaskInBody(note.body, idx, { status: nextStatus }) });
-                        }}
-                      >
-                        {task.status}
-                      </button>
-                      <span className="task-text">
-                        <RichInlineText
-                          text={task.text}
-                          people={directory.people}
-                          clients={directory.clients}
-                          notes={allNotes}
-                          onClickPerson={onNavigatePerson}
-                          onClickLabel={onNavigateLabel}
-                          onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                        />
-                      </span>
-                      {extractInlineLabelPills(line, onNavigateLabel)}
-                    </div>
-                    <div className="task-right">
-                      {task.priority === 'high' && <span className="priority-high">!HIGH</span>}
-                      {task.dueDate && <span className="due-chip">due {task.dueDate}</span>}
-                      <button
-                        type="button"
-                        className="mini-icon-btn danger"
-                        title="Delete task"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          patchNote({ body: deleteTaskFromBody(note.body, idx) });
-                        }}
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                  </div>
-                );
-              }
-
-              // 2. Interactive Decision Block
-              const decision = decisionsByLine.map.get(idx);
-              if (decision) {
-                const nextDecStatus =
-                  DECISION_CYCLE[(DECISION_CYCLE.indexOf(decision.status) + 1) % DECISION_CYCLE.length];
-                return (
-                  <div key={idx} className="decision-inline-card" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="decision-main">
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', flex: 1 }}>
-                        <button
-                          type="button"
-                          className={`status-badge decision-badge-${decision.status}`}
-                          title={`Decision status (${decision.status}) — click to switch to ${nextDecStatus}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            patchNote({
-                              body: updateDecisionInBody(note.body, idx, { status: nextDecStatus }),
-                            });
-                          }}
-                        >
-                          <Gavel size={11} /> {decision.status}
-                        </button>
-                        <span style={{ fontWeight: 550 }}>
-                          <RichInlineText
-                            text={decision.text}
-                            people={directory.people}
-                            clients={directory.clients}
-                            notes={allNotes}
-                            onClickPerson={onNavigatePerson}
-                            onClickLabel={onNavigateLabel}
-                            onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                          />
-                        </span>
-                        {extractInlineLabelPills(line, onNavigateLabel)}
-                      </div>
-                      <button
-                        type="button"
-                        className="mini-icon-btn danger"
-                        title="Delete decision"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          patchNote({ body: deleteDecisionFromBody(note.body, idx) });
-                        }}
-                      >
-                        <Trash2 size={12} />
-                      </button>
-                    </div>
-                    {decision.rationale && (
-                      <div
-                        className="decision-rationale"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (decision.rationaleLineIndex !== null) {
-                            setActiveLineIdx(decision.rationaleLineIndex);
-                          }
-                        }}
-                      >
-                        Rationale:{' '}
-                        <RichInlineText
-                          text={decision.rationale}
-                          people={directory.people}
-                          clients={directory.clients}
-                          notes={allNotes}
-                          onClickPerson={onNavigatePerson}
-                          onClickLabel={onNavigateLabel}
-                          onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                        />
-                      </div>
-                    )}
-                  </div>
-                );
-              }
-
-              // 3. Headings, Bullets, Quotes, and Paragraphs
-              const trimmed = line.trim();
-              if (!trimmed) {
-                return (
-                  <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="block-rendered">
-                      {lines.length === 1 && (
-                        <span className="block-empty-hint">
-                          Click anywhere and start typing — use @person, #label, [[note]], or /task &amp; /decision…
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                );
-              }
-
-              if (trimmed.startsWith('### ')) {
-                return (
-                  <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="block-rendered block-h3">
-                      <RichInlineText
-                        text={trimmed.slice(4)}
-                        people={directory.people}
-                        clients={directory.clients}
-                        notes={allNotes}
-                        onClickPerson={onNavigatePerson}
-                        onClickLabel={onNavigateLabel}
-                        onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                      />
-                    </div>
-                  </div>
-                );
-              }
-
-              if (trimmed.startsWith('## ')) {
-                return (
-                  <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="block-rendered block-h2">
-                      <RichInlineText
-                        text={trimmed.slice(3)}
-                        people={directory.people}
-                        clients={directory.clients}
-                        notes={allNotes}
-                        onClickPerson={onNavigatePerson}
-                        onClickLabel={onNavigateLabel}
-                        onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                      />
-                    </div>
-                  </div>
-                );
-              }
-
-              if (trimmed.startsWith('# ')) {
-                return (
-                  <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="block-rendered block-h1">
-                      <RichInlineText
-                        text={trimmed.slice(2)}
-                        people={directory.people}
-                        clients={directory.clients}
-                        notes={allNotes}
-                        onClickPerson={onNavigatePerson}
-                        onClickLabel={onNavigateLabel}
-                        onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                      />
-                    </div>
-                  </div>
-                );
-              }
-
-              if (/^[-*•]\s+/.test(trimmed)) {
-                return (
-                  <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="block-rendered block-bullet">
-                      <span className="bullet-dot">•</span>
-                      <span>
-                        <RichInlineText
-                          text={trimmed.replace(/^[-*•]\s+/, '')}
-                          people={directory.people}
-                          clients={directory.clients}
-                          notes={allNotes}
-                          onClickPerson={onNavigatePerson}
-                          onClickLabel={onNavigateLabel}
-                          onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                        />
-                      </span>
-                    </div>
-                  </div>
-                );
-              }
-
-              if (trimmed.startsWith('>')) {
-                return (
-                  <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                    <div className="block-rendered block-quote">
-                      <RichInlineText
-                        text={trimmed.replace(/^>\s*/, '')}
-                        people={directory.people}
-                        clients={directory.clients}
-                        notes={allNotes}
-                        onClickPerson={onNavigatePerson}
-                        onClickLabel={onNavigateLabel}
-                        onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                      />
-                    </div>
-                  </div>
-                );
-              }
-
-              return (
-                <div key={idx} className="block-row" onClick={() => setActiveLineIdx(idx)}>
-                  <div className="block-rendered">
-                    <RichInlineText
-                      text={line}
-                      people={directory.people}
-                      clients={directory.clients}
-                      notes={allNotes}
-                      onClickPerson={onNavigatePerson}
-                      onClickLabel={onNavigateLabel}
-                      onClickNoteLink={onNavigateOrCreateNoteByTitle}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+            onCompositionStart={() => {
+              isComposingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              isComposingRef.current = false;
+              handleDocInput();
+            }}
+            onBeforeInput={handleDocBeforeInput}
+            onInput={handleDocInput}
+            onKeyDown={handleDocKeyDown}
+            onMouseDown={handleDocMouseDown}
+            onMouseMove={handleDocMouseMove}
+            onPaste={handleDocPaste}
+          />
         )}
 
-        {/* Synced File Path Indicator */}
-        <div
-          style={{
-            marginTop: 28,
-            paddingTop: 10,
-            borderTop: '1px solid var(--border-subtle)',
-            display: 'flex',
-            justifyContent: 'space-between',
-            fontSize: 11.5,
-            color: 'var(--text-muted)',
-            fontFamily: 'var(--font-mono)',
-          }}
-        >
+        {/* Subtle Page Footer */}
+        <div className="word-page-footer no-print">
           <span>
             <FolderKanban size={12} style={{ verticalAlign: '-2px', marginRight: 5 }} />
             {note.filePath ||
@@ -1285,7 +1949,36 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         </div>
       </div>
 
-      {/* Floating Autocomplete Popover */}
+      {/* Subtle Word-Style Floating Link Chip when Caret is Inside @Person, #Label, or [[Note]] */}
+      {activeToken && !autocomplete && (
+        <div
+          className="doc-token-popover no-print"
+          style={{ top: activeToken.rect.top, left: activeToken.rect.left }}
+          onMouseDown={(e) => e.preventDefault()}
+        >
+          <button
+            type="button"
+            className="doc-token-popover-btn"
+            onClick={() => {
+              if (activeToken.kind === 'person') onNavigatePerson(activeToken.value);
+              else if (activeToken.kind === 'label') onNavigateLabel(activeToken.value);
+              else onNavigateOrCreateNoteByTitle(activeToken.value);
+              setActiveToken(null);
+            }}
+          >
+            <ExternalLink size={12} />
+            <span>
+              {activeToken.kind === 'person'
+                ? `Open @${activeToken.value} notes`
+                : activeToken.kind === 'label'
+                ? `Open #${activeToken.value} report`
+                : `Open "${activeToken.value}"`}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {/* Caret-Anchored Autocomplete Popover */}
       {autocomplete && autocompleteItems.length > 0 && (
         <div
           className="autocomplete-popover"
@@ -1353,26 +2046,3 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     </div>
   );
 };
-
-function extractInlineLabelPills(rawLine: string, onNavigateLabel: (lbl: string) => void): React.ReactNode[] {
-  const pills: React.ReactNode[] = [];
-  const rx = /(?:^|\s)#([\p{L}][\p{L}\p{N}_-]{1,38})/gu;
-  let m: RegExpExecArray | null;
-  while ((m = rx.exec(rawLine)) !== null) {
-    const lbl = m[1].toLowerCase();
-    pills.push(
-      <button
-        key={`${m.index}-${lbl}`}
-        type="button"
-        className="pill pill-label"
-        onClick={(e) => {
-          e.stopPropagation();
-          onNavigateLabel(lbl);
-        }}
-      >
-        #{lbl}
-      </button>
-    );
-  }
-  return pills;
-}
