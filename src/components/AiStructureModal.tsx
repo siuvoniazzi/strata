@@ -1,0 +1,431 @@
+import React, { useEffect, useState } from 'react';
+import { Check, Copy, KeyRound, ShieldCheck, Sparkles, X } from 'lucide-react';
+import type {
+  AiConfig,
+  AiProviderType,
+  AiStructureProposal,
+  Note,
+  WorkspaceDirectory,
+} from '../types';
+import { generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
+import { serializeTaskLine } from '../utils/markdown';
+
+interface AiStructureModalProps {
+  note: Note;
+  directory: WorkspaceDirectory;
+  aiConfig: AiConfig;
+  onClose: () => void;
+  onApply: (updated: Note, newParticipants: string[]) => void;
+  onOpenAiSettings: () => void;
+}
+
+export const AiStructureModal: React.FC<AiStructureModalProps> = ({
+  note,
+  directory,
+  aiConfig,
+  onClose,
+  onApply,
+  onOpenAiSettings,
+}) => {
+  const [loading, setLoading] = useState(true);
+  const [proposal, setProposal] = useState<AiStructureProposal | null>(null);
+  const [applyMetadata, setApplyMetadata] = useState(true);
+  const [bodyMode, setBodyMode] = useState<'append' | 'replace' | 'none'>('replace');
+  const [copiedPrompt, setCopiedPrompt] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    generateStructureProposal(note, directory, aiConfig).then((res) => {
+      if (active) {
+        setProposal(res);
+        setLoading(false);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [note, directory, aiConfig]);
+
+  const handleConfirm = () => {
+    if (!proposal) return;
+    let nextBody = note.body;
+
+    if (bodyMode === 'replace') {
+      nextBody = proposal.restructuredBody;
+    } else if (bodyMode === 'append') {
+      const additions: string[] = [];
+      if (proposal.extractedDecisions.length > 0) {
+        additions.push(
+          '## Extracted Decisions',
+          ...proposal.extractedDecisions.map((d) => `- [D:${d.status}] ${d.text}`)
+        );
+      }
+      if (proposal.extractedTasks.length > 0) {
+        additions.push(
+          '## Extracted Tasks',
+          ...proposal.extractedTasks.map((t) =>
+            serializeTaskLine({
+              status: 'todo',
+              text: t.text,
+              owner: t.owner,
+              dueDate: t.dueDate,
+              priority: t.priority,
+              labels: t.labels,
+            })
+          )
+        );
+      }
+      if (additions.length > 0) {
+        nextBody = `${additions.join('\n')}\n\n---\n\n${note.body}`;
+      }
+    }
+
+    const updated: Note = {
+      ...note,
+      title: applyMetadata ? proposal.suggestedTitle : note.title,
+      scope: applyMetadata ? proposal.suggestedScope : note.scope,
+      clientId: applyMetadata ? proposal.suggestedClientId : note.clientId,
+      projectId: applyMetadata ? proposal.suggestedProjectId : note.projectId,
+      participants: applyMetadata
+        ? Array.from(new Set([...note.participants, ...proposal.suggestedParticipants]))
+        : note.participants,
+      labels: applyMetadata
+        ? Array.from(new Set([...note.labels, ...proposal.suggestedLabels]))
+        : note.labels,
+      body: nextBody,
+      updatedAt: new Date().toISOString(),
+    };
+
+    onApply(updated, applyMetadata ? proposal.suggestedParticipants : []);
+  };
+
+  const handleCopyCopilotPrompt = () => {
+    const prompt = [
+      'Structure the following meeting note into clean Markdown using:',
+      '- @[Full Name] for people mentions',
+      '- #label for topics',
+      '- "- [ ] Action item @[Owner] due:YYYY-MM-DD" for tasks',
+      '- "- [D:agreed] Decision statement" for decisions',
+      '',
+      `Title: ${note.title}`,
+      `Date: ${note.date}`,
+      note.body,
+    ].join('\n');
+    navigator.clipboard.writeText(prompt);
+    setCopiedPrompt(true);
+    setTimeout(() => setCopiedPrompt(false), 1800);
+  };
+
+  const suggestedClientName = proposal?.suggestedClientId
+    ? directory.clients.find((c) => c.id === proposal.suggestedClientId)?.name
+    : null;
+  const suggestedProjectName = proposal?.suggestedProjectId
+    ? directory.projects.find((p) => p.id === proposal.suggestedProjectId)?.name
+    : null;
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" style={{ maxWidth: 760 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Sparkles size={16} />
+            <strong>Structure &amp; Extract — Review Before Applying</strong>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <button type="button" className="btn btn-xs" onClick={handleCopyCopilotPrompt}>
+              {copiedPrompt ? <Check size={12} /> : <Copy size={12} />}
+              {copiedPrompt ? 'Copied for Copilot/Chat' : 'Copy Prompt for Corporate Chat'}
+            </button>
+            <button type="button" className="btn btn-xs btn-ghost" onClick={onOpenAiSettings}>
+              <KeyRound size={12} /> AI Engine
+            </button>
+            <button type="button" className="btn btn-icon btn-ghost" onClick={onClose}>
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+
+        <div className="modal-body">
+          {loading || !proposal ? (
+            <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-secondary)' }}>
+              Analyzing note structure, people, labels, decisions, and tasks…
+            </div>
+          ) : (
+            <>
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '8px 12px',
+                  borderRadius: 'var(--radius-sm)',
+                  background: 'var(--bg-surface-subtle)',
+                  border: '1px solid var(--border-subtle)',
+                  fontSize: 12,
+                }}
+              >
+                <span>
+                  Engine: <strong>{proposal.usedProvider}</strong>
+                </span>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={applyMetadata}
+                    onChange={(e) => setApplyMetadata(e.target.checked)}
+                  />
+                  Apply inferred Header Metadata (Title, Client/Project, Participants, #Labels)
+                </label>
+              </div>
+
+              {/* Proposed Metadata Summary */}
+              <div className="radar-card" style={{ gap: 6 }}>
+                <div style={{ fontSize: 12.5 }}>
+                  <strong>Title:</strong> {proposal.suggestedTitle}
+                </div>
+                <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', fontSize: 12 }}>
+                  <span>
+                    <strong>Space:</strong>{' '}
+                    {suggestedClientName
+                      ? `Client: ${suggestedClientName}`
+                      : proposal.suggestedScope === 'internal'
+                      ? 'Internal'
+                      : 'Inbox'}
+                    {suggestedProjectName ? ` → ${suggestedProjectName}` : ''}
+                  </span>
+                  <span>
+                    <strong>Participants:</strong>{' '}
+                    {proposal.suggestedParticipants.length > 0
+                      ? proposal.suggestedParticipants.map((p) => `@${p}`).join(', ')
+                      : 'None detected'}
+                  </span>
+                  <span>
+                    <strong>Labels:</strong>{' '}
+                    {proposal.suggestedLabels.length > 0
+                      ? proposal.suggestedLabels.map((l) => `#${l}`).join(' ')
+                      : 'None'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Extracted Decisions & Tasks Count */}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <span className="pill pill-link">
+                  {proposal.extractedDecisions.length} newly detected implicit Decision(s)
+                </span>
+                <span className="pill pill-person">
+                  {proposal.extractedTasks.length} newly detected implicit Task(s)
+                </span>
+              </div>
+
+              {/* Body Mode Selector */}
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  className={`btn btn-xs ${bodyMode === 'replace' ? 'btn-primary' : ''}`}
+                  onClick={() => setBodyMode('replace')}
+                >
+                  Restructure into Clean Sections (Recommended)
+                </button>
+                <button
+                  type="button"
+                  className={`btn btn-xs ${bodyMode === 'append' ? 'btn-primary' : ''}`}
+                  onClick={() => setBodyMode('append')}
+                >
+                  Prepend Extracted Tasks/Decisions (Keep Raw Text Intact)
+                </button>
+                <button
+                  type="button"
+                  className={`btn btn-xs ${bodyMode === 'none' ? 'btn-primary' : ''}`}
+                  onClick={() => setBodyMode('none')}
+                >
+                  Metadata Only (Don't Change Note Body)
+                </button>
+              </div>
+
+              {/* Side-by-Side Diff Preview */}
+              <div className="diff-grid">
+                <div>
+                  <div className="form-label" style={{ marginBottom: 4 }}>
+                    Current Note Body
+                  </div>
+                  <div className="diff-pane">{note.body || '(Empty)'}</div>
+                </div>
+                <div>
+                  <div className="form-label" style={{ marginBottom: 4 }}>
+                    Proposed Structured Markdown
+                  </div>
+                  <div className="diff-pane">{proposal.restructuredBody}</div>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="modal-footer">
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            disabled={loading || !proposal}
+            onClick={handleConfirm}
+          >
+            Apply Selected Changes
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+interface AiSettingsModalProps {
+  config: AiConfig;
+  onSave: (next: AiConfig) => void;
+  onClose: () => void;
+}
+
+export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({ config, onSave, onClose }) => {
+  const [draft, setDraft] = useState<AiConfig>(config);
+
+  const handleProviderSelect = (provider: AiProviderType) => {
+    const defaultModel: Record<AiProviderType, string> = {
+      local: 'deterministic-v1',
+      openai: 'gpt-4o-mini',
+      azure: 'gpt-4o',
+      gemini: 'gemini-2.5-flash',
+      anthropic: 'claude-3-5-haiku-latest',
+    };
+    setDraft({
+      ...draft,
+      provider,
+      model: defaultModel[provider],
+      baseUrl: provider === 'openai' ? 'https://api.openai.com/v1' : draft.baseUrl,
+    });
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-card" style={{ maxWidth: 560 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <ShieldCheck size={16} />
+            <strong>AI Engine &amp; Corporate Compliance Settings</strong>
+          </div>
+          <button type="button" className="btn btn-icon btn-ghost" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="modal-body">
+          <div
+            style={{
+              padding: '9px 12px',
+              borderRadius: 'var(--radius-sm)',
+              background: 'var(--bg-surface-subtle)',
+              border: '1px solid var(--border-subtle)',
+              fontSize: 12,
+              color: 'var(--text-secondary)',
+            }}
+          >
+            <strong>Local-Only Key Storage:</strong> API keys stay exclusively in this browser's{' '}
+            <code>localStorage</code> and are <strong>never</strong> written into synced OneDrive <code>.md</code> or{' '}
+            <code>.zip</code> files. When set to <em>Local Smart Engine</em>, zero note text leaves your laptop.
+          </div>
+
+          <div className="form-field">
+            <label className="form-label">Provider</label>
+            <select
+              className="form-input"
+              value={draft.provider}
+              onChange={(e) => handleProviderSelect(e.target.value as AiProviderType)}
+            >
+              <option value="local">Local Smart Engine (Default — 100% Offline, Zero API Key)</option>
+              <option value="azure">Azure OpenAI Service (Corporate Approved Tenant)</option>
+              <option value="openai">OpenAI / Corporate OpenAI-Compatible Gateway</option>
+              <option value="gemini">Google Gemini API</option>
+              <option value="anthropic">Anthropic Claude API</option>
+            </select>
+          </div>
+
+          {draft.provider !== 'local' && (
+            <>
+              {(draft.provider === 'openai' || draft.provider === 'azure') && (
+                <div className="form-field">
+                  <label className="form-label">
+                    {draft.provider === 'azure'
+                      ? 'Azure Resource Endpoint (e.g., https://my-corp.openai.azure.com)'
+                      : 'Base URL (OpenAI or Internal Corporate Gateway)'}
+                  </label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={draft.baseUrl || ''}
+                    placeholder={
+                      draft.provider === 'azure'
+                        ? 'https://your-company.openai.azure.com'
+                        : 'https://api.openai.com/v1'
+                    }
+                    onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
+                  />
+                </div>
+              )}
+
+              {draft.provider === 'azure' ? (
+                <div className="form-field">
+                  <label className="form-label">Azure Deployment Name</label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={draft.azureDeployment || ''}
+                    placeholder="gpt-4o"
+                    onChange={(e) => setDraft({ ...draft, azureDeployment: e.target.value })}
+                  />
+                </div>
+              ) : (
+                <div className="form-field">
+                  <label className="form-label">Model Name</label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={draft.model}
+                    onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                  />
+                </div>
+              )}
+
+              <div className="form-field">
+                <label className="form-label">API Key</label>
+                <input
+                  type="password"
+                  className="form-input"
+                  placeholder="Paste approved API key…"
+                  value={draft.apiKey}
+                  onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
+                />
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="modal-footer">
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => {
+              saveAiConfig(draft);
+              onSave(draft);
+              onClose();
+            }}
+          >
+            Save AI Configuration
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
