@@ -30,6 +30,48 @@ import {
 const TASK_CYCLE: TaskStatus[] = ['todo', 'doing', 'waiting', 'done'];
 const DEC_CYCLE: DecisionStatus[] = ['agreed', 'proposed', 'superseded'];
 
+function getItemContextMeta(
+  note: Note | undefined,
+  clientId: string | null,
+  projectId: string | null,
+  clientById: Map<string, Client>,
+  projectById: Map<string, Project>,
+): { label: string; color?: string; spaceValue: string; projectId: string | null } | null {
+  const client = clientId ? clientById.get(clientId) : undefined;
+  const project = projectId ? projectById.get(projectId) : undefined;
+  if (client && project) {
+    return {
+      label: `${client.name} · ${project.name}`,
+      color: client.color,
+      spaceValue: client.id,
+      projectId: project.id,
+    };
+  }
+  if (client) {
+    return {
+      label: client.name,
+      color: client.color,
+      spaceValue: client.id,
+      projectId: null,
+    };
+  }
+  if (project) {
+    return {
+      label: `Internal · ${project.name}`,
+      spaceValue: '__internal__',
+      projectId: project.id,
+    };
+  }
+  if (note?.scope === 'internal') {
+    return {
+      label: 'Internal',
+      spaceValue: '__internal__',
+      projectId: null,
+    };
+  }
+  return null;
+}
+
 export const TasksGlobalView: React.FC<{
   notes: Note[];
   directory: WorkspaceDirectory;
@@ -38,7 +80,32 @@ export const TasksGlobalView: React.FC<{
   onDeleteTask: (task: ParsedTask) => void;
 }> = ({ notes, directory, onOpenNote, onUpdateTaskStatus, onDeleteTask }) => {
   const [statusFilter, setStatusFilter] = useState<'open' | TaskStatus | 'all'>('open');
+  const [spaceFilter, setSpaceFilter] = useState('');
+  const [projectFilter, setProjectFilter] = useState('');
   const [ownerFilter, setOwnerFilter] = useState('');
+
+  const noteById = useMemo(() => new Map(notes.map((n) => [n.id, n])), [notes]);
+  const clientById = useMemo(
+    () => new Map(directory.clients.map((c) => [c.id, c])),
+    [directory.clients],
+  );
+  const projectById = useMemo(
+    () => new Map(directory.projects.map((p) => [p.id, p])),
+    [directory.projects],
+  );
+
+  const availableProjects = useMemo(() => {
+    if (spaceFilter === '__internal__') {
+      return directory.projects.filter((p) => p.scope === 'internal');
+    }
+    if (spaceFilter === '__inbox__') {
+      return [];
+    }
+    if (spaceFilter) {
+      return directory.projects.filter((p) => p.clientId === spaceFilter);
+    }
+    return directory.projects;
+  }, [directory.projects, spaceFilter]);
 
   const allTasks = useMemo(() => {
     const out: ParsedTask[] = [];
@@ -51,9 +118,36 @@ export const TasksGlobalView: React.FC<{
   const filtered = allTasks.filter((t) => {
     if (statusFilter === 'open' && t.status === 'done') return false;
     if (statusFilter !== 'open' && statusFilter !== 'all' && t.status !== statusFilter) return false;
+    const parentNote = noteById.get(t.noteId);
+    if (spaceFilter === '__internal__') {
+      if (parentNote?.scope !== 'internal') return false;
+    } else if (spaceFilter === '__inbox__') {
+      if (parentNote?.scope !== 'inbox') return false;
+    } else if (spaceFilter) {
+      if (t.clientId !== spaceFilter) return false;
+    }
+    if (projectFilter && t.projectId !== projectFilter) return false;
     if (ownerFilter && (t.owner || '').toLowerCase() !== ownerFilter.toLowerCase()) return false;
     return true;
   });
+
+  const handleSpaceChange = (nextSpace: string) => {
+    setSpaceFilter(nextSpace);
+    if (nextSpace && projectFilter) {
+      const proj = projectById.get(projectFilter);
+      const stillValid =
+        nextSpace === '__internal__'
+          ? proj?.scope === 'internal'
+          : nextSpace === '__inbox__'
+          ? false
+          : proj?.clientId === nextSpace;
+      if (!stillValid) setProjectFilter('');
+    }
+  };
+
+  const hasActiveFilters = Boolean(
+    spaceFilter || projectFilter || ownerFilter || statusFilter !== 'open',
+  );
 
   return (
     <div className="page-scroll">
@@ -62,7 +156,7 @@ export const TasksGlobalView: React.FC<{
           <div>
             <h1 className="page-h1">Tasks Across All Notes</h1>
             <p className="page-subtitle">
-              Every inline checkbox stays two-way synced with its source Markdown note.
+              Filter action items by client, project, status, or @owner — every checkbox stays two-way synced with its source note.
             </p>
           </div>
         </div>
@@ -78,8 +172,47 @@ export const TasksGlobalView: React.FC<{
               {st.toUpperCase()}
             </button>
           ))}
+
           <select
             className="meta-select"
+            aria-label="Filter tasks by client or space"
+            value={spaceFilter}
+            onChange={(e) => handleSpaceChange(e.target.value)}
+          >
+            <option value="">All Clients &amp; Spaces</option>
+            {directory.clients.map((c) => (
+              <option key={c.id} value={c.id}>
+                Client: {c.name}
+              </option>
+            ))}
+            <option value="__internal__">Internal Workspace</option>
+            <option value="__inbox__">Inbox (Unfiled)</option>
+          </select>
+
+          <select
+            className="meta-select"
+            aria-label="Filter tasks by project"
+            value={projectFilter}
+            disabled={spaceFilter === '__inbox__'}
+            onChange={(e) => setProjectFilter(e.target.value)}
+          >
+            <option value="">All Projects</option>
+            {availableProjects.map((p) => {
+              const prefix = !spaceFilter
+                ? `${p.scope === 'internal' ? 'Internal' : clientById.get(p.clientId || '')?.name || 'Client'} · `
+                : 'Project: ';
+              return (
+                <option key={p.id} value={p.id}>
+                  {prefix}
+                  {p.name}
+                </option>
+              );
+            })}
+          </select>
+
+          <select
+            className="meta-select"
+            aria-label="Filter tasks by owner"
             value={ownerFilter}
             onChange={(e) => setOwnerFilter(e.target.value)}
           >
@@ -90,6 +223,25 @@ export const TasksGlobalView: React.FC<{
               </option>
             ))}
           </select>
+
+          {hasActiveFilters && (
+            <button
+              type="button"
+              className="btn btn-xs btn-ghost"
+              onClick={() => {
+                setStatusFilter('open');
+                setSpaceFilter('');
+                setProjectFilter('');
+                setOwnerFilter('');
+              }}
+            >
+              Reset Filters
+            </button>
+          )}
+
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-muted)' }}>
+            {filtered.length} {filtered.length === 1 ? 'task' : 'tasks'}
+          </span>
         </div>
 
         <div className="surface-panel">
@@ -98,6 +250,13 @@ export const TasksGlobalView: React.FC<{
           ) : (
             filtered.map((t) => {
               const nextStatus = TASK_CYCLE[(TASK_CYCLE.indexOf(t.status) + 1) % TASK_CYCLE.length];
+              const ctx = getItemContextMeta(
+                noteById.get(t.noteId),
+                t.clientId,
+                t.projectId,
+                clientById,
+                projectById,
+              );
               return (
                 <div
                   key={t.id}
@@ -115,6 +274,22 @@ export const TasksGlobalView: React.FC<{
                     {t.owner && <span className="pill pill-person">@{t.owner}</span>}
                   </div>
                   <div className="task-right">
+                    {ctx && (
+                      <button
+                        type="button"
+                        className="context-chip"
+                        title="Filter by this client / project"
+                        onClick={() => {
+                          setSpaceFilter(ctx.spaceValue);
+                          setProjectFilter(ctx.projectId || '');
+                        }}
+                      >
+                        {ctx.color && (
+                          <span className="client-dot" style={{ background: ctx.color }} />
+                        )}
+                        {ctx.label}
+                      </button>
+                    )}
                     {t.priority === 'high' && <span className="priority-high">!HIGH</span>}
                     {t.dueDate && <span className="due-chip">due {t.dueDate}</span>}
                     <button type="button" className="pill pill-link" onClick={() => onOpenNote(t.noteId)}>
@@ -147,6 +322,31 @@ export const DecisionsGlobalView: React.FC<{
   onDeleteDecision: (decision: ParsedDecision) => void;
 }> = ({ notes, directory, onOpenNote, onUpdateDecisionStatus, onDeleteDecision }) => {
   const [statusFilter, setStatusFilter] = useState<'all' | DecisionStatus>('all');
+  const [spaceFilter, setSpaceFilter] = useState('');
+  const [projectFilter, setProjectFilter] = useState('');
+
+  const noteById = useMemo(() => new Map(notes.map((n) => [n.id, n])), [notes]);
+  const clientById = useMemo(
+    () => new Map(directory.clients.map((c) => [c.id, c])),
+    [directory.clients],
+  );
+  const projectById = useMemo(
+    () => new Map(directory.projects.map((p) => [p.id, p])),
+    [directory.projects],
+  );
+
+  const availableProjects = useMemo(() => {
+    if (spaceFilter === '__internal__') {
+      return directory.projects.filter((p) => p.scope === 'internal');
+    }
+    if (spaceFilter === '__inbox__') {
+      return [];
+    }
+    if (spaceFilter) {
+      return directory.projects.filter((p) => p.clientId === spaceFilter);
+    }
+    return directory.projects;
+  }, [directory.projects, spaceFilter]);
 
   const allDecisions = useMemo(() => {
     const out: ParsedDecision[] = [];
@@ -156,7 +356,35 @@ export const DecisionsGlobalView: React.FC<{
     return out.sort((a, b) => b.noteDate.localeCompare(a.noteDate));
   }, [notes, directory.people]);
 
-  const filtered = allDecisions.filter((d) => statusFilter === 'all' || d.status === statusFilter);
+  const filtered = allDecisions.filter((d) => {
+    if (statusFilter !== 'all' && d.status !== statusFilter) return false;
+    const parentNote = noteById.get(d.noteId);
+    if (spaceFilter === '__internal__') {
+      if (parentNote?.scope !== 'internal') return false;
+    } else if (spaceFilter === '__inbox__') {
+      if (parentNote?.scope !== 'inbox') return false;
+    } else if (spaceFilter) {
+      if (d.clientId !== spaceFilter) return false;
+    }
+    if (projectFilter && d.projectId !== projectFilter) return false;
+    return true;
+  });
+
+  const handleSpaceChange = (nextSpace: string) => {
+    setSpaceFilter(nextSpace);
+    if (nextSpace && projectFilter) {
+      const proj = projectById.get(projectFilter);
+      const stillValid =
+        nextSpace === '__internal__'
+          ? proj?.scope === 'internal'
+          : nextSpace === '__inbox__'
+          ? false
+          : proj?.clientId === nextSpace;
+      if (!stillValid) setProjectFilter('');
+    }
+  };
+
+  const hasActiveFilters = Boolean(spaceFilter || projectFilter || statusFilter !== 'all');
 
   return (
     <div className="page-scroll">
@@ -165,7 +393,7 @@ export const DecisionsGlobalView: React.FC<{
           <div>
             <h1 className="page-h1">Decision Register</h1>
             <p className="page-subtitle">
-              Chronological audit trail of agreed, proposed, and superseded decisions across clients and projects.
+              Chronological audit trail of agreed, proposed, and superseded decisions — filterable by client or project.
             </p>
           </div>
         </div>
@@ -181,6 +409,61 @@ export const DecisionsGlobalView: React.FC<{
               {st.toUpperCase()}
             </button>
           ))}
+
+          <select
+            className="meta-select"
+            aria-label="Filter decisions by client or space"
+            value={spaceFilter}
+            onChange={(e) => handleSpaceChange(e.target.value)}
+          >
+            <option value="">All Clients &amp; Spaces</option>
+            {directory.clients.map((c) => (
+              <option key={c.id} value={c.id}>
+                Client: {c.name}
+              </option>
+            ))}
+            <option value="__internal__">Internal Workspace</option>
+            <option value="__inbox__">Inbox (Unfiled)</option>
+          </select>
+
+          <select
+            className="meta-select"
+            aria-label="Filter decisions by project"
+            value={projectFilter}
+            disabled={spaceFilter === '__inbox__'}
+            onChange={(e) => setProjectFilter(e.target.value)}
+          >
+            <option value="">All Projects</option>
+            {availableProjects.map((p) => {
+              const prefix = !spaceFilter
+                ? `${p.scope === 'internal' ? 'Internal' : clientById.get(p.clientId || '')?.name || 'Client'} · `
+                : 'Project: ';
+              return (
+                <option key={p.id} value={p.id}>
+                  {prefix}
+                  {p.name}
+                </option>
+              );
+            })}
+          </select>
+
+          {hasActiveFilters && (
+            <button
+              type="button"
+              className="btn btn-xs btn-ghost"
+              onClick={() => {
+                setStatusFilter('all');
+                setSpaceFilter('');
+                setProjectFilter('');
+              }}
+            >
+              Reset Filters
+            </button>
+          )}
+
+          <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--text-muted)' }}>
+            {filtered.length} {filtered.length === 1 ? 'decision' : 'decisions'}
+          </span>
         </div>
 
         <div className="surface-panel">
@@ -189,6 +472,13 @@ export const DecisionsGlobalView: React.FC<{
           ) : (
             filtered.map((d) => {
               const nextStatus = DEC_CYCLE[(DEC_CYCLE.indexOf(d.status) + 1) % DEC_CYCLE.length];
+              const ctx = getItemContextMeta(
+                noteById.get(d.noteId),
+                d.clientId,
+                d.projectId,
+                clientById,
+                projectById,
+              );
               return (
                 <div key={d.id} className="decision-inline-card">
                   <div className="decision-main">
@@ -207,7 +497,23 @@ export const DecisionsGlobalView: React.FC<{
                         </span>
                       ))}
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                      {ctx && (
+                        <button
+                          type="button"
+                          className="context-chip"
+                          title="Filter by this client / project"
+                          onClick={() => {
+                            setSpaceFilter(ctx.spaceValue);
+                            setProjectFilter(ctx.projectId || '');
+                          }}
+                        >
+                          {ctx.color && (
+                            <span className="client-dot" style={{ background: ctx.color }} />
+                          )}
+                          {ctx.label}
+                        </button>
+                      )}
                       <button type="button" className="pill pill-link" onClick={() => onOpenNote(d.noteId)}>
                         ↗ {d.noteTitle} ({d.noteDate})
                       </button>

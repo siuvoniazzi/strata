@@ -86,7 +86,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         const t = new Date(`${note.date}T12:00:00`).getTime();
         if (!Number.isNaN(t) && t < minTime) continue;
       }
-      if (clientId && note.clientId !== clientId) continue;
+      if (clientId === '__internal__') {
+        if (note.scope !== 'internal') continue;
+      } else if (clientId === '__inbox__') {
+        if (note.scope !== 'inbox') continue;
+      } else if (clientId && note.clientId !== clientId) {
+        continue;
+      }
       if (projectId && note.projectId !== projectId) continue;
 
       const noteLabels = getAllNoteLabels(note);
@@ -118,7 +124,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   const reportHeading = useMemo(() => {
     const parts: string[] = [];
-    if (clientId) {
+    if (clientId === '__internal__') {
+      parts.push('Internal Workspace');
+    } else if (clientId === '__inbox__') {
+      parts.push('Inbox');
+    } else if (clientId) {
       parts.push(directory.clients.find((c) => c.id === clientId)?.name || 'Client');
     }
     if (projectId) {
@@ -238,16 +248,23 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 Client: {c.name}
               </option>
             ))}
+            <option value="__internal__">Internal Workspace</option>
+            <option value="__inbox__">Inbox (Unfiled)</option>
           </select>
 
           <select
             className="meta-select"
             value={projectId}
+            disabled={clientId === '__inbox__'}
             onChange={(e) => setProjectId(e.target.value)}
           >
             <option value="">All Projects</option>
             {directory.projects
-              .filter((p) => !clientId || p.clientId === clientId)
+              .filter((p) => {
+                if (clientId === '__internal__') return p.scope === 'internal';
+                if (clientId === '__inbox__') return false;
+                return !clientId || p.clientId === clientId;
+              })
               .map((p) => (
                 <option key={p.id} value={p.id}>
                   Project: {p.name}
