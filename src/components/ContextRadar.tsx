@@ -369,7 +369,7 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                   type="text"
                   className="form-input"
                   style={{ flex: 1, fontSize: 12.5 }}
-                  placeholder="e.g., What did we agree on SSO or pricing?"
+                  placeholder="e.g., What decisions or blockers came up recently?"
                   value={askQuery}
                   onChange={(e) => setAskQuery(e.target.value)}
                 />
@@ -378,7 +378,7 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                 </button>
               </div>
               <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                {['SSO cutover decisions', 'Open high priority tasks', 'Pricing & SOW agreements'].map((preset) => (
+                {['Recent decisions', 'Open high priority tasks', 'Unresolved blockers'].map((preset) => (
                   <button
                     key={preset}
                     type="button"

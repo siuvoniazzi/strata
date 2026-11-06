@@ -25,12 +25,15 @@ import type {
   WorkspaceDirectory,
 } from '../types';
 import {
+  deleteDecisionFromBody,
+  deleteTaskFromBody,
   detectUnlinkedPeopleInText,
   formatPersonMention,
   getAllNoteLabels,
   normalizeLabel,
   parseMeetingInviteText,
   parseNoteItems,
+  removeLabelFromNote,
   slugify,
   updateDecisionInBody,
   updateTaskInBody,
@@ -762,27 +765,22 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
               <Hash size={13} /> Labels
             </span>
             <div className="meta-value">
-              {combinedLabels.map((lbl) => {
-                const isHeaderExplicit = note.labels.includes(lbl);
-                return (
-                  <span key={lbl} className="pill pill-label" onClick={() => onNavigateLabel(lbl)}>
-                    #{lbl}
-                    {isHeaderExplicit && (
-                      <button
-                        type="button"
-                        className="pill-remove"
-                        title="Remove header label"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          patchNote({ labels: note.labels.filter((x) => x !== lbl) });
-                        }}
-                      >
-                        <X size={11} />
-                      </button>
-                    )}
-                  </span>
-                );
-              })}
+              {combinedLabels.map((lbl) => (
+                <span key={lbl} className="pill pill-label" onClick={() => onNavigateLabel(lbl)}>
+                  #{lbl}
+                  <button
+                    type="button"
+                    className="pill-remove"
+                    title="Remove #label from this note"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onUpdateNote(removeLabelFromNote(note, lbl));
+                    }}
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              ))}
               <input
                 type="text"
                 list="labels-datalist"
@@ -899,11 +897,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             </button>
             <button
               type="button"
-              className="btn btn-xs btn-ghost"
+              className="btn btn-xs btn-danger-ghost"
               onClick={() => onDeleteNote(note.id)}
-              title="Delete note"
+              title="Delete this note"
             >
-              <Trash2 size={13} />
+              <Trash2 size={13} /> Delete Note
             </button>
           </div>
         </div>
@@ -999,6 +997,17 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     <div className="task-right">
                       {task.priority === 'high' && <span className="priority-high">!HIGH</span>}
                       {task.dueDate && <span className="due-chip">due {task.dueDate}</span>}
+                      <button
+                        type="button"
+                        className="mini-icon-btn danger"
+                        title="Delete task"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          patchNote({ body: deleteTaskFromBody(note.body, idx) });
+                        }}
+                      >
+                        <Trash2 size={12} />
+                      </button>
                     </div>
                   </div>
                 );
@@ -1039,6 +1048,17 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                         </span>
                         {extractInlineLabelPills(line, onNavigateLabel)}
                       </div>
+                      <button
+                        type="button"
+                        className="mini-icon-btn danger"
+                        title="Delete decision"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          patchNote({ body: deleteDecisionFromBody(note.body, idx) });
+                        }}
+                      >
+                        <Trash2 size={12} />
+                      </button>
                     </div>
                     {decision.rationale && (
                       <div
@@ -1262,7 +1282,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 className="form-textarea"
                 rows={6}
                 autoFocus
-                placeholder={`Subject: Northstar Cloud Security Sync\nDate: 2026-11-06\nRequired: Sarah Chen <sarah.chen@northstarfin.com>; Marcus Weber <m.weber@northstarfin.com>`}
+                placeholder={`Subject: Q4 Architecture Sync\nDate: 2026-11-06\nRequired: Jane Doe <jane@acme.com>; Alex Rivera <alex@acme.com>`}
                 value={inviteRawText}
                 onChange={(e) => setInviteRawText(e.target.value)}
               />

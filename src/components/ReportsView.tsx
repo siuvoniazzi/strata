@@ -6,6 +6,7 @@ import {
   Gavel,
   Printer,
   Sparkles,
+  Trash2,
 } from 'lucide-react';
 import type {
   AiConfig,
@@ -29,7 +30,9 @@ interface ReportsViewProps {
   initialPersonFilter?: string;
   onOpenNote: (noteId: string) => void;
   onUpdateTaskStatus: (task: ParsedTask, status: TaskStatus) => void;
+  onDeleteTask: (task: ParsedTask) => void;
   onUpdateDecisionStatus: (decision: ParsedDecision, status: DecisionStatus) => void;
+  onDeleteDecision: (decision: ParsedDecision) => void;
   onSaveBriefAsNote: (title: string, body: string, clientId: string | null, projectId: string | null) => void;
 }
 
@@ -46,7 +49,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   initialPersonFilter = '',
   onOpenNote,
   onUpdateTaskStatus,
+  onDeleteTask,
   onUpdateDecisionStatus,
+  onDeleteDecision,
   onSaveBriefAsNote,
 }) => {
   const [clientId, setClientId] = useState(initialClientFilter);
@@ -395,13 +400,23 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         </button>
                         <span style={{ fontWeight: 550 }}>{d.text}</span>
                       </div>
-                      <button
-                        type="button"
-                        className="pill pill-link"
-                        onClick={() => onOpenNote(d.noteId)}
-                      >
-                        ↗ {d.noteTitle} ({d.noteDate})
-                      </button>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <button
+                          type="button"
+                          className="pill pill-link"
+                          onClick={() => onOpenNote(d.noteId)}
+                        >
+                          ↗ {d.noteTitle} ({d.noteDate})
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-icon-btn danger"
+                          title="Delete decision from source note"
+                          onClick={() => onDeleteDecision(d)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
                     </div>
                     {d.rationale && <div className="decision-rationale">Rationale: {d.rationale}</div>}
                   </div>
@@ -450,6 +465,14 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         onClick={() => onOpenNote(t.noteId)}
                       >
                         ↗ {t.noteTitle}
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-icon-btn danger"
+                        title="Delete task from source note"
+                        onClick={() => onDeleteTask(t)}
+                      >
+                        <Trash2 size={13} />
                       </button>
                     </div>
                   </div>

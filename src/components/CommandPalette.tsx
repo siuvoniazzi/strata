@@ -11,7 +11,9 @@ import {
   Search,
   Sparkles,
   Sun,
+  Trash2,
   User,
+  Users,
 } from 'lucide-react';
 import type { Note, WorkspaceDirectory } from '../types';
 
@@ -22,6 +24,7 @@ interface CommandPaletteProps {
   theme: 'light' | 'dark';
   onClose: () => void;
   onNewNote: () => void;
+  onDeleteCurrentNote: () => void;
   onSelectNote: (noteId: string) => void;
   onOpenReportForLabel: (label: string) => void;
   onOpenPersonNotes: (personName: string) => void;
@@ -38,6 +41,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   theme,
   onClose,
   onNewNote,
+  onDeleteCurrentNote,
   onSelectNote,
   onOpenReportForLabel,
   onOpenPersonNotes,
@@ -65,11 +69,25 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         action: onNewNote,
       },
       {
+        id: 'act-delete-note',
+        title: 'Delete Current Note',
+        category: 'Quick Action',
+        icon: <Trash2 size={14} />,
+        action: onDeleteCurrentNote,
+      },
+      {
         id: 'act-ai-structure',
         title: 'Structure & Extract Current Note (Preview Diff)',
         category: 'AI & Structure',
         icon: <Sparkles size={14} />,
         action: onTriggerAiStructure,
+      },
+      {
+        id: 'view-directory',
+        title: 'Open Directory (Manage People, Clients, Projects & #Labels)',
+        category: 'Navigation',
+        icon: <Users size={14} />,
+        action: () => onSwitchMainView('people'),
       },
       {
         id: 'view-reports',
@@ -150,6 +168,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     directory.people,
     theme,
     onNewNote,
+    onDeleteCurrentNote,
     onTriggerAiStructure,
     onSwitchMainView,
     onConnectFolder,

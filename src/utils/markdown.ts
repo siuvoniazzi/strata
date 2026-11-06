@@ -355,6 +355,48 @@ export function updateDecisionInBody(
 }
 
 /**
+ * Deletes a Task line from a note's Markdown body.
+ */
+export function deleteTaskFromBody(body: string, lineIndex: number): string {
+  const lines = body.split('\n');
+  if (lineIndex < 0 || lineIndex >= lines.length) return body;
+  lines.splice(lineIndex, 1);
+  return lines.join('\n');
+}
+
+/**
+ * Deletes a Decision line (and its indented Rationale sub-line if present) from a note's Markdown body.
+ */
+export function deleteDecisionFromBody(body: string, lineIndex: number): string {
+  const lines = body.split('\n');
+  if (lineIndex < 0 || lineIndex >= lines.length) return body;
+  const hasRationale =
+    lineIndex + 1 < lines.length && /^\s*>\s*(?:Rationale:\s*)?(.+)$/i.test(lines[lineIndex + 1]);
+  lines.splice(lineIndex, hasRationale ? 2 : 1);
+  return lines.join('\n');
+}
+
+/**
+ * Removes a #label from both a note's frontmatter labels array and inline #label tokens in the body.
+ */
+export function removeLabelFromNote(note: Note, targetLabel: string): Note {
+  const norm = normalizeLabel(targetLabel);
+  if (!norm) return note;
+  const escaped = norm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const nextBody = note.body
+    .replace(new RegExp(`(^|[\\s(])#${escaped}(?=$|[\\s,.;:!?)])`, 'giu'), '$1')
+    .replace(/ {2,}/g, ' ');
+  const nextLabels = note.labels.filter((l) => normalizeLabel(l) !== norm);
+  if (nextBody === note.body && nextLabels.length === note.labels.length) return note;
+  return {
+    ...note,
+    labels: nextLabels,
+    body: nextBody,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Computes canonical relative .md path for local/OneDrive folder sync:
  * Inbox/ | Internal/<Project>/ | Clients/<Client>/<Project>/
  */

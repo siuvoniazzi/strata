@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BarChart3,
-  Building2,
   CheckSquare,
   ChevronRight,
   Compass,
@@ -9,17 +8,19 @@ import {
   FilePlus2,
   FolderSync,
   Gavel,
-  Hash,
   Inbox,
   KeyRound,
   Layers,
   Moon,
   PanelLeft,
+  Plus,
   RotateCcw,
   Search,
   Sun,
+  Trash2,
   Upload,
   Users,
+  X,
 } from 'lucide-react';
 import { AiSettingsModal, AiStructureModal } from './components/AiStructureModal';
 import { CommandPalette } from './components/CommandPalette';
@@ -48,14 +49,18 @@ import type {
 import { loadAiConfig } from './utils/aiProvider';
 import {
   computeNoteFilePath,
+  deleteDecisionFromBody,
+  deleteTaskFromBody,
   extractInlineMentions,
   getAllNoteLabels,
+  normalizeLabel,
   parseNoteItems,
+  removeLabelFromNote,
   slugify,
   updateDecisionInBody,
   updateTaskInBody,
 } from './utils/markdown';
-import { createSeedWorkspace } from './utils/seedData';
+import { createSeedWorkspace, purgeLegacyDemoData } from './utils/seedData';
 import {
   exportWorkspaceZip,
   type FsDirectoryHandle,
@@ -73,6 +78,13 @@ import {
 } from './utils/storage';
 
 const CLIENT_PALETTE = ['#0284c7', '#0d9488', '#d97706', '#2563eb', '#059669', '#dc2626'];
+
+interface UndoSnapshot {
+  message: string;
+  notes: Note[];
+  directory: WorkspaceDirectory;
+  activeNoteId: string;
+}
 
 function makeFreshNote(partial?: Partial<Note>): Note {
   const now = new Date();
@@ -114,6 +126,18 @@ export function App() {
   const [radarOpen, setRadarOpen] = useState(true);
   const [radarRequestedTab, setRadarRequestedTab] = useState<'context' | 'ask' | 'outline' | null>(null);
 
+  // Sidebar inline quick-add state
+  const [sidebarAddingClient, setSidebarAddingClient] = useState(false);
+  const [sidebarClientInput, setSidebarClientInput] = useState('');
+  const [sidebarAddingProjectFor, setSidebarAddingProjectFor] = useState<string | null>(null); // 'internal' | clientId
+  const [sidebarProjectInput, setSidebarProjectInput] = useState('');
+  const [sidebarAddingLabel, setSidebarAddingLabel] = useState(false);
+  const [sidebarLabelInput, setSidebarLabelInput] = useState('');
+
+  // Undo toast for fast, safe deletions
+  const [undoSnapshot, setUndoSnapshot] = useState<UndoSnapshot | null>(null);
+  const undoTimerRef = useRef<number | null>(null);
+
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     try {
       const saved = localStorage.getItem('strata.theme');
@@ -154,27 +178,49 @@ export function App() {
     }
   }, [theme]);
 
-  // Hydrate workspace from IndexedDB + check persisted folder handle
+  // Hydrate workspace from IndexedDB + one-time purge of v1 demo records
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
-        const [savedNotes, savedDir, persistedHandle] = await Promise.all([
+        const [savedNotes, savedDir, demoPurgedV2, persistedHandle] = await Promise.all([
           idbGet<Note[]>('notes'),
           idbGet<WorkspaceDirectory>('directory'),
+          idbGet<boolean>('demoPurgedV2'),
           loadPersistedDirHandle(),
         ]);
 
         if (!mounted) return;
 
-        if (savedNotes && savedNotes.length > 0 && savedDir) {
-          setNotes(savedNotes);
-          setDirectory(savedDir);
-          setActiveNoteId(savedNotes[0].id);
+        if (savedNotes && savedDir) {
+          if (!demoPurgedV2) {
+            const purged = purgeLegacyDemoData(savedNotes, savedDir);
+            setNotes(purged.notes);
+            setDirectory(purged.directory);
+            setActiveNoteId(purged.notes[0]?.id || '');
+            await idbSet('notes', purged.notes);
+            await idbSet('directory', purged.directory);
+            await idbSet('demoPurgedV2', true);
+
+            if (purged.didPurge && persistedHandle.handle && persistedHandle.permission === 'granted') {
+              const keptIds = new Set(purged.notes.map((n) => n.id));
+              for (const oldNote of savedNotes) {
+                if (!keptIds.has(oldNote.id) && oldNote.filePath) {
+                  removeNestedFileIfExists(persistedHandle.handle, oldNote.filePath).catch(() => {});
+                }
+              }
+              writeDirectoryMetadata(persistedHandle.handle, purged.directory).catch(() => {});
+            }
+          } else {
+            const hydratedNotes = savedNotes.length > 0 ? savedNotes : seed.notes;
+            setNotes(hydratedNotes);
+            setDirectory(savedDir);
+            setActiveNoteId(hydratedNotes[0].id);
+          }
         } else {
-          // Persist initial workspace immediately
           await idbSet('notes', seed.notes);
           await idbSet('directory', seed.directory);
+          await idbSet('demoPurgedV2', true);
         }
 
         if (persistedHandle.handle) {
@@ -208,6 +254,34 @@ export function App() {
       writeDirectoryMetadata(dirHandle, directory).catch(() => {});
     }
   }, [directory, hydrated, dirHandle, dirPermission]);
+
+  const pushUndo = useCallback(
+    (message: string) => {
+      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+      setUndoSnapshot({
+        message,
+        notes,
+        directory,
+        activeNoteId,
+      });
+      undoTimerRef.current = window.setTimeout(() => {
+        setUndoSnapshot(null);
+      }, 7000);
+    },
+    [notes, directory, activeNoteId]
+  );
+
+  const handleUndo = useCallback(() => {
+    if (!undoSnapshot) return;
+    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+    setNotes(undoSnapshot.notes);
+    setDirectory(undoSnapshot.directory);
+    setActiveNoteId(undoSnapshot.activeNoteId);
+    setUndoSnapshot(null);
+    if (dirHandle && dirPermission === 'granted') {
+      syncWorkspaceWithFolder(dirHandle, undoSnapshot.notes, undoSnapshot.directory).catch(() => {});
+    }
+  }, [undoSnapshot, dirHandle, dirPermission]);
 
   // Global keyboard shortcuts: Ctrl/Cmd+K (Command Palette), Alt+N (Instant New Note)
   const handleSpinUpNote = useCallback(() => {
@@ -333,6 +407,8 @@ export function App() {
   const handleDeleteNote = useCallback(
     (noteId: string) => {
       const target = notes.find((n) => n.id === noteId);
+      if (!target) return;
+      pushUndo(`Deleted note "${target.title || 'Untitled Note'}"`);
       const remaining = notes.filter((n) => n.id !== noteId);
       if (remaining.length === 0) {
         const fresh = makeFreshNote();
@@ -342,11 +418,11 @@ export function App() {
         setNotes(remaining);
         if (activeNoteId === noteId) setActiveNoteId(remaining[0].id);
       }
-      if (target?.filePath && dirHandle && dirPermission === 'granted') {
+      if (target.filePath && dirHandle && dirPermission === 'granted') {
         removeNestedFileIfExists(dirHandle, target.filePath);
       }
     },
-    [notes, activeNoteId, dirHandle, dirPermission]
+    [notes, activeNoteId, dirHandle, dirPermission, pushUndo]
   );
 
   const handleEnsurePerson = useCallback(
@@ -367,6 +443,62 @@ export function App() {
     [directory.people]
   );
 
+  const handleUpdatePerson = useCallback(
+    (updated: Person, previousName?: string) => {
+      setDirectory((prev) => ({
+        ...prev,
+        people: prev.people.map((p) => (p.id === updated.id ? updated : p)),
+      }));
+      if (previousName && previousName !== updated.name && updated.name.trim()) {
+        setNotes((prev) =>
+          prev.map((n) =>
+            n.participants.includes(previousName)
+              ? {
+                  ...n,
+                  participants: n.participants.map((part) =>
+                    part === previousName ? updated.name : part
+                  ),
+                }
+              : n
+          )
+        );
+      }
+    },
+    []
+  );
+
+  const handleDeletePerson = useCallback(
+    (personId: string) => {
+      const target = directory.people.find((p) => p.id === personId);
+      if (!target) return;
+      pushUndo(`Deleted person "${target.name}"`);
+      setDirectory((prev) => ({
+        ...prev,
+        people: prev.people.filter((p) => p.id !== personId),
+      }));
+      setNotes((prev) =>
+        prev.map((n) =>
+          n.participants.some((part) => part.toLowerCase() === target.name.toLowerCase())
+            ? {
+                ...n,
+                participants: n.participants.filter(
+                  (part) => part.toLowerCase() !== target.name.toLowerCase()
+                ),
+                updatedAt: new Date().toISOString(),
+              }
+            : n
+        )
+      );
+      if (
+        noteFilter.kind === 'person' &&
+        noteFilter.personName?.toLowerCase() === target.name.toLowerCase()
+      ) {
+        setNoteFilter({ kind: 'all' });
+      }
+    },
+    [directory.people, noteFilter, pushUndo]
+  );
+
   const handleAddClient = useCallback(
     (name: string, domain?: string): string => {
       const existing = directory.clients.find((c) => c.name.toLowerCase() === name.toLowerCase());
@@ -382,6 +514,63 @@ export function App() {
       return id;
     },
     [directory.clients]
+  );
+
+  const handleUpdateClient = useCallback((updated: Client) => {
+    setDirectory((prev) => ({
+      ...prev,
+      clients: prev.clients.map((c) => (c.id === updated.id ? updated : c)),
+    }));
+  }, []);
+
+  const handleDeleteClient = useCallback(
+    (clientId: string) => {
+      const target = directory.clients.find((c) => c.id === clientId);
+      if (!target) return;
+      pushUndo(`Deleted client "${target.name}"`);
+
+      const removedProjectIds = new Set(
+        directory.projects.filter((p) => p.clientId === clientId).map((p) => p.id)
+      );
+
+      const nextDir: WorkspaceDirectory = {
+        ...directory,
+        clients: directory.clients.filter((c) => c.id !== clientId),
+        projects: directory.projects.filter((p) => p.clientId !== clientId),
+        people: directory.people.map((p) =>
+          p.clientId === clientId ? { ...p, clientId: null, isInternal: true } : p
+        ),
+      };
+      setDirectory(nextDir);
+
+      const nowIso = new Date().toISOString();
+      setNotes((prev) =>
+        prev.map((n) => {
+          if (n.clientId !== clientId) return n;
+          const moved: Note = {
+            ...n,
+            scope: 'inbox',
+            clientId: null,
+            projectId: null,
+            updatedAt: nowIso,
+          };
+          const nextPath = computeNoteFilePath(moved, nextDir);
+          const withPath = { ...moved, filePath: nextPath };
+          syncSingleNoteToDisk(withPath, n.filePath, nextDir);
+          return withPath;
+        })
+      );
+
+      if (
+        (noteFilter.kind === 'client' && noteFilter.clientId === clientId) ||
+        (noteFilter.kind === 'project' &&
+          (noteFilter.clientId === clientId ||
+            (noteFilter.projectId && removedProjectIds.has(noteFilter.projectId))))
+      ) {
+        setNoteFilter({ kind: 'all' });
+      }
+    },
+    [directory, noteFilter, pushUndo, syncSingleNoteToDisk]
   );
 
   const handleAddProject = useCallback(
@@ -400,6 +589,88 @@ export function App() {
     []
   );
 
+  const handleUpdateProject = useCallback((updated: Project) => {
+    setDirectory((prev) => ({
+      ...prev,
+      projects: prev.projects.map((p) => (p.id === updated.id ? updated : p)),
+    }));
+  }, []);
+
+  const handleDeleteProject = useCallback(
+    (projectId: string) => {
+      const target = directory.projects.find((p) => p.id === projectId);
+      if (!target) return;
+      pushUndo(`Deleted project "${target.name}"`);
+
+      const nextDir: WorkspaceDirectory = {
+        ...directory,
+        projects: directory.projects.filter((p) => p.id !== projectId),
+      };
+      setDirectory(nextDir);
+
+      const nowIso = new Date().toISOString();
+      setNotes((prev) =>
+        prev.map((n) => {
+          if (n.projectId !== projectId) return n;
+          const unassigned: Note = {
+            ...n,
+            projectId: null,
+            updatedAt: nowIso,
+          };
+          const nextPath = computeNoteFilePath(unassigned, nextDir);
+          const withPath = { ...unassigned, filePath: nextPath };
+          syncSingleNoteToDisk(withPath, n.filePath, nextDir);
+          return withPath;
+        })
+      );
+
+      if (noteFilter.kind === 'project' && noteFilter.projectId === projectId) {
+        setNoteFilter(
+          target.clientId ? { kind: 'client', clientId: target.clientId } : { kind: 'internal' }
+        );
+      }
+    },
+    [directory, noteFilter, pushUndo, syncSingleNoteToDisk]
+  );
+
+  const handleAddLabel = useCallback((rawLabel: string) => {
+    const norm = normalizeLabel(rawLabel);
+    if (!norm) return;
+    setDirectory((prev) =>
+      prev.customLabels.includes(norm)
+        ? prev
+        : { ...prev, customLabels: [...prev.customLabels, norm] }
+    );
+  }, []);
+
+  const handleDeleteLabel = useCallback(
+    (rawLabel: string) => {
+      const norm = normalizeLabel(rawLabel);
+      if (!norm) return;
+      pushUndo(`Deleted #${norm} label`);
+
+      setDirectory((prev) => ({
+        ...prev,
+        customLabels: prev.customLabels.filter((l) => normalizeLabel(l) !== norm),
+      }));
+
+      setNotes((prev) =>
+        prev.map((n) => {
+          const cleaned = removeLabelFromNote(n, norm);
+          if (cleaned !== n) {
+            syncSingleNoteToDisk(cleaned, n.filePath);
+          }
+          return cleaned;
+        })
+      );
+
+      if (noteFilter.kind === 'label' && noteFilter.label === norm) {
+        setNoteFilter({ kind: 'all' });
+      }
+    },
+    [noteFilter, pushUndo, syncSingleNoteToDisk]
+  );
+
   const handleUpdateRemoteTaskStatus = useCallback(
     (task: ParsedTask, nextStatus: TaskStatus) => {
       const target = notes.find((n) => n.id === task.noteId);
@@ -410,6 +681,17 @@ export function App() {
     [notes, handleUpdateNote]
   );
 
+  const handleDeleteRemoteTask = useCallback(
+    (task: ParsedTask) => {
+      const target = notes.find((n) => n.id === task.noteId);
+      if (!target) return;
+      pushUndo(`Deleted task "${task.text.slice(0, 34)}"`);
+      const nextBody = deleteTaskFromBody(target.body, task.lineIndex);
+      handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
+    },
+    [notes, handleUpdateNote, pushUndo]
+  );
+
   const handleUpdateRemoteDecisionStatus = useCallback(
     (decision: ParsedDecision, nextStatus: DecisionStatus) => {
       const target = notes.find((n) => n.id === decision.noteId);
@@ -418,6 +700,17 @@ export function App() {
       handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
     },
     [notes, handleUpdateNote]
+  );
+
+  const handleDeleteRemoteDecision = useCallback(
+    (decision: ParsedDecision) => {
+      const target = notes.find((n) => n.id === decision.noteId);
+      if (!target) return;
+      pushUndo(`Deleted decision "${decision.text.slice(0, 34)}"`);
+      const nextBody = deleteDecisionFromBody(target.body, decision.lineIndex);
+      handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
+    },
+    [notes, handleUpdateNote, pushUndo]
   );
 
   const handleConnectOrSyncFolder = async () => {
@@ -460,7 +753,10 @@ export function App() {
   };
 
   const handleResetCleanWorkspace = () => {
-    if (!window.confirm('Clear sample notes and start with a fresh blank note?')) return;
+    if (!window.confirm('Delete all notes, clients, projects, and people in this browser workspace?')) {
+      return;
+    }
+    pushUndo('Cleared entire workspace');
     const fresh = makeFreshNote();
     const emptyDir: WorkspaceDirectory = {
       clients: [],
@@ -487,7 +783,7 @@ export function App() {
     if (mainView === 'reports') return 'Reports Hub';
     if (mainView === 'tasks') return 'Tasks Rollup';
     if (mainView === 'decisions') return 'Decision Register';
-    if (mainView === 'people') return 'People & Clients';
+    if (mainView === 'people') return 'Workspace Directory';
     if (noteFilter.kind === 'inbox') return 'Inbox';
     if (noteFilter.kind === 'internal') return 'Internal Workspace';
     if (noteFilter.kind === 'client') {
@@ -500,6 +796,11 @@ export function App() {
     if (noteFilter.kind === 'person') return `@${noteFilter.personName}`;
     return 'All Notes';
   }, [mainView, noteFilter, directory.clients, directory.projects]);
+
+  const internalProjects = useMemo(
+    () => directory.projects.filter((p) => p.scope === 'internal'),
+    [directory.projects]
+  );
 
   return (
     <div className={shellClass}>
@@ -555,7 +856,10 @@ export function App() {
             >
               <FilePlus2 size={14} />
               New Note
-              <span className="kbd" style={{ background: 'rgba(255,255,255,0.2)', color: '#fff', borderColor: 'transparent' }}>
+              <span
+                className="kbd"
+                style={{ background: 'rgba(255,255,255,0.2)', color: '#fff', borderColor: 'transparent' }}
+              >
                 Alt+N
               </span>
             </button>
@@ -636,9 +940,11 @@ export function App() {
                 onClick={() => setMainView('people')}
               >
                 <span className="nav-item-left">
-                  <Users size={14} /> People &amp; Clients
+                  <Users size={14} /> Directory
                 </span>
-                <span className="nav-item-count">{directory.people.length}</span>
+                <span className="nav-item-count">
+                  {directory.people.length + directory.clients.length + directory.projects.length}
+                </span>
               </button>
             </div>
 
@@ -646,109 +952,388 @@ export function App() {
             <div className="nav-section">
               <div className="nav-section-header">
                 <span>Clients &amp; Projects</span>
-                <Building2 size={12} />
+                <button
+                  type="button"
+                  className="mini-icon-btn"
+                  title="Add Client"
+                  onClick={() => {
+                    setSidebarAddingClient((v) => !v);
+                    setSidebarClientInput('');
+                  }}
+                >
+                  <Plus size={13} />
+                </button>
               </div>
+
+              {sidebarAddingClient && (
+                <form
+                  className="sidebar-inline-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!sidebarClientInput.trim()) return;
+                    const cId = handleAddClient(sidebarClientInput.trim());
+                    setSidebarClientInput('');
+                    setSidebarAddingClient(false);
+                    setMainView('notes');
+                    setNoteFilter({ kind: 'client', clientId: cId });
+                  }}
+                >
+                  <input
+                    type="text"
+                    className="sidebar-inline-input"
+                    placeholder="New client name…"
+                    autoFocus
+                    value={sidebarClientInput}
+                    onChange={(e) => setSidebarClientInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') setSidebarAddingClient(false);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="mini-icon-btn"
+                    onClick={() => setSidebarAddingClient(false)}
+                  >
+                    <X size={12} />
+                  </button>
+                </form>
+              )}
 
               {directory.clients.map((client) => {
                 const clientProjects = directory.projects.filter((p) => p.clientId === client.id);
                 const clientNoteCount = notes.filter((n) => n.clientId === client.id).length;
                 return (
                   <div key={client.id}>
-                    <button
-                      type="button"
-                      className={`nav-item ${
-                        mainView === 'notes' &&
-                        noteFilter.kind === 'client' &&
-                        noteFilter.clientId === client.id
-                          ? 'active'
-                          : ''
-                      }`}
-                      onClick={() => {
-                        setMainView('notes');
-                        setNoteFilter({ kind: 'client', clientId: client.id });
-                      }}
-                    >
-                      <span className="nav-item-left">
-                        <span className="client-dot" style={{ background: client.color }} />
-                        {client.name}
-                      </span>
-                      <span className="nav-item-count">{clientNoteCount}</span>
-                    </button>
-
-                    {clientProjects.map((proj) => (
+                    <div className="nav-row-wrap">
                       <button
-                        key={proj.id}
                         type="button"
-                        className={`nav-item tree-indent ${
+                        className={`nav-item ${
                           mainView === 'notes' &&
-                          noteFilter.kind === 'project' &&
-                          noteFilter.projectId === proj.id
+                          noteFilter.kind === 'client' &&
+                          noteFilter.clientId === client.id
                             ? 'active'
                             : ''
                         }`}
                         onClick={() => {
                           setMainView('notes');
-                          setNoteFilter({
-                            kind: 'project',
-                            clientId: client.id,
-                            projectId: proj.id,
-                          });
+                          setNoteFilter({ kind: 'client', clientId: client.id });
                         }}
                       >
                         <span className="nav-item-left">
-                          <ChevronRight size={12} />
-                          {proj.name}
+                          <span className="client-dot" style={{ background: client.color }} />
+                          {client.name}
                         </span>
+                        <span className="nav-item-count">{clientNoteCount}</span>
                       </button>
+                      <div className="nav-row-actions">
+                        <button
+                          type="button"
+                          className="mini-icon-btn"
+                          title={`Add project under ${client.name}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSidebarAddingProjectFor((curr) =>
+                              curr === client.id ? null : client.id
+                            );
+                            setSidebarProjectInput('');
+                          }}
+                        >
+                          <Plus size={12} />
+                        </button>
+                        <button
+                          type="button"
+                          className="mini-icon-btn danger"
+                          title={`Delete client ${client.name}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDeleteClient(client.id);
+                          }}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {sidebarAddingProjectFor === client.id && (
+                      <form
+                        className="sidebar-inline-form"
+                        style={{ paddingLeft: 18 }}
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (!sidebarProjectInput.trim()) return;
+                          const pId = handleAddProject(
+                            sidebarProjectInput.trim(),
+                            'client',
+                            client.id
+                          );
+                          setSidebarProjectInput('');
+                          setSidebarAddingProjectFor(null);
+                          setMainView('notes');
+                          setNoteFilter({ kind: 'project', clientId: client.id, projectId: pId });
+                        }}
+                      >
+                        <input
+                          type="text"
+                          className="sidebar-inline-input"
+                          placeholder={`Project for ${client.name}…`}
+                          autoFocus
+                          value={sidebarProjectInput}
+                          onChange={(e) => setSidebarProjectInput(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Escape') setSidebarAddingProjectFor(null);
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="mini-icon-btn"
+                          onClick={() => setSidebarAddingProjectFor(null)}
+                        >
+                          <X size={12} />
+                        </button>
+                      </form>
+                    )}
+
+                    {clientProjects.map((proj) => (
+                      <div key={proj.id} className="nav-row-wrap">
+                        <button
+                          type="button"
+                          className={`nav-item tree-indent ${
+                            mainView === 'notes' &&
+                            noteFilter.kind === 'project' &&
+                            noteFilter.projectId === proj.id
+                              ? 'active'
+                              : ''
+                          }`}
+                          onClick={() => {
+                            setMainView('notes');
+                            setNoteFilter({
+                              kind: 'project',
+                              clientId: client.id,
+                              projectId: proj.id,
+                            });
+                          }}
+                        >
+                          <span className="nav-item-left">
+                            <ChevronRight size={12} />
+                            {proj.name}
+                          </span>
+                        </button>
+                        <div className="nav-row-actions">
+                          <button
+                            type="button"
+                            className="mini-icon-btn danger"
+                            title={`Delete project ${proj.name}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteProject(proj.id);
+                            }}
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      </div>
                     ))}
                   </div>
                 );
               })}
 
-              {/* Internal Workspace Projects */}
-              <button
-                type="button"
-                className={`nav-item ${
-                  mainView === 'notes' && noteFilter.kind === 'internal' ? 'active' : ''
-                }`}
-                onClick={() => {
-                  setMainView('notes');
-                  setNoteFilter({ kind: 'internal' });
-                }}
-              >
-                <span className="nav-item-left">
-                  <span className="client-dot" style={{ background: 'var(--text-muted)' }} />
-                  Internal Workspace
-                </span>
-              </button>
+              {/* Internal Workspace & Internal Projects */}
+              <div className="nav-row-wrap">
+                <button
+                  type="button"
+                  className={`nav-item ${
+                    mainView === 'notes' && noteFilter.kind === 'internal' ? 'active' : ''
+                  }`}
+                  onClick={() => {
+                    setMainView('notes');
+                    setNoteFilter({ kind: 'internal' });
+                  }}
+                >
+                  <span className="nav-item-left">
+                    <span className="client-dot" style={{ background: 'var(--text-muted)' }} />
+                    Internal Workspace
+                  </span>
+                </button>
+                <div className="nav-row-actions">
+                  <button
+                    type="button"
+                    className="mini-icon-btn"
+                    title="Add internal project"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSidebarAddingProjectFor((curr) =>
+                        curr === 'internal' ? null : 'internal'
+                      );
+                      setSidebarProjectInput('');
+                    }}
+                  >
+                    <Plus size={12} />
+                  </button>
+                </div>
+              </div>
+
+              {sidebarAddingProjectFor === 'internal' && (
+                <form
+                  className="sidebar-inline-form"
+                  style={{ paddingLeft: 18 }}
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!sidebarProjectInput.trim()) return;
+                    const pId = handleAddProject(sidebarProjectInput.trim(), 'internal', null);
+                    setSidebarProjectInput('');
+                    setSidebarAddingProjectFor(null);
+                    setMainView('notes');
+                    setNoteFilter({ kind: 'project', projectId: pId });
+                  }}
+                >
+                  <input
+                    type="text"
+                    className="sidebar-inline-input"
+                    placeholder="Internal project name…"
+                    autoFocus
+                    value={sidebarProjectInput}
+                    onChange={(e) => setSidebarProjectInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') setSidebarAddingProjectFor(null);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="mini-icon-btn"
+                    onClick={() => setSidebarAddingProjectFor(null)}
+                  >
+                    <X size={12} />
+                  </button>
+                </form>
+              )}
+
+              {internalProjects.map((proj) => (
+                <div key={proj.id} className="nav-row-wrap">
+                  <button
+                    type="button"
+                    className={`nav-item tree-indent ${
+                      mainView === 'notes' &&
+                      noteFilter.kind === 'project' &&
+                      noteFilter.projectId === proj.id
+                        ? 'active'
+                        : ''
+                    }`}
+                    onClick={() => {
+                      setMainView('notes');
+                      setNoteFilter({
+                        kind: 'project',
+                        projectId: proj.id,
+                      });
+                    }}
+                  >
+                    <span className="nav-item-left">
+                      <ChevronRight size={12} />
+                      {proj.name}
+                    </span>
+                  </button>
+                  <div className="nav-row-actions">
+                    <button
+                      type="button"
+                      className="mini-icon-btn danger"
+                      title={`Delete project ${proj.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteProject(proj.id);
+                      }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
 
             {/* Unified #Labels / Topics */}
             <div className="nav-section">
               <div className="nav-section-header">
                 <span>Topics &amp; #Labels</span>
-                <Hash size={12} />
+                <button
+                  type="button"
+                  className="mini-icon-btn"
+                  title="Add #label"
+                  onClick={() => {
+                    setSidebarAddingLabel((v) => !v);
+                    setSidebarLabelInput('');
+                  }}
+                >
+                  <Plus size={13} />
+                </button>
               </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, padding: '4px 6px' }}>
-                {allWorkspaceLabels.map((lbl) => (
+
+              {sidebarAddingLabel && (
+                <form
+                  className="sidebar-inline-form"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const norm = normalizeLabel(sidebarLabelInput);
+                    if (!norm) return;
+                    handleAddLabel(norm);
+                    setSidebarLabelInput('');
+                    setSidebarAddingLabel(false);
+                  }}
+                >
+                  <input
+                    type="text"
+                    className="sidebar-inline-input"
+                    placeholder="New #label…"
+                    autoFocus
+                    value={sidebarLabelInput}
+                    onChange={(e) => setSidebarLabelInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') setSidebarAddingLabel(false);
+                    }}
+                  />
                   <button
-                    key={lbl}
                     type="button"
-                    className="pill pill-label"
-                    onClick={() => {
-                      setMainView('notes');
-                      setNoteFilter({ kind: 'label', label: lbl });
-                    }}
-                    onDoubleClick={() => {
-                      setReportInitialFilter({ label: lbl });
-                      setMainView('reports');
-                    }}
-                    title="Click to filter notes · Double-click to open Topic Report"
+                    className="mini-icon-btn"
+                    onClick={() => setSidebarAddingLabel(false)}
                   >
-                    #{lbl}
+                    <X size={12} />
                   </button>
-                ))}
-              </div>
+                </form>
+              )}
+
+              {allWorkspaceLabels.length === 0 ? (
+                <div style={{ padding: '4px 8px', fontSize: 11.5, color: 'var(--text-muted)' }}>
+                  Type <code>#topic</code> in any note
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, padding: '4px 6px' }}>
+                  {allWorkspaceLabels.map((lbl) => (
+                    <span
+                      key={lbl}
+                      className="pill pill-label"
+                      onClick={() => {
+                        setMainView('notes');
+                        setNoteFilter({ kind: 'label', label: lbl });
+                      }}
+                      onDoubleClick={() => {
+                        setReportInitialFilter({ label: lbl });
+                        setMainView('reports');
+                      }}
+                      title="Click to filter notes · Double-click to open Topic Report"
+                    >
+                      #{lbl}
+                      <button
+                        type="button"
+                        className="pill-remove"
+                        title={`Delete #${lbl}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleDeleteLabel(lbl);
+                        }}
+                      >
+                        <X size={10} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
 
@@ -788,9 +1373,9 @@ export function App() {
               </button>
               <button
                 type="button"
-                className="btn btn-xs btn-ghost"
+                className="btn btn-xs btn-danger-ghost"
                 onClick={handleResetCleanWorkspace}
-                title="Clear sample workspace and start fresh"
+                title="Wipe all local workspace data"
               >
                 <RotateCcw size={12} />
               </button>
@@ -906,7 +1491,14 @@ export function App() {
                     />
                   </div>
                   {noteFilter.kind !== 'all' && (
-                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11.5 }}>
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        fontSize: 11.5,
+                      }}
+                    >
                       <span style={{ fontWeight: 600, color: 'var(--accent-text)' }}>
                         Filter: {activeBreadcrumbLabel}
                       </span>
@@ -937,10 +1529,21 @@ export function App() {
 
                 <div className="note-list-items">
                   {filteredNotesList.length === 0 ? (
-                    <div style={{ padding: 16, textAlign: 'center', color: 'var(--text-muted)', fontSize: 12.5 }}>
+                    <div
+                      style={{
+                        padding: 16,
+                        textAlign: 'center',
+                        color: 'var(--text-muted)',
+                        fontSize: 12.5,
+                      }}
+                    >
                       No notes in this view yet.
                       <div style={{ marginTop: 8 }}>
-                        <button type="button" className="btn btn-xs btn-primary" onClick={handleSpinUpNote}>
+                        <button
+                          type="button"
+                          className="btn btn-xs btn-primary"
+                          onClick={handleSpinUpNote}
+                        >
                           + Spin Up Note
                         </button>
                       </div>
@@ -955,25 +1558,37 @@ export function App() {
                         .replace(/[-*]\s*\[[ /?xXD:a-z]+\]\s*/gi, '')
                         .trim();
                       return (
-                        <button
-                          key={n.id}
-                          type="button"
-                          className={`note-card-item ${n.id === activeNote.id ? 'active' : ''}`}
-                          onClick={() => setActiveNoteId(n.id)}
-                        >
-                          <div className="note-card-title">{n.title || 'Untitled Note'}</div>
-                          <div className="note-card-meta">
-                            <span>{n.date}</span>
-                            {client && (
-                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                                <span className="client-dot" style={{ background: client.color }} />
-                                {client.name}
-                              </span>
-                            )}
-                            {n.scope === 'inbox' && <span>Inbox</span>}
-                          </div>
-                          {preview && <div className="note-card-snippet">{preview}</div>}
-                        </button>
+                        <div key={n.id} className="note-card-wrap">
+                          <button
+                            type="button"
+                            className={`note-card-item ${n.id === activeNote.id ? 'active' : ''}`}
+                            onClick={() => setActiveNoteId(n.id)}
+                          >
+                            <div className="note-card-title">{n.title || 'Untitled Note'}</div>
+                            <div className="note-card-meta">
+                              <span>{n.date}</span>
+                              {client && (
+                                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                                  <span className="client-dot" style={{ background: client.color }} />
+                                  {client.name}
+                                </span>
+                              )}
+                              {n.scope === 'inbox' && <span>Inbox</span>}
+                            </div>
+                            {preview && <div className="note-card-snippet">{preview}</div>}
+                          </button>
+                          <button
+                            type="button"
+                            className="card-delete-btn"
+                            title="Delete note"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteNote(n.id);
+                            }}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
                       );
                     })
                   )}
@@ -1044,7 +1659,9 @@ export function App() {
               setMainView('notes');
             }}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
+            onDeleteTask={handleDeleteRemoteTask}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
+            onDeleteDecision={handleDeleteRemoteDecision}
             onSaveBriefAsNote={(title, body, cId, pId) => {
               const saved = makeFreshNote({
                 title,
@@ -1070,6 +1687,7 @@ export function App() {
               setMainView('notes');
             }}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
+            onDeleteTask={handleDeleteRemoteTask}
           />
         )}
 
@@ -1082,6 +1700,7 @@ export function App() {
               setMainView('notes');
             }}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
+            onDeleteDecision={handleDeleteRemoteDecision}
           />
         )}
 
@@ -1089,12 +1708,8 @@ export function App() {
           <PeopleDirectoryView
             notes={notes}
             directory={directory}
-            onUpdatePerson={(updated) =>
-              setDirectory((prev) => ({
-                ...prev,
-                people: prev.people.map((p) => (p.id === updated.id ? updated : p)),
-              }))
-            }
+            allLabels={allWorkspaceLabels}
+            onUpdatePerson={handleUpdatePerson}
             onCreatePerson={(p) =>
               setDirectory((prev) => ({
                 ...prev,
@@ -1104,9 +1719,36 @@ export function App() {
                 ],
               }))
             }
+            onDeletePerson={handleDeletePerson}
             onAddClient={handleAddClient}
+            onUpdateClient={handleUpdateClient}
+            onDeleteClient={handleDeleteClient}
+            onAddProject={handleAddProject}
+            onUpdateProject={handleUpdateProject}
+            onDeleteProject={handleDeleteProject}
+            onAddLabel={handleAddLabel}
+            onDeleteLabel={handleDeleteLabel}
             onFilterNotesByPerson={(name) => {
               setNoteFilter({ kind: 'person', personName: name });
+              setMainView('notes');
+              setNoteListOpen(true);
+            }}
+            onFilterNotesByClient={(cId) => {
+              setNoteFilter({ kind: 'client', clientId: cId });
+              setMainView('notes');
+              setNoteListOpen(true);
+            }}
+            onFilterNotesByProject={(proj) => {
+              setNoteFilter({
+                kind: 'project',
+                clientId: proj.clientId || undefined,
+                projectId: proj.id,
+              });
+              setMainView('notes');
+              setNoteListOpen(true);
+            }}
+            onFilterNotesByLabel={(lbl) => {
+              setNoteFilter({ kind: 'label', label: lbl });
               setMainView('notes');
               setNoteListOpen(true);
             }}
@@ -1135,6 +1777,25 @@ export function App() {
           onToggleRemoteTaskStatus={handleUpdateRemoteTaskStatus}
           onCollapse={() => setRadarOpen(false)}
         />
+      )}
+
+      {/* Undo Deletion Toast */}
+      {undoSnapshot && (
+        <div className="undo-toast no-print" role="status" aria-live="polite">
+          <span>{undoSnapshot.message}</span>
+          <button type="button" className="undo-toast-btn" onClick={handleUndo}>
+            Undo
+          </button>
+          <button
+            type="button"
+            className="mini-icon-btn"
+            style={{ color: 'inherit', opacity: 0.7 }}
+            onClick={() => setUndoSnapshot(null)}
+            aria-label="Dismiss notification"
+          >
+            <X size={13} />
+          </button>
+        </div>
       )}
 
       {/* Modals */}
@@ -1174,6 +1835,7 @@ export function App() {
           theme={theme}
           onClose={() => setShowCommandPalette(false)}
           onNewNote={handleSpinUpNote}
+          onDeleteCurrentNote={() => handleDeleteNote(activeNote.id)}
           onSelectNote={(id) => {
             setActiveNoteId(id);
             setMainView('notes');

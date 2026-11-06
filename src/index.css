@@ -1352,6 +1352,164 @@ textarea {
   font-size: 12.5px;
 }
 
+/* Hover Action Controls & Danger Buttons */
+.btn-danger-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.btn-danger-ghost:hover {
+  background: var(--priority-high-bg);
+  color: var(--priority-high-text);
+  border-color: transparent;
+}
+
+.nav-row-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.nav-row-wrap .nav-item {
+  padding-right: 48px;
+}
+
+.nav-row-actions {
+  position: absolute;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.nav-row-wrap:hover .nav-row-actions,
+.nav-row-wrap:focus-within .nav-row-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.nav-row-wrap:hover .nav-item-count {
+  opacity: 0;
+}
+
+.mini-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.mini-icon-btn:hover {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+.mini-icon-btn.danger:hover {
+  background: var(--priority-high-bg);
+  color: var(--priority-high-text);
+}
+
+.note-card-wrap {
+  position: relative;
+}
+
+.note-card-wrap .note-card-title {
+  padding-right: 22px;
+}
+
+.card-delete-btn {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.note-card-wrap:hover .card-delete-btn,
+.note-card-wrap:focus-within .card-delete-btn {
+  opacity: 1;
+}
+
+.card-delete-btn:hover {
+  background: var(--priority-high-bg);
+  color: var(--priority-high-text);
+}
+
+.sidebar-inline-form {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+}
+
+.sidebar-inline-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 7px;
+  font-size: 12px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--accent-primary);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  outline: none;
+}
+
+.undo-toast {
+  position: fixed;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 95;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 14px;
+  border-radius: var(--radius-md);
+  background: var(--text-primary);
+  color: var(--bg-surface);
+  box-shadow: var(--shadow-md);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.undo-toast-btn {
+  padding: 3px 9px;
+  border-radius: var(--radius-xs);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.14);
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.undo-toast-btn:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
 /* Responsive Breakpoints */
 @media (max-width: 1180px) {
   .app-shell {

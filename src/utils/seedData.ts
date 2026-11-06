@@ -70,200 +70,98 @@ export const NOTE_TEMPLATES: Array<{
   },
 ];
 
-export function createSeedWorkspace(): { notes: Note[]; directory: WorkspaceDirectory } {
-  const directory: WorkspaceDirectory = {
-    clients: [
-      {
-        id: 'client-northstar',
-        name: 'Northstar Financial',
-        color: '#0284c7',
-        domain: 'northstarfin.com',
-        industry: 'Enterprise Banking',
-      },
-      {
-        id: 'client-helios',
-        name: 'Helios Health',
-        color: '#0d9488',
-        domain: 'helioshealth.org',
-        industry: 'Healthcare Systems',
-      },
-    ],
-    projects: [
-      {
-        id: 'proj-sso-cutover',
-        name: 'Zero-Trust SSO Migration',
-        scope: 'client',
-        clientId: 'client-northstar',
-        status: 'active',
-      },
-      {
-        id: 'proj-wealth-portal',
-        name: 'Advisor Analytics Portal',
-        scope: 'client',
-        clientId: 'client-northstar',
-        status: 'active',
-      },
-      {
-        id: 'proj-patient-intake',
-        name: 'Clinical Intake Modernization',
-        scope: 'client',
-        clientId: 'client-helios',
-        status: 'active',
-      },
-      {
-        id: 'proj-platform-ops',
-        name: 'Q4 Delivery & Architecture Standards',
-        scope: 'internal',
-        clientId: null,
-        status: 'active',
-      },
-    ],
-    people: [
-      {
-        id: 'person-sarah-chen',
-        name: 'Sarah Chen',
-        role: 'VP Identity & Security',
-        email: 'sarah.chen@northstarfin.com',
-        clientId: 'client-northstar',
-      },
-      {
-        id: 'person-marcus-weber',
-        name: 'Marcus Weber',
-        role: 'Principal Enterprise Architect',
-        email: 'm.weber@northstarfin.com',
-        clientId: 'client-northstar',
-      },
-      {
-        id: 'person-elena-rostova',
-        name: 'Elena Rostova',
-        role: 'Director of Clinical Operations',
-        email: 'elena.rostova@helioshealth.org',
-        clientId: 'client-helios',
-      },
-      {
-        id: 'person-david-kim',
-        name: 'David Kim',
-        role: 'Lead Security Engineer',
-        email: 'david.kim@internal.io',
-        clientId: null,
-        isInternal: true,
-      },
-      {
-        id: 'person-claire-dubois',
-        name: 'Claire Dubois',
-        role: 'Engagement Lead',
-        email: 'claire.dubois@internal.io',
-        clientId: null,
-        isInternal: true,
-      },
-    ],
-    customLabels: ['security', 'sso', 'pricing', 'architecture', 'q4-launch', 'compliance', 'risk'],
+const LEGACY_DEMO_NOTE_IDS = new Set([
+  'note-northstar-today',
+  'note-northstar-kickoff',
+  'note-helios-intake',
+  'note-internal-ops',
+]);
+
+const LEGACY_DEMO_CLIENT_IDS = new Set(['client-northstar', 'client-helios']);
+
+const LEGACY_DEMO_PROJECT_IDS = new Set([
+  'proj-sso-cutover',
+  'proj-wealth-portal',
+  'proj-patient-intake',
+  'proj-platform-ops',
+]);
+
+const LEGACY_DEMO_PERSON_IDS = new Set([
+  'person-sarah-chen',
+  'person-marcus-weber',
+  'person-elena-rostova',
+  'person-david-kim',
+  'person-claire-dubois',
+]);
+
+const LEGACY_DEMO_LABELS = new Set([
+  'security',
+  'sso',
+  'pricing',
+  'architecture',
+  'q4-launch',
+  'compliance',
+  'risk',
+]);
+
+export function createBlankInitialNote(): Note {
+  const now = new Date();
+  const iso = now.toISOString();
+  return {
+    id: `note-${now.getTime().toString(36)}`,
+    title: '',
+    date: iso.slice(0, 10),
+    scope: 'inbox',
+    clientId: null,
+    projectId: null,
+    participants: [],
+    labels: [],
+    body: '',
+    createdAt: iso,
+    updatedAt: iso,
   };
+}
 
-  const notes: Note[] = [
-    {
-      id: 'note-northstar-today',
-      title: 'Northstar SSO Cutover — Readiness & Rollback Check',
-      date: '2026-11-06',
-      scope: 'client',
-      clientId: 'client-northstar',
-      projectId: 'proj-sso-cutover',
-      participants: ['Sarah Chen', 'Marcus Weber', 'David Kim'],
-      labels: ['security', 'sso', 'q4-launch'],
-      createdAt: '2026-11-06T09:00:00.000Z',
-      updatedAt: '2026-11-06T09:30:00.000Z',
-      body: [
-        '## Cutover Readiness',
-        '- Reviewed staging SAML 2.0 assertion latency with @[Sarah Chen] and @[Marcus Weber]; p99 token exchange is holding at 84ms.',
-        '- Sarah Chen noted audit logging retention needs sign-off before the November 16 pilot cohort.',
-        '- Referenced prior IdP architecture baseline in [[Northstar Identity Kickoff & SOW Scope]].',
-        '',
-        '## Decisions',
-        '- [D:agreed] Run phased canary rollout starting with 250 internal wealth advisors on Nov 16 @[Sarah Chen] @[Marcus Weber] #sso #q4-launch',
-        '  > Rationale: Limits blast radius while validating hardware FIDO2 fallback keys in production.',
-        '- [D:proposed] Extend legacy session token grace window from 4h to 8h during week 1 @[David Kim] #security #risk',
-        '  > Rationale: Prevents mid-trading-day re-authentication prompts if Okta group sync lags.',
-        '',
-        '## Action Items',
-        '- [ ] Deliver signed SOC2 log-forwarding addendum to @[Sarah Chen] due:2026-11-10 !high #compliance',
-        '- [/] Validate automated SAML rollback runbook in pre-prod @[David Kim] due:2026-11-09 !high #sso',
-        '- [?] Confirm change-freeze window with Northstar CAB board @[Marcus Weber] due:2026-11-11 #q4-launch',
-      ].join('\n'),
+export function createSeedWorkspace(): { notes: Note[]; directory: WorkspaceDirectory } {
+  return {
+    notes: [createBlankInitialNote()],
+    directory: {
+      clients: [],
+      projects: [],
+      people: [],
+      customLabels: [],
     },
-    {
-      id: 'note-northstar-kickoff',
-      title: 'Northstar Identity Kickoff & SOW Scope',
-      date: '2026-10-28',
-      scope: 'client',
-      clientId: 'client-northstar',
-      projectId: 'proj-sso-cutover',
-      participants: ['Sarah Chen', 'Claire Dubois', 'David Kim'],
-      labels: ['security', 'sso', 'pricing', 'architecture'],
-      createdAt: '2026-10-28T14:00:00.000Z',
-      updatedAt: '2026-10-28T15:00:00.000Z',
-      body: [
-        '## Scope & Commercial Alignment',
-        '- Aligned phase 1 fixed-fee milestone structure with @[Sarah Chen] and @[Claire Dubois] #pricing.',
-        '- Legacy LDAP groups will be mapped 1:1 into SCIM provisioning attributes.',
-        '',
-        '## Decisions',
-        '- [D:agreed] Standardize on SAML 2.0 + SCIM 2.0 provisioning via Okta for Phase 1 @[Sarah Chen] @[David Kim] #architecture #sso',
-        '  > Rationale: Avoids custom OIDC proxy engineering ahead of Q4 regulatory audit.',
-        '- [D:agreed] Cap Phase 1 professional services contingency buffer at 12% @[Claire Dubois] @[Sarah Chen] #pricing',
-        '',
-        '## Action Items',
-        '- [x] Provision dedicated sandbox tenant and test certificates @[David Kim] due:2026-11-01 #security',
-        '- [ ] Share Phase 2 Advisor Analytics Portal commercial estimate @[Claire Dubois] due:2026-11-13 #pricing',
-      ].join('\n'),
-    },
-    {
-      id: 'note-helios-intake',
-      title: 'Helios Clinical Intake — HIPAA Audit & Triage Flow',
-      date: '2026-11-04',
-      scope: 'client',
-      clientId: 'client-helios',
-      projectId: 'proj-patient-intake',
-      participants: ['Elena Rostova', 'Claire Dubois'],
-      labels: ['compliance', 'architecture', 'q4-launch'],
-      createdAt: '2026-11-04T16:00:00.000Z',
-      updatedAt: '2026-11-04T16:45:00.000Z',
-      body: [
-        '## Triage Workflow Findings',
-        '- @[Elena Rostova] shared clinic pilot telemetry: average mobile check-in dropped from 6.4 min to 2.1 min.',
-        '- Need field-level PHI encryption verification documented before expanding to 14 regional clinics #compliance #security.',
-        '',
-        '## Decisions',
-        '- [D:agreed] Keep biometric consent forms stored exclusivamente in Helios regional KMS vault @[Elena Rostova] #compliance #security',
-        '  > Rationale: Satisfies hospital counsel data residency policy without multi-region replication.',
-        '',
-        '## Action Items',
-        '- [ ] Send updated BAA security questionnaire responses to @[Elena Rostova] due:2026-11-11 !high #compliance',
-        '- [ ] Prepare clinic rollout training deck with @[Claire Dubois] due:2026-11-14 #q4-launch',
-      ].join('\n'),
-    },
-    {
-      id: 'note-internal-ops',
-      title: 'Internal Architecture Guild — AI & Security Patterns',
-      date: '2026-11-02',
-      scope: 'internal',
-      clientId: null,
-      projectId: 'proj-platform-ops',
-      participants: ['David Kim', 'Claire Dubois'],
-      labels: ['architecture', 'security'],
-      createdAt: '2026-11-02T11:00:00.000Z',
-      updatedAt: '2026-11-02T11:40:00.000Z',
-      body: [
-        '## Reusable Delivery Playbooks',
-        '- Consolidating SAML/SCIM cutover checklist from [[Northstar Identity Kickoff & SOW Scope]] and HIPAA encryption checklist from Helios.',
-        '',
-        '## Decisions',
-        '- [D:agreed] Adopt standardized pre-cutover rollback runbook across all enterprise client migrations @[David Kim] @[Claire Dubois] #architecture',
-        '',
-        '## Action Items',
-        '- [ ] Publish reusable SSO cutover template to internal engineering handbook @[David Kim] due:2026-11-15 #architecture',
-      ].join('\n'),
-    },
-  ];
+  };
+}
 
-  return { notes, directory };
+/**
+ * Automatically purges legacy v1 demo records from IndexedDB while preserving any user-created notes & entities.
+ */
+export function purgeLegacyDemoData(
+  notes: Note[],
+  directory: WorkspaceDirectory
+): { notes: Note[]; directory: WorkspaceDirectory; didPurge: boolean } {
+  const filteredNotes = notes.filter((n) => !LEGACY_DEMO_NOTE_IDS.has(n.id));
+  const filteredClients = directory.clients.filter((c) => !LEGACY_DEMO_CLIENT_IDS.has(c.id));
+  const filteredProjects = directory.projects.filter((p) => !LEGACY_DEMO_PROJECT_IDS.has(p.id));
+  const filteredPeople = directory.people.filter((p) => !LEGACY_DEMO_PERSON_IDS.has(p.id));
+  const filteredLabels = directory.customLabels.filter((l) => !LEGACY_DEMO_LABELS.has(l));
+
+  const didPurge =
+    filteredNotes.length !== notes.length ||
+    filteredClients.length !== directory.clients.length ||
+    filteredProjects.length !== directory.projects.length ||
+    filteredPeople.length !== directory.people.length ||
+    filteredLabels.length !== directory.customLabels.length;
+
+  return {
+    notes: filteredNotes.length > 0 ? filteredNotes : [createBlankInitialNote()],
+    directory: {
+      clients: filteredClients,
+      projects: filteredProjects,
+      people: filteredPeople,
+      customLabels: filteredLabels,
+    },
+    didPurge,
+  };
 }
