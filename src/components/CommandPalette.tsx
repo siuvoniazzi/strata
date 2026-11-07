@@ -10,11 +10,13 @@ import {
   Maximize2,
   Minimize2,
   Moon,
+  Redo2,
   Search,
   Settings,
   Sparkles,
   Sun,
   Trash2,
+  Undo2,
   User,
   Users,
 } from 'lucide-react';
@@ -26,6 +28,18 @@ interface CommandPaletteProps {
   allLabels: string[];
   theme: 'light' | 'dark';
   isFocusMode?: boolean;
+  canUndoNote?: boolean;
+  canRedoNote?: boolean;
+  noteUndoLabel?: string | null;
+  noteRedoLabel?: string | null;
+  onUndoNote?: () => void;
+  onRedoNote?: () => void;
+  canUndoWorkspace?: boolean;
+  canRedoWorkspace?: boolean;
+  workspaceUndoLabel?: string | null;
+  workspaceRedoLabel?: string | null;
+  onUndoWorkspace?: () => void;
+  onRedoWorkspace?: () => void;
   onClose: () => void;
   onNewNote: () => void;
   onToggleFocusMode?: () => void;
@@ -40,12 +54,29 @@ interface CommandPaletteProps {
   onConnectFolder: () => void;
 }
 
+const IS_MAC_PLATFORM =
+  typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+const UNDO_SHORTCUT_HINT = IS_MAC_PLATFORM ? '⌘Z' : 'Ctrl+Z';
+const REDO_SHORTCUT_HINT = IS_MAC_PLATFORM ? '⇧⌘Z' : 'Ctrl+Y';
+
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
   notes,
   directory,
   allLabels,
   theme,
   isFocusMode = false,
+  canUndoNote = false,
+  canRedoNote = false,
+  noteUndoLabel = null,
+  noteRedoLabel = null,
+  onUndoNote,
+  onRedoNote,
+  canUndoWorkspace = false,
+  canRedoWorkspace = false,
+  workspaceUndoLabel = null,
+  workspaceRedoLabel = null,
+  onUndoWorkspace,
+  onRedoWorkspace,
   onClose,
   onNewNote,
   onToggleFocusMode,
@@ -70,6 +101,50 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       icon: React.ReactNode;
       action: () => void;
     }> = [
+      ...(canUndoNote && onUndoNote
+        ? [
+            {
+              id: 'act-undo-note',
+              title: `Undo Note Edit${noteUndoLabel ? ` — ${noteUndoLabel}` : ''} (${UNDO_SHORTCUT_HINT})`,
+              category: 'Quick Action',
+              icon: <Undo2 size={14} />,
+              action: onUndoNote,
+            },
+          ]
+        : []),
+      ...(canRedoNote && onRedoNote
+        ? [
+            {
+              id: 'act-redo-note',
+              title: `Redo Note Edit${noteRedoLabel ? ` — ${noteRedoLabel}` : ''} (${REDO_SHORTCUT_HINT})`,
+              category: 'Quick Action',
+              icon: <Redo2 size={14} />,
+              action: onRedoNote,
+            },
+          ]
+        : []),
+      ...(canUndoWorkspace && onUndoWorkspace
+        ? [
+            {
+              id: 'act-undo-workspace',
+              title: `Undo Workspace Action${workspaceUndoLabel ? ` — ${workspaceUndoLabel}` : ''}`,
+              category: 'Quick Action',
+              icon: <Undo2 size={14} />,
+              action: onUndoWorkspace,
+            },
+          ]
+        : []),
+      ...(canRedoWorkspace && onRedoWorkspace
+        ? [
+            {
+              id: 'act-redo-workspace',
+              title: `Redo Workspace Action${workspaceRedoLabel ? ` — ${workspaceRedoLabel}` : ''}`,
+              category: 'Quick Action',
+              icon: <Redo2 size={14} />,
+              action: onRedoWorkspace,
+            },
+          ]
+        : []),
       {
         id: 'act-new-note',
         title: 'Spin Up New Note (Instant Blank Canvas)',
@@ -190,10 +265,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     }
 
     const q = query.trim().toLowerCase();
-    if (!q) return list.slice(0, 14);
+    if (!q) return list.slice(0, 18);
     return list
       .filter((item) => item.title.toLowerCase().includes(q) || item.category.toLowerCase().includes(q))
-      .slice(0, 16);
+      .slice(0, 18);
   }, [
     query,
     notes,
@@ -201,6 +276,18 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     directory.people,
     theme,
     isFocusMode,
+    canUndoNote,
+    canRedoNote,
+    noteUndoLabel,
+    noteRedoLabel,
+    onUndoNote,
+    onRedoNote,
+    canUndoWorkspace,
+    canRedoWorkspace,
+    workspaceUndoLabel,
+    workspaceRedoLabel,
+    onUndoWorkspace,
+    onRedoWorkspace,
     onNewNote,
     onToggleFocusMode,
     onOpenSettings,

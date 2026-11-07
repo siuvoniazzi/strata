@@ -224,6 +224,12 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
   return out.join('');
 }
 
+function renderBlockInlineHtml(text: string, knownPeople: Person[]): string {
+  const html = inlineMarkdownToHtml(text, knownPeople);
+  if (!html) return '';
+  return html.endsWith(' ') ? `${html.slice(0, -1)}&nbsp;` : html;
+}
+
 /**
  * Hydrates a Markdown note body into clean semantic block HTML for the continuous Word-like page.
  */
@@ -264,13 +270,13 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     const decMatch = line.match(/^\s*[-*]\s*\[D(?::(agreed|proposed|superseded))?\](?:\s+(.*))?$/i);
     if (decMatch) {
       const status = ((decMatch[1] || 'agreed').toLowerCase() as DecisionStatus);
-      const inner = inlineMarkdownToHtml(decMatch[2] || '', knownPeople);
+      const inner = renderBlockInlineHtml(decMatch[2] || '', knownPeople);
       htmlBlocks.push(`<p class="doc-decision" data-status="${status}">${inner || '<br>'}</p>`);
 
       if (i + 1 < lines.length) {
         const ratMatch = lines[i + 1].match(/^\s*>\s*(?:Rationale:\s*)?(.*)$/i);
         if (ratMatch) {
-          const ratInner = inlineMarkdownToHtml(ratMatch[1] || '', knownPeople);
+          const ratInner = renderBlockInlineHtml(ratMatch[1] || '', knownPeople);
           htmlBlocks.push(`<blockquote class="doc-rationale">${ratInner || '<br>'}</blockquote>`);
           i += 2;
           continue;
@@ -284,7 +290,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     const taskMatch = line.match(/^\s*[-*]\s*\[([ /?xX])\](?:\s+(.*))?$/);
     if (taskMatch) {
       const status = STATUS_CHAR_TO_TASK[taskMatch[1]] || 'todo';
-      const inner = inlineMarkdownToHtml(taskMatch[2] || '', knownPeople);
+      const inner = renderBlockInlineHtml(taskMatch[2] || '', knownPeople);
       htmlBlocks.push(`<p class="doc-task" data-status="${status}">${inner || '<br>'}</p>`);
       i++;
       continue;
@@ -295,7 +301,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       const items: string[] = [];
       while (i < lines.length && isBulletLine(lines[i])) {
         const m = lines[i].match(/^\s*[-*•]\s+(.*)$/);
-        const itemHtml = inlineMarkdownToHtml(m ? m[1] : '', knownPeople);
+        const itemHtml = renderBlockInlineHtml(m ? m[1] : '', knownPeople);
         items.push(`<li>${itemHtml || '<br>'}</li>`);
         i++;
       }
@@ -308,7 +314,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       const items: string[] = [];
       while (i < lines.length && isOrderedLine(lines[i])) {
         const m = lines[i].match(/^\s*\d+\.\s+(.*)$/);
-        const itemHtml = inlineMarkdownToHtml(m ? m[1] : '', knownPeople);
+        const itemHtml = renderBlockInlineHtml(m ? m[1] : '', knownPeople);
         items.push(`<li>${itemHtml || '<br>'}</li>`);
         i++;
       }
@@ -319,7 +325,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     // 5. Headings
     const h3Match = line.match(/^#{3,6}\s+(.*)$/);
     if (h3Match) {
-      const inner = inlineMarkdownToHtml(h3Match[1], knownPeople);
+      const inner = renderBlockInlineHtml(h3Match[1], knownPeople);
       htmlBlocks.push(`<h3>${inner || '<br>'}</h3>`);
       i++;
       continue;
@@ -327,7 +333,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
 
     const h2Match = line.match(/^##\s+(.*)$/);
     if (h2Match) {
-      const inner = inlineMarkdownToHtml(h2Match[1], knownPeople);
+      const inner = renderBlockInlineHtml(h2Match[1], knownPeople);
       htmlBlocks.push(`<h2>${inner || '<br>'}</h2>`);
       i++;
       continue;
@@ -335,7 +341,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
 
     const h1Match = line.match(/^#\s+(.*)$/);
     if (h1Match) {
-      const inner = inlineMarkdownToHtml(h1Match[1], knownPeople);
+      const inner = renderBlockInlineHtml(h1Match[1], knownPeople);
       htmlBlocks.push(`<h1>${inner || '<br>'}</h1>`);
       i++;
       continue;
@@ -351,7 +357,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     // 7. Blockquote
     const quoteMatch = line.match(/^\s*>\s?(.*)$/);
     if (quoteMatch) {
-      const inner = inlineMarkdownToHtml(quoteMatch[1], knownPeople);
+      const inner = renderBlockInlineHtml(quoteMatch[1], knownPeople);
       htmlBlocks.push(`<blockquote>${inner || '<br>'}</blockquote>`);
       i++;
       continue;
@@ -361,7 +367,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     if (!line.trim()) {
       htmlBlocks.push('<p><br></p>');
     } else {
-      htmlBlocks.push(`<p>${inlineMarkdownToHtml(line, knownPeople)}</p>`);
+      htmlBlocks.push(`<p>${renderBlockInlineHtml(line, knownPeople)}</p>`);
     }
     i++;
   }

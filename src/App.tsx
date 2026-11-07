@@ -95,14 +95,20 @@ import {
   writeNoteToFolder,
 } from './utils/storage';
 
+import {
+  areNotesContentEqual,
+  type EditorSelectionSnapshot,
+  type NoteEditMeta,
+  type PendingSelectionRestore,
+  UndoHistoryStore,
+  type WorkspaceSnapshotState,
+} from './utils/undoHistory';
+
 const CLIENT_PALETTE = ['#0284c7', '#0d9488', '#d97706', '#2563eb', '#059669', '#dc2626'];
 
-interface UndoSnapshot {
+interface WorkspaceToastState {
   message: string;
-  notes: Note[];
-  directory: WorkspaceDirectory;
-  activeNoteId: string;
-  draftNote: Note | null;
+  action: 'undo' | 'redo' | null;
 }
 
 function makeFreshNote(partial?: Partial<Note>): Note {
@@ -161,6 +167,7 @@ export function App() {
   const seed = useMemo(() => createSeedWorkspace(), []);
   const initialPrefs = useMemo(() => loadWorkspacePreferences(), []);
   const [initialDraft] = useState<Note>(() => makeFreshNote());
+  const [historyStore] = useState(() => new UndoHistoryStore());
 
   const [preferences, setPreferences] = useState<WorkspacePreferences>(initialPrefs);
   const [draftNote, setDraftNote] = useState<Note | null>(initialDraft);
@@ -171,6 +178,9 @@ export function App() {
   const [mainView, setMainView] = useState<ActiveMainView>('notes');
   const [noteFilter, setNoteFilter] = useState<NoteFilter>({ kind: 'all' });
   const [listSearch, setListSearch] = useState('');
+  const [pendingSelectionRestore, setPendingSelectionRestore] =
+    useState<PendingSelectionRestore | null>(null);
+  const restoreNonceRef = useRef<number>(0);
 
   const [reportInitialFilter, setReportInitialFilter] = useState<{
     label?: string;
@@ -205,8 +215,8 @@ export function App() {
   const [sidebarAddingLabel, setSidebarAddingLabel] = useState(false);
   const [sidebarLabelInput, setSidebarLabelInput] = useState('');
 
-  // Undo toast for fast, safe deletions
-  const [undoSnapshot, setUndoSnapshot] = useState<UndoSnapshot | null>(null);
+  // Workspace undo/redo notification toast
+  const [workspaceToast, setWorkspaceToast] = useState<WorkspaceToastState | null>(null);
   const undoTimerRef = useRef<number | null>(null);
 
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -408,36 +418,218 @@ export function App() {
     }
   }, [directory, hydrated, dirHandle, dirPermission]);
 
-  const pushUndo = useCallback(
-    (message: string) => {
-      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
-      setUndoSnapshot({
-        message,
-        notes,
-        directory,
-        activeNoteId,
-        draftNote,
-      });
-      undoTimerRef.current = window.setTimeout(() => {
-        setUndoSnapshot(null);
-      }, 7000);
-    },
-    [notes, directory, activeNoteId, draftNote]
+  const activeNote = useMemo(() => {
+    const savedMatch = notes.find((n) => n.id === activeNoteId);
+    if (savedMatch) return savedMatch;
+    if (draftNote && draftNote.id === activeNoteId) return draftNote;
+    return notes[0] || draftNote || initialDraft;
+  }, [notes, activeNoteId, draftNote, initialDraft]);
+
+  const getHistoryUiSnapshot = useCallback(
+    () => historyStore.getUiSnapshot(activeNote.id),
+    [historyStore, activeNote.id]
+  );
+  const historyUi = useSyncExternalStore(
+    historyStore.subscribe,
+    getHistoryUiSnapshot,
+    getHistoryUiSnapshot
   );
 
-  const handleUndo = useCallback(() => {
-    if (!undoSnapshot) return;
-    if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
-    setNotes(undoSnapshot.notes);
-    setDirectory(undoSnapshot.directory);
-    setDraftNote(undoSnapshot.draftNote);
-    draftBaselineRef.current = undoSnapshot.draftNote;
-    setActiveNoteId(undoSnapshot.activeNoteId);
-    setUndoSnapshot(null);
-    if (dirHandle && dirPermission === 'granted') {
-      syncWorkspaceWithFolder(dirHandle, undoSnapshot.notes, undoSnapshot.directory).catch(() => {});
-    }
-  }, [undoSnapshot, dirHandle, dirPermission]);
+  const showToastMessage = useCallback(
+    (message: string, action: 'undo' | 'redo' | null = 'undo') => {
+      if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
+      setWorkspaceToast({ message, action });
+      undoTimerRef.current = window.setTimeout(() => {
+        setWorkspaceToast(null);
+      }, 7000);
+    },
+    []
+  );
+
+  const syncSingleNoteToDisk = useCallback(
+    async (updatedNote: Note, previousPath?: string, customDir?: WorkspaceDirectory) => {
+      if (!dirHandle || dirPermission !== 'granted') return;
+      try {
+        const nextPath = await writeNoteToFolder(
+          dirHandle,
+          updatedNote,
+          customDir || directory,
+          previousPath
+        );
+        if (nextPath !== updatedNote.filePath) {
+          setNotes((prev) =>
+            prev.map((n) => (n.id === updatedNote.id ? { ...n, filePath: nextPath } : n))
+          );
+        }
+      } catch {
+        setSyncStatus('Sync warning — check folder access');
+      }
+    },
+    [dirHandle, dirPermission, directory]
+  );
+
+  const syncWorkspaceDiffToDisk = useCallback(
+    async (prevNotes: Note[], targetNotes: Note[], targetDir: WorkspaceDirectory) => {
+      if (!dirHandle || dirPermission !== 'granted') return;
+      try {
+        const targetIds = new Set(targetNotes.map((n) => n.id));
+        for (const oldNote of prevNotes) {
+          if (!targetIds.has(oldNote.id) && oldNote.filePath) {
+            await removeNestedFileIfExists(dirHandle, oldNote.filePath);
+          }
+        }
+        const prevById = new Map(prevNotes.map((n) => [n.id, n]));
+        for (const nextNote of targetNotes) {
+          const prevNote = prevById.get(nextNote.id);
+          if (
+            !prevNote ||
+            !areNotesContentEqual(prevNote, nextNote) ||
+            prevNote.filePath !== nextNote.filePath
+          ) {
+            await writeNoteToFolder(dirHandle, nextNote, targetDir, prevNote?.filePath);
+          }
+        }
+        await writeDirectoryMetadata(dirHandle, targetDir);
+      } catch {
+        setSyncStatus('Sync warning — check folder access');
+      }
+    },
+    [dirHandle, dirPermission]
+  );
+
+  const captureWorkspaceSnapshot = useCallback(
+    (): WorkspaceSnapshotState => ({
+      notes,
+      directory,
+      activeNoteId,
+      draftNote,
+      noteFilter,
+      mainView,
+    }),
+    [notes, directory, activeNoteId, draftNote, noteFilter, mainView]
+  );
+
+  const applyWorkspaceSnapshot = useCallback(
+    (target: WorkspaceSnapshotState, prev: WorkspaceSnapshotState) => {
+      setNotes(target.notes);
+      setDirectory(target.directory);
+      setDraftNote(target.draftNote);
+      draftBaselineRef.current = target.draftNote;
+      setActiveNoteId(target.activeNoteId);
+      setNoteFilter(target.noteFilter);
+      setMainView(target.mainView);
+      setOverlayStack((prevStack) =>
+        prevStack.filter(
+          (entry) => entry.kind !== 'note' || target.notes.some((n) => n.id === entry.noteId)
+        )
+      );
+      void syncWorkspaceDiffToDisk(prev.notes, target.notes, target.directory);
+    },
+    [syncWorkspaceDiffToDisk]
+  );
+
+  const pushWorkspaceHistory = useCallback(
+    (label: string, options?: { coalesceKey?: string | null; showToast?: boolean }) => {
+      const snap = captureWorkspaceSnapshot();
+      historyStore.recordWorkspaceChange(snap, {
+        label,
+        coalesceKey: options?.coalesceKey ?? null,
+      });
+      if (options?.showToast) {
+        showToastMessage(label, 'undo');
+      }
+    },
+    [captureWorkspaceSnapshot, historyStore, showToastMessage]
+  );
+
+  const handleUndoWorkspace = useCallback((): boolean => {
+    const current = captureWorkspaceSnapshot();
+    const res = historyStore.undoWorkspace(current);
+    if (!res) return false;
+    applyWorkspaceSnapshot(res.state, current);
+    showToastMessage(`Undid: ${res.label}`, 'redo');
+    return true;
+  }, [applyWorkspaceSnapshot, captureWorkspaceSnapshot, historyStore, showToastMessage]);
+
+  const handleRedoWorkspace = useCallback((): boolean => {
+    const current = captureWorkspaceSnapshot();
+    const res = historyStore.redoWorkspace(current);
+    if (!res) return false;
+    applyWorkspaceSnapshot(res.state, current);
+    showToastMessage(`Redid: ${res.label}`, 'undo');
+    return true;
+  }, [applyWorkspaceSnapshot, captureWorkspaceSnapshot, historyStore, showToastMessage]);
+
+  const handleSyncNoteSelection = useCallback(
+    (selection: EditorSelectionSnapshot) => {
+      historyStore.updateNoteSelection(activeNote.id, selection);
+    },
+    [activeNote.id, historyStore]
+  );
+
+  const applyRestoredNoteState = useCallback(
+    (
+      targetNote: Note,
+      targetWasDraft: boolean,
+      selection: EditorSelectionSnapshot,
+      previousFilePath?: string
+    ) => {
+      if (targetWasDraft) {
+        setNotes((prev) => prev.filter((n) => n.id !== targetNote.id));
+        draftBaselineRef.current = targetNote;
+        setDraftNote(targetNote);
+        setActiveNoteId(targetNote.id);
+        if (previousFilePath && dirHandle && dirPermission === 'granted') {
+          removeNestedFileIfExists(dirHandle, previousFilePath).catch(() => {});
+        }
+      } else {
+        if (draftBaselineRef.current?.id === targetNote.id) {
+          draftBaselineRef.current = null;
+          setDraftNote(null);
+        }
+        const computedPath = computeNoteFilePath(targetNote, directory);
+        const withPath = {
+          ...targetNote,
+          filePath: computedPath,
+          updatedAt: new Date().toISOString(),
+        };
+        setNotes((prev) =>
+          prev.some((n) => n.id === withPath.id)
+            ? prev.map((n) => (n.id === withPath.id ? withPath : n))
+            : [withPath, ...prev]
+        );
+        setActiveNoteId(withPath.id);
+        syncSingleNoteToDisk(withPath, previousFilePath);
+      }
+
+      setPendingSelectionRestore({
+        noteId: targetNote.id,
+        selection,
+        nonce: ++restoreNonceRef.current,
+      });
+    },
+    [dirHandle, dirPermission, directory, syncSingleNoteToDisk]
+  );
+
+  const handleUndoNote = useCallback((): boolean => {
+    const currentWasDraft = Boolean(
+      draftNote && draftNote.id === activeNote.id && !notes.some((n) => n.id === activeNote.id)
+    );
+    const res = historyStore.undoNote(activeNote.id, activeNote, currentWasDraft);
+    if (!res) return false;
+    applyRestoredNoteState(res.note, res.wasDraft, res.selection, activeNote.filePath);
+    return true;
+  }, [activeNote, applyRestoredNoteState, draftNote, historyStore, notes]);
+
+  const handleRedoNote = useCallback((): boolean => {
+    const currentWasDraft = Boolean(
+      draftNote && draftNote.id === activeNote.id && !notes.some((n) => n.id === activeNote.id)
+    );
+    const res = historyStore.redoNote(activeNote.id, activeNote, currentWasDraft);
+    if (!res) return false;
+    applyRestoredNoteState(res.note, res.wasDraft, res.selection, activeNote.filePath);
+    return true;
+  }, [activeNote, applyRestoredNoteState, draftNote, historyStore, notes]);
 
   const openOverlay = useCallback((entry: OverlayEntry) => {
     setOverlayStack([entry]);
@@ -518,7 +710,7 @@ export function App() {
     [preferences.focusOnNewNote, sidebarOpen, noteListOpen, radarOpen]
   );
 
-  // Global keyboard shortcuts: Ctrl/Cmd+K (Command Palette), Alt+N (Instant New Note)
+  // Global keyboard shortcuts: Ctrl/Cmd+K (Command Palette), Alt+N (Instant New Note), Ctrl/Cmd+Z / Shift+Z / Y (Undo/Redo)
   const handleSpinUpNote = useCallback(() => {
     const inheritedScope =
       noteFilter.kind === 'client' || (noteFilter.kind === 'project' && noteFilter.clientId)
@@ -589,49 +781,138 @@ export function App() {
       if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setShowCommandPalette((v) => !v);
-      } else if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'n') {
+        return;
+      }
+      if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'n') {
         e.preventDefault();
         handleSpinUpNote();
-      } else if (
+        return;
+      }
+      if (
         (e.altKey && !e.ctrlKey && !e.metaKey && (e.key.toLowerCase() === 'z' || e.key === 'Ω')) ||
         ((e.metaKey || e.ctrlKey) && !e.altKey && e.key === '\\')
       ) {
         e.preventDefault();
         handleToggleFocusMode();
+        return;
+      }
+
+      const isMod = e.metaKey || e.ctrlKey;
+      const keyLower = e.key.toLowerCase();
+      const isUndoShortcut = isMod && !e.altKey && !e.shiftKey && keyLower === 'z';
+      const isRedoShortcut =
+        (isMod && !e.altKey && e.shiftKey && keyLower === 'z') ||
+        (isMod && !e.altKey && !e.shiftKey && keyLower === 'y');
+
+      if (!isUndoShortcut && !isRedoShortcut) return;
+
+      if (
+        showCommandPalette ||
+        showAiStructure ||
+        showAiSettings ||
+        document.querySelector('.modal-backdrop, .lightbox-backdrop')
+      ) {
+        return;
+      }
+
+      const activeEl = document.activeElement as HTMLElement | null;
+      if (activeEl) {
+        const tag = activeEl.tagName.toUpperCase();
+        if (tag === 'INPUT' || tag === 'TEXTAREA') {
+          const isNoteTitle = activeEl.id === 'note-title-input';
+          const isRawMd = activeEl.classList.contains('raw-markdown-textarea');
+          const isMetaDate = activeEl.classList.contains('meta-date-input');
+          const isDirField = activeEl.classList.contains('directory-inline-field');
+          const isInlineAdd =
+            activeEl.classList.contains('inline-add-input') ||
+            activeEl.classList.contains('sidebar-inline-input');
+
+          if (isDirField) {
+            e.preventDefault();
+            if (isUndoShortcut) handleUndoWorkspace();
+            else handleRedoWorkspace();
+            return;
+          }
+
+          if (isInlineAdd) {
+            if ((activeEl as HTMLInputElement).value !== '') {
+              return;
+            }
+          } else if (!isNoteTitle && !isRawMd && !isMetaDate) {
+            return;
+          }
+        }
+      }
+
+      const focusInNoteEditor = Boolean(
+        activeEl &&
+          (activeEl.id === 'note-title-input' ||
+            activeEl.classList.contains('raw-markdown-textarea') ||
+            activeEl.closest('.word-doc-body') ||
+            (activeEl.closest('.meta-grid') &&
+              !(
+                activeEl.classList.contains('inline-add-input') &&
+                (activeEl as HTMLInputElement).value !== ''
+              )))
+      );
+
+      const inNotesEditor =
+        mainView === 'notes' &&
+        overlayStack.length === 0 &&
+        (!isMobile || mobileNotesPane === 'editor');
+
+      if (isUndoShortcut) {
+        const target = historyStore.resolveUndoTarget({
+          activeNoteId: activeNote.id,
+          inNotesEditor,
+          focusInNoteEditor,
+          workspaceToastActive: workspaceToast !== null,
+        });
+        if (focusInNoteEditor) e.preventDefault();
+        if (target === 'note') {
+          e.preventDefault();
+          handleUndoNote();
+        } else if (target === 'workspace') {
+          e.preventDefault();
+          handleUndoWorkspace();
+        }
+      } else {
+        const target = historyStore.resolveRedoTarget({
+          activeNoteId: activeNote.id,
+          inNotesEditor,
+          focusInNoteEditor,
+          workspaceToastActive: workspaceToast !== null,
+        });
+        if (focusInNoteEditor) e.preventDefault();
+        if (target === 'note') {
+          e.preventDefault();
+          handleRedoNote();
+        } else if (target === 'workspace') {
+          e.preventDefault();
+          handleRedoWorkspace();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleSpinUpNote, handleToggleFocusMode]);
-
-  const activeNote = useMemo(() => {
-    const savedMatch = notes.find((n) => n.id === activeNoteId);
-    if (savedMatch) return savedMatch;
-    if (draftNote && draftNote.id === activeNoteId) return draftNote;
-    return notes[0] || draftNote || initialDraft;
-  }, [notes, activeNoteId, draftNote, initialDraft]);
-
-  const syncSingleNoteToDisk = useCallback(
-    async (updatedNote: Note, previousPath?: string, customDir?: WorkspaceDirectory) => {
-      if (!dirHandle || dirPermission !== 'granted') return;
-      try {
-        const nextPath = await writeNoteToFolder(
-          dirHandle,
-          updatedNote,
-          customDir || directory,
-          previousPath
-        );
-        if (nextPath !== updatedNote.filePath) {
-          setNotes((prev) =>
-            prev.map((n) => (n.id === updatedNote.id ? { ...n, filePath: nextPath } : n))
-          );
-        }
-      } catch {
-        setSyncStatus('Sync warning — check folder access');
-      }
-    },
-    [dirHandle, dirPermission, directory]
-  );
+  }, [
+    activeNote.id,
+    handleRedoNote,
+    handleRedoWorkspace,
+    handleSpinUpNote,
+    handleToggleFocusMode,
+    handleUndoNote,
+    handleUndoWorkspace,
+    historyStore,
+    isMobile,
+    mainView,
+    mobileNotesPane,
+    overlayStack.length,
+    showAiSettings,
+    showAiStructure,
+    showCommandPalette,
+    workspaceToast,
+  ]);
 
   const handleOpenOrCreateNoteByTitle = useCallback(
     (targetTitle: string) => {
@@ -641,6 +922,7 @@ export function App() {
       if (found) {
         openNoteEditor(found.id);
       } else {
+        pushWorkspaceHistory(`Created note "${targetTitle}"`);
         const raw = makeFreshNote({
           title: targetTitle,
           scope: activeNote.scope,
@@ -661,6 +943,7 @@ export function App() {
       activeNote.clientId,
       activeNote.projectId,
       directory,
+      pushWorkspaceHistory,
       syncSingleNoteToDisk,
       openNoteEditor,
       openNewNoteInEditor,
@@ -686,6 +969,7 @@ export function App() {
           );
         }
       } else {
+        pushWorkspaceHistory(`Created note "${targetTitle}"`);
         const raw = makeFreshNote({
           title: targetTitle,
           scope: activeNote.scope,
@@ -706,6 +990,7 @@ export function App() {
       activeNote.clientId,
       activeNote.projectId,
       directory,
+      pushWorkspaceHistory,
       syncSingleNoteToDisk,
     ]
   );
@@ -755,17 +1040,12 @@ export function App() {
     });
   }, [notes, noteFilter, listSearch, directory.people]);
 
-  const handleUpdateNote = useCallback(
+  const commitNoteToStateAndDisk = useCallback(
     (updated: Note) => {
-      const baseline = draftBaselineRef.current;
-      if (baseline && baseline.id === updated.id) {
-        if (!hasNoteChangedFromDraft(updated, baseline)) {
-          return;
-        }
+      if (draftBaselineRef.current?.id === updated.id) {
         draftBaselineRef.current = null;
         setDraftNote(null);
       }
-
       const prevNote = notes.find((n) => n.id === updated.id);
       const computedPath = computeNoteFilePath(updated, directory);
       const withPath = { ...updated, filePath: computedPath };
@@ -777,6 +1057,44 @@ export function App() {
       syncSingleNoteToDisk(withPath, prevNote?.filePath);
     },
     [notes, directory, syncSingleNoteToDisk]
+  );
+
+  const handleUpdateNote = useCallback(
+    (updated: Note, meta?: NoteEditMeta) => {
+      const baseline = draftBaselineRef.current;
+      let prevNote: Note | undefined;
+      let prevWasDraft = false;
+
+      if (baseline && baseline.id === updated.id) {
+        if (!hasNoteChangedFromDraft(updated, baseline)) {
+          if (meta?.selectionAfter !== undefined) {
+            historyStore.updateNoteSelection(updated.id, meta.selectionAfter);
+          }
+          return;
+        }
+        prevNote = baseline;
+        prevWasDraft = true;
+        draftBaselineRef.current = null;
+        setDraftNote(null);
+      } else {
+        prevNote = notes.find((n) => n.id === updated.id);
+      }
+
+      const computedPath = computeNoteFilePath(updated, directory);
+      const withPath = { ...updated, filePath: computedPath };
+
+      if (prevNote) {
+        historyStore.recordNoteChange(prevNote, prevWasDraft, withPath, meta);
+      }
+
+      setNotes((prev) =>
+        prev.some((n) => n.id === updated.id)
+          ? prev.map((n) => (n.id === updated.id ? withPath : n))
+          : [withPath, ...prev]
+      );
+      syncSingleNoteToDisk(withPath, prevNote?.filePath);
+    },
+    [notes, directory, historyStore, syncSingleNoteToDisk]
   );
 
   const handleDeleteNote = useCallback(
@@ -801,7 +1119,7 @@ export function App() {
 
       const target = notes.find((n) => n.id === noteId);
       if (!target) return;
-      pushUndo(`Deleted note "${target.title || 'Untitled Note'}"`);
+      pushWorkspaceHistory(`Deleted note "${target.title || 'Untitled Note'}"`, { showToast: true });
       const remaining = notes.filter((n) => n.id !== noteId);
       if (remaining.length === 0) {
         const fresh = makeFreshNote();
@@ -825,7 +1143,7 @@ export function App() {
         removeNestedFileIfExists(dirHandle, target.filePath);
       }
     },
-    [draftNote, notes, activeNoteId, dirHandle, dirPermission, pushUndo]
+    [draftNote, notes, activeNoteId, dirHandle, dirPermission, pushWorkspaceHistory]
   );
 
   const handleEnsurePerson = useCallback(
@@ -846,8 +1164,25 @@ export function App() {
     [directory.people]
   );
 
+  const handleCreatePerson = useCallback(
+    (p: Omit<Person, 'id'>) => {
+      pushWorkspaceHistory(`Added person "${p.name}"`);
+      setDirectory((prev) => ({
+        ...prev,
+        people: [
+          ...prev.people,
+          { ...p, id: `person-${slugify(p.name)}-${Date.now().toString(36).slice(-3)}` },
+        ],
+      }));
+    },
+    [pushWorkspaceHistory]
+  );
+
   const handleUpdatePerson = useCallback(
     (updated: Person, previousName?: string) => {
+      pushWorkspaceHistory(`Updated person "${updated.name}"`, {
+        coalesceKey: `person-edit-${updated.id}`,
+      });
       setDirectory((prev) => ({
         ...prev,
         people: prev.people.map((p) => (p.id === updated.id ? updated : p)),
@@ -867,14 +1202,14 @@ export function App() {
         );
       }
     },
-    []
+    [pushWorkspaceHistory]
   );
 
   const handleDeletePerson = useCallback(
     (personId: string) => {
       const target = directory.people.find((p) => p.id === personId);
       if (!target) return;
-      pushUndo(`Deleted person "${target.name}"`);
+      pushWorkspaceHistory(`Deleted person "${target.name}"`, { showToast: true });
       setDirectory((prev) => ({
         ...prev,
         people: prev.people.filter((p) => p.id !== personId),
@@ -899,13 +1234,16 @@ export function App() {
         setNoteFilter({ kind: 'all' });
       }
     },
-    [directory.people, noteFilter, pushUndo]
+    [directory.people, noteFilter, pushWorkspaceHistory]
   );
 
   const handleAddClient = useCallback(
-    (name: string, domain?: string): string => {
+    (name: string, domain?: string, options?: { recordHistory?: boolean }): string => {
       const existing = directory.clients.find((c) => c.name.toLowerCase() === name.toLowerCase());
       if (existing) return existing.id;
+      if (options?.recordHistory !== false) {
+        pushWorkspaceHistory(`Added client "${name}"`);
+      }
       const id = `client-${slugify(name)}-${Date.now().toString(36).slice(-3)}`;
       const created: Client = {
         id,
@@ -916,21 +1254,27 @@ export function App() {
       setDirectory((prev) => ({ ...prev, clients: [...prev.clients, created] }));
       return id;
     },
-    [directory.clients]
+    [directory.clients, pushWorkspaceHistory]
   );
 
-  const handleUpdateClient = useCallback((updated: Client) => {
-    setDirectory((prev) => ({
-      ...prev,
-      clients: prev.clients.map((c) => (c.id === updated.id ? updated : c)),
-    }));
-  }, []);
+  const handleUpdateClient = useCallback(
+    (updated: Client) => {
+      pushWorkspaceHistory(`Updated client "${updated.name}"`, {
+        coalesceKey: `client-edit-${updated.id}`,
+      });
+      setDirectory((prev) => ({
+        ...prev,
+        clients: prev.clients.map((c) => (c.id === updated.id ? updated : c)),
+      }));
+    },
+    [pushWorkspaceHistory]
+  );
 
   const handleDeleteClient = useCallback(
     (clientId: string) => {
       const target = directory.clients.find((c) => c.id === clientId);
       if (!target) return;
-      pushUndo(`Deleted client "${target.name}"`);
+      pushWorkspaceHistory(`Deleted client "${target.name}"`, { showToast: true });
 
       const removedProjectIds = new Set(
         directory.projects.filter((p) => p.clientId === clientId).map((p) => p.id)
@@ -973,11 +1317,19 @@ export function App() {
         setNoteFilter({ kind: 'all' });
       }
     },
-    [directory, noteFilter, pushUndo, syncSingleNoteToDisk]
+    [directory, noteFilter, pushWorkspaceHistory, syncSingleNoteToDisk]
   );
 
   const handleAddProject = useCallback(
-    (name: string, scope: 'client' | 'internal', clientId: string | null): string => {
+    (
+      name: string,
+      scope: 'client' | 'internal',
+      clientId: string | null,
+      options?: { recordHistory?: boolean }
+    ): string => {
+      if (options?.recordHistory !== false) {
+        pushWorkspaceHistory(`Added project "${name}"`);
+      }
       const id = `proj-${slugify(name)}-${Date.now().toString(36).slice(-3)}`;
       const created: Project = {
         id,
@@ -989,21 +1341,27 @@ export function App() {
       setDirectory((prev) => ({ ...prev, projects: [...prev.projects, created] }));
       return id;
     },
-    []
+    [pushWorkspaceHistory]
   );
 
-  const handleUpdateProject = useCallback((updated: Project) => {
-    setDirectory((prev) => ({
-      ...prev,
-      projects: prev.projects.map((p) => (p.id === updated.id ? updated : p)),
-    }));
-  }, []);
+  const handleUpdateProject = useCallback(
+    (updated: Project) => {
+      pushWorkspaceHistory(`Updated project "${updated.name}"`, {
+        coalesceKey: `project-edit-${updated.id}`,
+      });
+      setDirectory((prev) => ({
+        ...prev,
+        projects: prev.projects.map((p) => (p.id === updated.id ? updated : p)),
+      }));
+    },
+    [pushWorkspaceHistory]
+  );
 
   const handleDeleteProject = useCallback(
     (projectId: string) => {
       const target = directory.projects.find((p) => p.id === projectId);
       if (!target) return;
-      pushUndo(`Deleted project "${target.name}"`);
+      pushWorkspaceHistory(`Deleted project "${target.name}"`, { showToast: true });
 
       const nextDir: WorkspaceDirectory = {
         ...directory,
@@ -1033,24 +1391,28 @@ export function App() {
         );
       }
     },
-    [directory, noteFilter, pushUndo, syncSingleNoteToDisk]
+    [directory, noteFilter, pushWorkspaceHistory, syncSingleNoteToDisk]
   );
 
-  const handleAddLabel = useCallback((rawLabel: string) => {
-    const norm = normalizeLabel(rawLabel);
-    if (!norm) return;
-    setDirectory((prev) =>
-      prev.customLabels.includes(norm)
-        ? prev
-        : { ...prev, customLabels: [...prev.customLabels, norm] }
-    );
-  }, []);
+  const handleAddLabel = useCallback(
+    (rawLabel: string) => {
+      const norm = normalizeLabel(rawLabel);
+      if (!norm || directory.customLabels.includes(norm)) return;
+      pushWorkspaceHistory(`Added #${norm} label`);
+      setDirectory((prev) =>
+        prev.customLabels.includes(norm)
+          ? prev
+          : { ...prev, customLabels: [...prev.customLabels, norm] }
+      );
+    },
+    [directory.customLabels, pushWorkspaceHistory]
+  );
 
   const handleDeleteLabel = useCallback(
     (rawLabel: string) => {
       const norm = normalizeLabel(rawLabel);
       if (!norm) return;
-      pushUndo(`Deleted #${norm} label`);
+      pushWorkspaceHistory(`Deleted #${norm} label`, { showToast: true });
 
       setDirectory((prev) => ({
         ...prev,
@@ -1071,49 +1433,51 @@ export function App() {
         setNoteFilter({ kind: 'all' });
       }
     },
-    [noteFilter, pushUndo, syncSingleNoteToDisk]
+    [noteFilter, pushWorkspaceHistory, syncSingleNoteToDisk]
   );
 
   const handleUpdateRemoteTaskStatus = useCallback(
     (task: ParsedTask, nextStatus: TaskStatus) => {
       const target = notes.find((n) => n.id === task.noteId);
       if (!target) return;
+      pushWorkspaceHistory(`Task status → ${nextStatus}`);
       const nextBody = updateTaskInBody(target.body, task.lineIndex, { status: nextStatus });
-      handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
+      commitNoteToStateAndDisk({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
     },
-    [notes, handleUpdateNote]
+    [notes, commitNoteToStateAndDisk, pushWorkspaceHistory]
   );
 
   const handleDeleteRemoteTask = useCallback(
     (task: ParsedTask) => {
       const target = notes.find((n) => n.id === task.noteId);
       if (!target) return;
-      pushUndo(`Deleted task "${task.text.slice(0, 34)}"`);
+      pushWorkspaceHistory(`Deleted task "${task.text.slice(0, 34)}"`, { showToast: true });
       const nextBody = deleteTaskFromBody(target.body, task.lineIndex);
-      handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
+      commitNoteToStateAndDisk({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
     },
-    [notes, handleUpdateNote, pushUndo]
+    [notes, commitNoteToStateAndDisk, pushWorkspaceHistory]
   );
 
   const handleUpdateRemoteDecisionStatus = useCallback(
     (decision: ParsedDecision, nextStatus: DecisionStatus) => {
       const target = notes.find((n) => n.id === decision.noteId);
       if (!target) return;
+      pushWorkspaceHistory(`Decision status → ${nextStatus}`);
       const nextBody = updateDecisionInBody(target.body, decision.lineIndex, { status: nextStatus });
-      handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
+      commitNoteToStateAndDisk({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
     },
-    [notes, handleUpdateNote]
+    [notes, commitNoteToStateAndDisk, pushWorkspaceHistory]
   );
 
   const handleDeleteRemoteDecision = useCallback(
     (decision: ParsedDecision) => {
       const target = notes.find((n) => n.id === decision.noteId);
       if (!target) return;
-      pushUndo(`Deleted decision "${decision.text.slice(0, 34)}"`);
+      pushWorkspaceHistory(`Deleted decision "${decision.text.slice(0, 34)}"`, { showToast: true });
       const nextBody = deleteDecisionFromBody(target.body, decision.lineIndex);
-      handleUpdateNote({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
+      commitNoteToStateAndDisk({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
     },
-    [notes, handleUpdateNote, pushUndo]
+    [notes, commitNoteToStateAndDisk, pushWorkspaceHistory]
   );
 
   const handleConnectOrSyncFolder = async () => {
@@ -1164,7 +1528,8 @@ export function App() {
     if (!window.confirm('Delete all notes, clients, projects, and people in this browser workspace?')) {
       return;
     }
-    pushUndo('Cleared entire workspace');
+    pushWorkspaceHistory('Cleared entire workspace', { showToast: true });
+    const oldNotes = notes;
     const fresh = makeFreshNote();
     const emptyDir: WorkspaceDirectory = {
       clients: [],
@@ -1180,6 +1545,9 @@ export function App() {
     setActiveNoteId(fresh.id);
     setNoteFilter({ kind: 'all' });
     setMainView('notes');
+    if (dirHandle && dirPermission === 'granted') {
+      void syncWorkspaceDiffToDisk(oldNotes, [], emptyDir);
+    }
   };
 
   const shellClass = [
@@ -1817,8 +2185,12 @@ export function App() {
                 onChange={async (e) => {
                   if (e.target.files && e.target.files.length > 0) {
                     const res = await importFilesIntoWorkspace(e.target.files, notes, directory);
+                    pushWorkspaceHistory('Imported Markdown files', { showToast: true });
                     setNotes(res.notes);
                     setDirectory(res.directory);
+                    if (dirHandle && dirPermission === 'granted') {
+                      void syncWorkspaceDiffToDisk(notes, res.notes, res.directory);
+                    }
                     if (res.notes[0]) openNoteEditor(res.notes[0].id);
                     e.target.value = '';
                   }
@@ -2195,7 +2567,7 @@ export function App() {
               allWorkspaceLabels={allWorkspaceLabels}
               onUpdateNote={handleUpdateNote}
               onDeleteNote={handleDeleteNote}
-              onAddClient={(name) => handleAddClient(name)}
+              onAddClient={handleAddClient}
               onAddProject={handleAddProject}
               onEnsurePerson={handleEnsurePerson}
               onNavigateLabel={(lbl) => openOverlay({ kind: 'report', label: lbl })}
@@ -2210,6 +2582,14 @@ export function App() {
                   document.getElementById('radar-ask-input')?.focus();
                 }, 40);
               }}
+              canUndo={historyUi.canUndoNote}
+              canRedo={historyUi.canRedoNote}
+              undoLabel={historyUi.noteUndoLabel}
+              redoLabel={historyUi.noteRedoLabel}
+              onUndo={handleUndoNote}
+              onRedo={handleRedoNote}
+              pendingSelectionRestore={pendingSelectionRestore}
+              onSyncSelection={handleSyncNoteSelection}
             />
           </div>
         )}
@@ -2231,6 +2611,7 @@ export function App() {
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
             onDeleteDecision={handleDeleteRemoteDecision}
             onSaveBriefAsNote={(title, body, cId, pId) => {
+              pushWorkspaceHistory(`Saved report "${title || 'Brief'}"`, { showToast: true });
               const raw = makeFreshNote({
                 title,
                 body,
@@ -2280,15 +2661,7 @@ export function App() {
             directory={directory}
             allLabels={allWorkspaceLabels}
             onUpdatePerson={handleUpdatePerson}
-            onCreatePerson={(p) =>
-              setDirectory((prev) => ({
-                ...prev,
-                people: [
-                  ...prev.people,
-                  { ...p, id: `person-${slugify(p.name)}-${Date.now().toString(36).slice(-3)}` },
-                ],
-              }))
-            }
+            onCreatePerson={handleCreatePerson}
             onDeletePerson={handleDeletePerson}
             onAddClient={handleAddClient}
             onUpdateClient={handleUpdateClient}
@@ -2411,11 +2784,14 @@ export function App() {
           onClearRequestedTab={() => setRadarRequestedTab(null)}
           onInsertIntoActiveNote={(snippet) => {
             const base = activeNote.body.trimEnd();
-            handleUpdateNote({
-              ...activeNote,
-              body: base ? `${base}\n\n${snippet}` : snippet,
-              updatedAt: new Date().toISOString(),
-            });
+            handleUpdateNote(
+              {
+                ...activeNote,
+                body: base ? `${base}\n\n${snippet}` : snippet,
+                updatedAt: new Date().toISOString(),
+              },
+              { label: 'Insert citation', coalesceKey: null }
+            );
             if (isMobile) setRadarOpen(false);
           }}
           onOpenNote={(nId) => {
@@ -2456,6 +2832,7 @@ export function App() {
           onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
           onDeleteDecision={handleDeleteRemoteDecision}
           onSaveBriefAsNote={(title, body, cId, pId) => {
+            pushWorkspaceHistory(`Saved report "${title || 'Brief'}"`, { showToast: true });
             const raw = makeFreshNote({
               title,
               body,
@@ -2472,18 +2849,39 @@ export function App() {
         />
       )}
 
-      {/* Undo Deletion Toast */}
-      {undoSnapshot && (
+      {/* Workspace Undo / Redo Toast */}
+      {workspaceToast && (
         <div className="undo-toast no-print" role="status" aria-live="polite">
-          <span>{undoSnapshot.message}</span>
-          <button type="button" className="undo-toast-btn" onClick={handleUndo}>
-            Undo
-          </button>
+          <span>{workspaceToast.message}</span>
+          {workspaceToast.action === 'undo' && historyUi.canUndoWorkspace && (
+            <button
+              id="btn-toast-undo"
+              type="button"
+              className="undo-toast-btn"
+              onClick={() => {
+                handleUndoWorkspace();
+              }}
+            >
+              Undo
+            </button>
+          )}
+          {workspaceToast.action === 'redo' && historyUi.canRedoWorkspace && (
+            <button
+              id="btn-toast-redo"
+              type="button"
+              className="undo-toast-btn"
+              onClick={() => {
+                handleRedoWorkspace();
+              }}
+            >
+              Redo
+            </button>
+          )}
           <button
             type="button"
             className="mini-icon-btn"
             style={{ color: 'inherit', opacity: 0.7 }}
-            onClick={() => setUndoSnapshot(null)}
+            onClick={() => setWorkspaceToast(null)}
             aria-label="Dismiss notification"
           >
             <X size={13} />
@@ -2503,7 +2901,7 @@ export function App() {
             for (const pName of newParticipants) {
               handleEnsurePerson(pName, updated.clientId);
             }
-            handleUpdateNote(updated);
+            handleUpdateNote(updated, { label: 'AI Structure', coalesceKey: null });
             setShowAiStructure(false);
           }}
           onOpenAiSettings={() => {
@@ -2582,6 +2980,26 @@ export function App() {
           }}
           onToggleTheme={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
           onConnectFolder={handleConnectOrSyncFolder}
+          canUndoNote={mainView === 'notes' && overlayStack.length === 0 && historyUi.canUndoNote}
+          canRedoNote={mainView === 'notes' && overlayStack.length === 0 && historyUi.canRedoNote}
+          noteUndoLabel={historyUi.noteUndoLabel}
+          noteRedoLabel={historyUi.noteRedoLabel}
+          onUndoNote={() => {
+            handleUndoNote();
+          }}
+          onRedoNote={() => {
+            handleRedoNote();
+          }}
+          canUndoWorkspace={historyUi.canUndoWorkspace}
+          canRedoWorkspace={historyUi.canRedoWorkspace}
+          workspaceUndoLabel={historyUi.workspaceUndoLabel}
+          workspaceRedoLabel={historyUi.workspaceRedoLabel}
+          onUndoWorkspace={() => {
+            handleUndoWorkspace();
+          }}
+          onRedoWorkspace={() => {
+            handleRedoWorkspace();
+          }}
         />
       )}
     </div>

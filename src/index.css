@@ -857,9 +857,14 @@ textarea {
   transition: background 0.1s ease, color 0.1s ease;
 }
 
-.doc-fmt-btn:hover {
+.doc-fmt-btn:hover:not(:disabled) {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+.doc-fmt-btn:disabled {
+  opacity: 0.36;
+  cursor: not-allowed;
 }
 
 .doc-fmt-btn.active {

@@ -18,9 +18,11 @@ import {
   MailPlus,
   Plus,
   Quote,
+  Redo2,
   Sparkles,
   Strikethrough,
   Trash2,
+  Undo2,
   UserCheck,
   UserPlus,
   X,
@@ -52,23 +54,46 @@ import {
 } from '../utils/docSerializer';
 import { resolveImageSrc, saveBlobAsImageAsset } from '../utils/imageStore';
 import { NOTE_TEMPLATES } from '../utils/seedData';
+import type {
+  EditorSelectionSnapshot,
+  NoteEditMeta,
+  PendingSelectionRestore,
+} from '../utils/undoHistory';
 import { ImageLightboxModal, type LightboxImageItem } from './ImageLightboxModal';
+
+const IS_MAC_PLATFORM =
+  typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
+const UNDO_SHORTCUT_HINT = IS_MAC_PLATFORM ? '⌘Z' : 'Ctrl+Z';
+const REDO_SHORTCUT_HINT = IS_MAC_PLATFORM ? '⇧⌘Z' : 'Ctrl+Y';
 
 interface HybridEditorProps {
   note: Note;
   allNotes: Note[];
   directory: WorkspaceDirectory;
   allWorkspaceLabels: string[];
-  onUpdateNote: (updated: Note) => void;
+  onUpdateNote: (updated: Note, meta?: NoteEditMeta) => void;
   onDeleteNote: (noteId: string) => void;
-  onAddClient: (name: string) => string;
-  onAddProject: (name: string, scope: 'client' | 'internal', clientId: string | null) => string;
+  onAddClient: (name: string, domain?: string, options?: { recordHistory?: boolean }) => string;
+  onAddProject: (
+    name: string,
+    scope: 'client' | 'internal',
+    clientId: string | null,
+    options?: { recordHistory?: boolean }
+  ) => string;
   onEnsurePerson: (name: string, clientId?: string | null, email?: string) => Person;
   onNavigateLabel: (label: string) => void;
   onNavigatePerson: (personName: string) => void;
   onNavigateOrCreateNoteByTitle: (title: string) => void;
   onOpenAiStructure: () => void;
   onOpenQuickAsk: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
+  undoLabel?: string | null;
+  redoLabel?: string | null;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  pendingSelectionRestore?: PendingSelectionRestore | null;
+  onSyncSelection?: (selection: EditorSelectionSnapshot) => void;
 }
 
 type AutocompleteTrigger = {
@@ -95,6 +120,197 @@ type ActiveFormatState = {
 
 const TASK_CYCLE: TaskStatus[] = ['todo', 'doing', 'waiting', 'done'];
 const DECISION_CYCLE: DecisionStatus[] = ['agreed', 'proposed', 'superseded'];
+
+function getOrderedDocBlocks(root: HTMLElement): HTMLElement[] {
+  const blocks: HTMLElement[] = [];
+  Array.from(root.children).forEach((child) => {
+    const el = child as HTMLElement;
+    const tag = el.tagName.toUpperCase();
+    if (tag === 'UL' || tag === 'OL') {
+      Array.from(el.children).forEach((li) => {
+        if (li.tagName.toUpperCase() === 'LI') {
+          blocks.push(li as HTMLElement);
+        }
+      });
+    } else {
+      blocks.push(el);
+    }
+  });
+  return blocks;
+}
+
+function resolvePointInDocBlocks(
+  root: HTMLElement,
+  blocks: HTMLElement[],
+  container: Node,
+  offset: number
+): { block: number; offset: number } | null {
+  if (blocks.length === 0) return null;
+
+  if (container === root) {
+    if (offset >= root.childNodes.length) {
+      const lastIdx = blocks.length - 1;
+      const lastBlk = blocks[lastIdx];
+      const len = lastBlk.classList.contains('doc-image-block')
+        ? 0
+        : (lastBlk.textContent || '').length;
+      return { block: lastIdx, offset: len };
+    }
+    const child = root.childNodes[Math.max(0, offset)] as HTMLElement | undefined;
+    if (child) {
+      const directIdx = blocks.indexOf(child);
+      if (directIdx !== -1) return { block: directIdx, offset: 0 };
+      const firstLi = child.querySelector?.('li') as HTMLElement | null;
+      if (firstLi) {
+        const liIdx = blocks.indexOf(firstLi);
+        if (liIdx !== -1) return { block: liIdx, offset: 0 };
+      }
+    }
+    return { block: 0, offset: 0 };
+  }
+
+  let curr: Node | null = container;
+  let foundBlock: HTMLElement | null = null;
+  while (curr && curr !== root) {
+    if (curr.nodeType === Node.ELEMENT_NODE) {
+      const idx = blocks.indexOf(curr as HTMLElement);
+      if (idx !== -1) {
+        foundBlock = curr as HTMLElement;
+        break;
+      }
+    }
+    curr = curr.parentNode;
+  }
+
+  if (!foundBlock) return { block: 0, offset: 0 };
+  const blockIdx = blocks.indexOf(foundBlock);
+  if (
+    foundBlock.classList.contains('doc-image-block') ||
+    foundBlock.tagName.toUpperCase() === 'HR'
+  ) {
+    return { block: blockIdx, offset: 0 };
+  }
+
+  try {
+    const probe = document.createRange();
+    probe.selectNodeContents(foundBlock);
+    probe.setEnd(container, offset);
+    return { block: blockIdx, offset: probe.toString().length };
+  } catch {
+    return { block: blockIdx, offset: 0 };
+  }
+}
+
+function captureDocSelection(root: HTMLElement): EditorSelectionSnapshot {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  if (!root.contains(range.commonAncestorContainer)) return null;
+
+  const blocks = getOrderedDocBlocks(root);
+  const startPt = resolvePointInDocBlocks(root, blocks, range.startContainer, range.startOffset);
+  const endPt = range.collapsed
+    ? startPt
+    : resolvePointInDocBlocks(root, blocks, range.endContainer, range.endOffset);
+  if (!startPt || !endPt) return null;
+
+  return {
+    kind: 'doc',
+    startBlock: startPt.block,
+    startOffset: startPt.offset,
+    endBlock: endPt.block,
+    endOffset: endPt.offset,
+  };
+}
+
+function resolveDomPointFromBlockOffset(
+  blk: HTMLElement,
+  targetOffset: number
+): { node: Node; offset: number } {
+  if (blk.classList.contains('doc-image-block') || blk.tagName.toUpperCase() === 'HR') {
+    const parent = blk.parentNode;
+    if (parent) {
+      const idx = Array.from(parent.childNodes).indexOf(blk);
+      return { node: parent, offset: Math.max(0, idx) };
+    }
+    return { node: blk, offset: 0 };
+  }
+
+  const walker = document.createTreeWalker(blk, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  let n: Node | null;
+  while ((n = walker.nextNode())) {
+    textNodes.push(n as Text);
+  }
+
+  if (textNodes.length === 0) {
+    return { node: blk, offset: 0 };
+  }
+
+  let remaining = Math.max(0, targetOffset);
+  for (let i = 0; i < textNodes.length; i++) {
+    const tn = textNodes[i];
+    const len = (tn.nodeValue || '').length;
+    if (remaining < len) {
+      return { node: tn, offset: remaining };
+    }
+    if (remaining === len) {
+      const tokenParent = tn.parentElement?.classList.contains('doc-token')
+        ? tn.parentElement
+        : null;
+      if (
+        tokenParent &&
+        i + 1 < textNodes.length &&
+        !tokenParent.contains(textNodes[i + 1])
+      ) {
+        return { node: textNodes[i + 1], offset: 0 };
+      }
+      return { node: tn, offset: len };
+    }
+    remaining -= len;
+  }
+
+  const last = textNodes[textNodes.length - 1];
+  return { node: last, offset: (last.nodeValue || '').length };
+}
+
+function restoreDocSelection(
+  root: HTMLElement,
+  snap: Extract<EditorSelectionSnapshot, { kind: 'doc' }>
+): void {
+  const blocks = getOrderedDocBlocks(root);
+  if (blocks.length === 0) {
+    root.focus({ preventScroll: true });
+    return;
+  }
+
+  const startIdx = Math.max(0, Math.min(blocks.length - 1, snap.startBlock));
+  const endIdx = Math.max(0, Math.min(blocks.length - 1, snap.endBlock));
+  const startBlk = blocks[startIdx];
+  const endBlk = blocks[endIdx];
+
+  const startPt = resolveDomPointFromBlockOffset(startBlk, snap.startOffset);
+  const endPt =
+    startIdx === endIdx && snap.startOffset === snap.endOffset
+      ? startPt
+      : resolveDomPointFromBlockOffset(endBlk, snap.endOffset);
+
+  root.focus({ preventScroll: true });
+  try {
+    const sel = window.getSelection();
+    if (sel) {
+      const r = document.createRange();
+      r.setStart(startPt.node, startPt.offset);
+      r.setEnd(endPt.node, endPt.offset);
+      sel.removeAllRanges();
+      sel.addRange(r);
+    }
+  } catch {
+    // Ignore transient range bounds mismatch
+  }
+
+  startBlk.scrollIntoView?.({ block: 'nearest' });
+}
 
 function placeCaretAtStart(el: HTMLElement) {
   const sel = window.getSelection();
@@ -327,6 +543,14 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   onNavigateOrCreateNoteByTitle,
   onOpenAiStructure,
   onOpenQuickAsk,
+  canUndo = false,
+  canRedo = false,
+  undoLabel = null,
+  redoLabel = null,
+  onUndo,
+  onRedo,
+  pendingSelectionRestore = null,
+  onSyncSelection,
 }) => {
   const [rawMode, setRawMode] = useState(false);
   const [participantInput, setParticipantInput] = useState('');
@@ -363,6 +587,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const lastSyncedNoteIdRef = useRef<string>('');
   const lastEmittedMarkdownRef = useRef<string>(note.body);
   const isComposingRef = useRef<boolean>(false);
+  const selectionBeforeRef = useRef<EditorSelectionSnapshot>(null);
+  const lastHandledRestoreNonceRef = useRef<number>(0);
+  const pendingInputMetaRef = useRef<{
+    label: string;
+    coalesceKey: string | null;
+    wordBoundary?: boolean;
+  } | null>(null);
   const noteRef = useRef<Note>(note);
   noteRef.current = note;
   const peopleRef = useRef<Person[]>(directory.people);
@@ -392,16 +623,84 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     return [];
   }, [directory.projects, note.scope, note.clientId]);
 
+  const captureCurrentEditorSelection = useCallback((): EditorSelectionSnapshot => {
+    const active = document.activeElement;
+    if (active && active === titleInputRef.current) {
+      return {
+        kind: 'title',
+        start: titleInputRef.current.selectionStart ?? titleInputRef.current.value.length,
+        end: titleInputRef.current.selectionEnd ?? titleInputRef.current.value.length,
+      };
+    }
+    if (active && active === rawTextareaRef.current) {
+      return {
+        kind: 'raw',
+        start: rawTextareaRef.current.selectionStart ?? rawTextareaRef.current.value.length,
+        end: rawTextareaRef.current.selectionEnd ?? rawTextareaRef.current.value.length,
+      };
+    }
+    if (docRef.current) {
+      return captureDocSelection(docRef.current);
+    }
+    return null;
+  }, []);
+
+  const recordPreEditSelection = useCallback(() => {
+    const snap = captureCurrentEditorSelection();
+    if (snap) {
+      selectionBeforeRef.current = snap;
+      onSyncSelection?.(snap);
+    }
+  }, [captureCurrentEditorSelection, onSyncSelection]);
+
+  const syncTitleSelectionBefore = useCallback(() => {
+    const el = titleInputRef.current;
+    if (el && el.value === noteRef.current.title) {
+      const snap: EditorSelectionSnapshot = {
+        kind: 'title',
+        start: el.selectionStart ?? el.value.length,
+        end: el.selectionEnd ?? el.value.length,
+      };
+      selectionBeforeRef.current = snap;
+      onSyncSelection?.(snap);
+    }
+  }, [onSyncSelection]);
+
+  const syncRawSelectionBefore = useCallback(() => {
+    const el = rawTextareaRef.current;
+    if (el && el.value === noteRef.current.body) {
+      const snap: EditorSelectionSnapshot = {
+        kind: 'raw',
+        start: el.selectionStart ?? el.value.length,
+        end: el.selectionEnd ?? el.value.length,
+      };
+      selectionBeforeRef.current = snap;
+      onSyncSelection?.(snap);
+    }
+  }, [onSyncSelection]);
+
   const patchNote = useCallback(
-    (partial: Partial<Note>) => {
+    (partial: Partial<Note>, meta?: NoteEditMeta) => {
       const current = noteRef.current;
-      onUpdateNote({
-        ...current,
-        ...partial,
-        updatedAt: new Date().toISOString(),
-      });
+      const selectionBefore =
+        meta?.selectionBefore !== undefined ? meta.selectionBefore : selectionBeforeRef.current;
+      const selectionAfter =
+        meta?.selectionAfter !== undefined ? meta.selectionAfter : captureCurrentEditorSelection();
+      onUpdateNote(
+        {
+          ...current,
+          ...partial,
+          updatedAt: new Date().toISOString(),
+        },
+        {
+          ...meta,
+          selectionBefore,
+          selectionAfter,
+        }
+      );
+      selectionBeforeRef.current = selectionAfter;
     },
-    [onUpdateNote]
+    [captureCurrentEditorSelection, onUpdateNote]
   );
 
   const syncEmptyAttr = useCallback(() => {
@@ -436,35 +735,38 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     }
   }, [note.id, note.body, rawMode, directory.people, syncEmptyAttr]);
 
-  const emitMarkdownFromDom = useCallback(() => {
-    const el = docRef.current;
-    if (!el) return;
-    const rawTrimmed = el.innerHTML.trim();
-    if (rawTrimmed === '' || /^<br\s*\/?>$/i.test(rawTrimmed)) {
-      el.innerHTML = '<p><br></p>';
-      placeCaretAtStart(el.firstElementChild as HTMLElement);
-    } else if (el.childNodes.length === 1 && el.firstChild?.nodeType === Node.TEXT_NODE) {
-      const txtNode = el.firstChild as Text;
-      const sel = window.getSelection();
-      const savedOffset = sel && sel.anchorNode === txtNode ? sel.anchorOffset : txtNode.length;
-      const p = document.createElement('p');
-      el.replaceChild(p, txtNode);
-      p.appendChild(txtNode);
-      if (sel) {
-        const r = document.createRange();
-        r.setStart(txtNode, savedOffset);
-        r.collapse(true);
-        sel.removeAllRanges();
-        sel.addRange(r);
+  const emitMarkdownFromDom = useCallback(
+    (meta?: NoteEditMeta) => {
+      const el = docRef.current;
+      if (!el) return;
+      const rawTrimmed = el.innerHTML.trim();
+      if (rawTrimmed === '' || /^<br\s*\/?>$/i.test(rawTrimmed)) {
+        el.innerHTML = '<p><br></p>';
+        placeCaretAtStart(el.firstElementChild as HTMLElement);
+      } else if (el.childNodes.length === 1 && el.firstChild?.nodeType === Node.TEXT_NODE) {
+        const txtNode = el.firstChild as Text;
+        const sel = window.getSelection();
+        const savedOffset = sel && sel.anchorNode === txtNode ? sel.anchorOffset : txtNode.length;
+        const p = document.createElement('p');
+        el.replaceChild(p, txtNode);
+        p.appendChild(txtNode);
+        if (sel) {
+          const r = document.createRange();
+          r.setStart(txtNode, savedOffset);
+          r.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(r);
+        }
       }
-    }
-    syncEmptyAttr();
-    const md = domToMarkdown(el);
-    if (md !== lastEmittedMarkdownRef.current) {
-      lastEmittedMarkdownRef.current = md;
-      patchNote({ body: md });
-    }
-  }, [patchNote, syncEmptyAttr]);
+      syncEmptyAttr();
+      const md = domToMarkdown(el);
+      if (md !== lastEmittedMarkdownRef.current) {
+        lastEmittedMarkdownRef.current = md;
+        patchNote({ body: md }, meta);
+      }
+    },
+    [patchNote, syncEmptyAttr]
+  );
 
   // Refresh active toolbar button state & token link chip when selection moves
   const refreshSelectionToolbarState = useCallback(() => {
@@ -542,13 +844,142 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     setActiveToken(null);
   }, []);
 
+  // Restore logical caret/selection after Undo or Redo hydration
+  useEffect(() => {
+    if (
+      !pendingSelectionRestore ||
+      pendingSelectionRestore.noteId !== note.id ||
+      pendingSelectionRestore.nonce === lastHandledRestoreNonceRef.current
+    ) {
+      return;
+    }
+    lastHandledRestoreNonceRef.current = pendingSelectionRestore.nonce;
+
+    const snap = pendingSelectionRestore.selection;
+    if (snap?.kind === 'title' && titleInputRef.current) {
+      const input = titleInputRef.current;
+      const maxLen = input.value.length;
+      const start = Math.max(0, Math.min(maxLen, snap.start));
+      const end = Math.max(start, Math.min(maxLen, snap.end));
+      input.focus({ preventScroll: true });
+      try {
+        input.setSelectionRange(start, end);
+      } catch {
+        // Ignore selection range errors
+      }
+      const actual: EditorSelectionSnapshot = { kind: 'title', start, end };
+      selectionBeforeRef.current = actual;
+      onSyncSelection?.(actual);
+    } else if (rawMode && rawTextareaRef.current) {
+      const ta = rawTextareaRef.current;
+      const maxLen = ta.value.length;
+      const start = snap?.kind === 'raw' ? Math.max(0, Math.min(maxLen, snap.start)) : maxLen;
+      const end = snap?.kind === 'raw' ? Math.max(start, Math.min(maxLen, snap.end)) : start;
+      ta.focus({ preventScroll: true });
+      try {
+        ta.setSelectionRange(start, end);
+      } catch {
+        // Ignore selection range errors
+      }
+      const actual: EditorSelectionSnapshot = { kind: 'raw', start, end };
+      selectionBeforeRef.current = actual;
+      onSyncSelection?.(actual);
+    } else if (!rawMode && docRef.current) {
+      if (snap?.kind === 'doc') {
+        restoreDocSelection(docRef.current, snap);
+        const actual = captureDocSelection(docRef.current);
+        selectionBeforeRef.current = actual;
+        onSyncSelection?.(actual);
+      } else {
+        selectionBeforeRef.current = captureDocSelection(docRef.current);
+      }
+    }
+
+    queueMicrotask(() => {
+      setAutocomplete(null);
+      setActiveToken(null);
+      refreshSelectionToolbarState();
+    });
+  }, [
+    note.id,
+    note.body,
+    note.title,
+    onSyncSelection,
+    pendingSelectionRestore,
+    rawMode,
+    refreshSelectionToolbarState,
+  ]);
+
   useEffect(() => {
     const onSelectionChange = () => {
-      if (!rawMode) refreshSelectionToolbarState();
+      if (!rawMode) {
+        refreshSelectionToolbarState();
+        if (!isComposingRef.current && !pendingInputMetaRef.current && docRef.current) {
+          const snap = captureDocSelection(docRef.current);
+          if (snap) {
+            selectionBeforeRef.current = snap;
+            onSyncSelection?.(snap);
+          }
+        }
+      }
     };
     document.addEventListener('selectionchange', onSelectionChange);
     return () => document.removeEventListener('selectionchange', onSelectionChange);
-  }, [rawMode, refreshSelectionToolbarState]);
+  }, [onSyncSelection, rawMode, refreshSelectionToolbarState]);
+
+  useEffect(() => {
+    const el = docRef.current;
+    if (rawMode || !el) return;
+
+    const onNativeBeforeInput = (ev: InputEvent) => {
+      const inputType = typeof ev.inputType === 'string' ? ev.inputType : '';
+      if (inputType === 'historyUndo') {
+        ev.preventDefault();
+        pendingInputMetaRef.current = null;
+        onUndo?.();
+        return;
+      }
+      if (inputType === 'historyRedo') {
+        ev.preventDefault();
+        pendingInputMetaRef.current = null;
+        onRedo?.();
+        return;
+      }
+
+      const snap = captureDocSelection(el);
+      if (snap) {
+        selectionBeforeRef.current = snap;
+        onSyncSelection?.(snap);
+      }
+
+      if (inputType === 'insertText' || inputType === 'insertCompositionText') {
+        pendingInputMetaRef.current = {
+          label: 'Typing',
+          coalesceKey: 'doc-type',
+          wordBoundary: Boolean(ev.data && /\s/.test(ev.data)),
+        };
+      } else if (inputType === 'deleteByCut') {
+        pendingInputMetaRef.current = { label: 'Cut', coalesceKey: null };
+      } else if (inputType.startsWith('delete')) {
+        pendingInputMetaRef.current = {
+          label: 'Delete text',
+          coalesceKey:
+            inputType === 'deleteContentBackward' || inputType === 'deleteContentForward'
+              ? 'doc-delete'
+              : null,
+        };
+      } else if (inputType.startsWith('format')) {
+        pendingInputMetaRef.current = { label: 'Formatting', coalesceKey: null };
+      } else if (inputType === 'insertParagraph' || inputType === 'insertLineBreak') {
+        pendingInputMetaRef.current = { label: 'New paragraph', coalesceKey: null };
+      } else if (inputType) {
+        pendingInputMetaRef.current = { label: 'Edit note', coalesceKey: null };
+      }
+    };
+
+    el.addEventListener('beforeinput', onNativeBeforeInput);
+    return () => el.removeEventListener('beforeinput', onNativeBeforeInput);
+  }, [onRedo, onSyncSelection, onUndo, rawMode]);
 
   const handleScopeOrClientChange = (val: string) => {
     if (val === '__new_client__') {
@@ -556,17 +987,20 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
     if (val === 'inbox') {
-      patchNote({ scope: 'inbox', clientId: null, projectId: null });
+      patchNote({ scope: 'inbox', clientId: null, projectId: null }, { label: 'Change space', coalesceKey: null });
     } else if (val === 'internal') {
-      patchNote({ scope: 'internal', clientId: null, projectId: null });
+      patchNote({ scope: 'internal', clientId: null, projectId: null }, { label: 'Change space', coalesceKey: null });
     } else if (val.startsWith('client:')) {
       const cId = val.slice('client:'.length);
       const validProj = directory.projects.some((p) => p.id === note.projectId && p.clientId === cId);
-      patchNote({
-        scope: 'client',
-        clientId: cId,
-        projectId: validProj ? note.projectId : null,
-      });
+      patchNote(
+        {
+          scope: 'client',
+          clientId: cId,
+          projectId: validProj ? note.projectId : null,
+        },
+        { label: 'Change space', coalesceKey: null }
+      );
     }
   };
 
@@ -583,7 +1017,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       inferredPatch.scope = 'client';
       inferredPatch.clientId = person.clientId;
     }
-    patchNote(inferredPatch);
+    patchNote(inferredPatch, { label: 'Add participant', coalesceKey: null });
     setParticipantInput('');
   };
 
@@ -591,7 +1025,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     const norm = normalizeLabel(rawLbl);
     if (!norm) return;
     if (!note.labels.includes(norm)) {
-      patchNote({ labels: [...note.labels, norm] });
+      patchNote({ labels: [...note.labels, norm] }, { label: 'Add label', coalesceKey: null });
     }
     setLabelInput('');
   };
@@ -605,13 +1039,16 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     const nextClientId = note.clientId || parsed.inferredClientId;
     const nextScope: NoteScope = nextClientId ? 'client' : note.scope;
 
-    patchNote({
-      title: parsed.title || note.title,
-      date: parsed.date || note.date,
-      participants: mergedParticipants,
-      clientId: nextClientId,
-      scope: nextScope,
-    });
+    patchNote(
+      {
+        title: parsed.title || note.title,
+        date: parsed.date || note.date,
+        participants: mergedParticipants,
+        clientId: nextClientId,
+        scope: nextScope,
+      },
+      { label: 'Import meeting invite', coalesceKey: null }
+    );
     setInviteRawText('');
     setShowInviteModal(false);
   };
@@ -622,7 +1059,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     const nextBody = note.body.trim() ? `${note.body.trim()}\n\n${tpl.body}` : tpl.body;
     const nextTitle = !note.title.trim() && tpl.titlePrefix ? tpl.titlePrefix : note.title;
     lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
-    patchNote({ title: nextTitle, body: nextBody });
+    patchNote({ title: nextTitle, body: nextBody }, { label: `Insert ${tpl.label}`, coalesceKey: null });
     setShowInsertMenu(false);
   };
 
@@ -633,7 +1070,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       formatPersonMention(person.name)
     );
     lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
-    patchNote({ body: updatedBody });
+    patchNote({ body: updatedBody }, { label: `Link @${person.name}`, coalesceKey: null });
   };
 
   const captureCurrentDocRange = useCallback((): Range | null => {
@@ -648,6 +1085,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     (figures: HTMLElement[], explicitRange?: Range | null) => {
       const root = docRef.current;
       if (!root || figures.length === 0) return;
+
+      recordPreEditSelection();
 
       const frag = document.createDocumentFragment();
       figures.forEach((fig) => frag.appendChild(fig));
@@ -701,7 +1140,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           root.focus();
           placeCaretAtStart(p);
         }
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Insert image', coalesceKey: null });
         refreshSelectionToolbarState();
         return;
       }
@@ -749,7 +1188,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             root.focus();
             placeCaretAtStart(p);
           }
-          emitMarkdownFromDom();
+          emitMarkdownFromDom({ label: 'Insert image', coalesceKey: null });
           refreshSelectionToolbarState();
           return;
         }
@@ -773,7 +1212,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         const targetCaretEl = ensureTrailingParagraph(lastFigure);
         root.focus();
         placeCaretAtStart(targetCaretEl);
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Insert image', coalesceKey: null });
         refreshSelectionToolbarState();
         return;
       }
@@ -816,10 +1255,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         placeCaretAtStart(nextBlock);
       }
 
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Insert image', coalesceKey: null });
       refreshSelectionToolbarState();
     },
-    [captureCurrentDocRange, emitMarkdownFromDom, refreshSelectionToolbarState]
+    [captureCurrentDocRange, emitMarkdownFromDom, recordPreEditSelection, refreshSelectionToolbarState]
   );
 
   const insertImageFiles = useCallback(
@@ -834,6 +1273,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       );
 
       if (rawMode) {
+        syncRawSelectionBefore();
         const mdSnippet = uploaded.map((u) => `![${u.alt}](${u.assetPath})`).join('\n\n');
         const ta = rawTextareaRef.current;
         const currentBody = noteRef.current.body;
@@ -846,11 +1286,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           const suffix = after.length > 0 && !after.startsWith('\n') ? '\n\n' : '\n';
           const updated = `${before}${prefix}${mdSnippet}${suffix}${after}`;
           lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
-          patchNote({ body: updated });
+          patchNote({ body: updated }, { label: 'Insert image', coalesceKey: null });
         } else {
           const updated = currentBody.trim() ? `${currentBody.trim()}\n\n${mdSnippet}\n` : `${mdSnippet}\n`;
           lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
-          patchNote({ body: updated });
+          patchNote({ body: updated }, { label: 'Insert image', coalesceKey: null });
         }
         return;
       }
@@ -863,7 +1303,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       );
       insertImageBlocksAtRange(figures, explicitRange);
     },
-    [insertImageBlocksAtRange, patchNote, rawMode]
+    [insertImageBlocksAtRange, patchNote, rawMode, syncRawSelectionBefore]
   );
 
   const handleTriggerImageUpload = () => {
@@ -1185,6 +1625,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const root = docRef.current;
       if (!root) return;
       root.focus();
+      recordPreEditSelection();
 
       if (targetStyle === 'ul' || targetStyle === 'ol') {
         // Clear custom task/decision classes first so native list toggle works cleanly
@@ -1193,7 +1634,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           blk.removeAttribute('data-status');
         });
         document.execCommand(targetStyle === 'ul' ? 'insertUnorderedList' : 'insertOrderedList');
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({
+          label: targetStyle === 'ul' ? 'Bullet list' : 'Numbered list',
+          coalesceKey: null,
+        });
         refreshSelectionToolbarState();
         return;
       }
@@ -1251,30 +1695,33 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       if (lastCreated) {
         placeCaretAtEnd(lastCreated);
       }
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Format block', coalesceKey: null });
       refreshSelectionToolbarState();
     },
-    [emitMarkdownFromDom, refreshSelectionToolbarState]
+    [emitMarkdownFromDom, recordPreEditSelection, refreshSelectionToolbarState]
   );
 
   const applyInlineCommand = (cmd: 'bold' | 'italic' | 'strikeThrough') => {
     const root = docRef.current;
     if (!root) return;
     root.focus();
+    recordPreEditSelection();
     document.execCommand(cmd);
-    emitMarkdownFromDom();
+    const label = cmd === 'bold' ? 'Bold' : cmd === 'italic' ? 'Italic' : 'Strikethrough';
+    emitMarkdownFromDom({ label, coalesceKey: null });
     refreshSelectionToolbarState();
   };
 
   const applyAutocompleteItem = (item: (typeof autocompleteItems)[number]) => {
     if (!autocomplete) return;
+    recordPreEditSelection();
     if (item.replacement === '__OPEN_ASK__') {
       if (autocomplete.textNode) {
         const r = document.createRange();
         r.setStart(autocomplete.textNode, autocomplete.tokenStart);
         r.setEnd(autocomplete.textNode, autocomplete.cursorPos);
         r.deleteContents();
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Slash command', coalesceKey: null });
       }
       setAutocomplete(null);
       onOpenQuickAsk();
@@ -1294,7 +1741,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           r.collapse(true);
         }
         savedInsertRangeRef.current = r.cloneRange();
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Slash command', coalesceKey: null });
       }
       setAutocomplete(null);
       imageInputRef.current?.click();
@@ -1305,12 +1752,22 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       onEnsurePerson(item.createPersonName, note.clientId);
     }
 
+    const tokenLabel =
+      autocomplete.kind === 'person'
+        ? 'Insert @person'
+        : autocomplete.kind === 'label'
+        ? 'Insert #label'
+        : autocomplete.kind === 'link'
+        ? 'Insert [[note]] link'
+        : 'Slash command';
+
     if (rawMode && rawTextareaRef.current) {
+      syncRawSelectionBefore();
       const full = note.body;
       const updated =
         full.slice(0, autocomplete.tokenStart) + item.replacement + full.slice(autocomplete.cursorPos);
       lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
-      patchNote({ body: updated });
+      patchNote({ body: updated }, { label: tokenLabel, coalesceKey: null });
       setAutocomplete(null);
       return;
     }
@@ -1389,7 +1846,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     setAutocomplete(null);
     setActiveToken(null);
-    emitMarkdownFromDom();
+    emitMarkdownFromDom({ label: tokenLabel, coalesceKey: null });
   };
 
   // Auto-convert Markdown prefixes (# , ## , - , 1. , [] , [d] , > ) into live WYSIWYG blocks on Space
@@ -1415,7 +1872,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       next.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
       const mounted = replaceBlockElement(blk, next);
       placeCaretAtStart(mounted);
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Format block', coalesceKey: null });
       refreshSelectionToolbarState();
       return true;
     };
@@ -1507,7 +1964,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         blk.replaceWith(ul);
       }
       placeCaretAtStart(li);
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Bullet list', coalesceKey: null });
       refreshSelectionToolbarState();
       return true;
     }
@@ -1525,7 +1982,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         blk.replaceWith(ol);
       }
       placeCaretAtStart(li);
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Numbered list', coalesceKey: null });
       refreshSelectionToolbarState();
       return true;
     }
@@ -1818,9 +2275,14 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
   // Prevent typing spaces/punctuation at the right edge of an inline token from bleeding token color
   const handleDocBeforeInput = (e: React.FormEvent<HTMLDivElement>) => {
-    const native = e.nativeEvent as InputEvent;
-    if (native.inputType !== 'insertText' || !native.data) return;
-    if (!/^[ \t,.;:!?)]/.test(native.data)) return;
+    const native = e.nativeEvent as Partial<InputEvent>;
+    const data =
+      typeof native.data === 'string'
+        ? native.data
+        : typeof (e as unknown as { data?: unknown }).data === 'string'
+        ? (e as unknown as { data: string }).data
+        : null;
+    if (!data || !/^[ \t,.;:!?)]/.test(data)) return;
 
     const root = docRef.current;
     const sel = window.getSelection();
@@ -1843,8 +2305,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     endProbe.setStart(range.startContainer, range.startOffset);
     if (endProbe.toString().length === 0) {
       e.preventDefault();
+      pendingInputMetaRef.current = null;
       const isAtLineEnd = !tokenEl.nextSibling || tokenEl.nextSibling.nodeName === 'BR';
-      const outChar = native.data === ' ' && isAtLineEnd ? '\u00A0' : native.data;
+      const outChar = data === ' ' && isAtLineEnd ? '\u00A0' : data;
       const textNode = document.createTextNode(outChar);
       tokenEl.after(textNode);
       const nextRange = document.createRange();
@@ -1853,12 +2316,18 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       sel.removeAllRanges();
       sel.addRange(nextRange);
       setActiveToken(null);
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({
+        label: 'Typing',
+        coalesceKey: 'doc-type',
+        wordBoundary: /\s/.test(data),
+      });
     }
   };
 
   const handleDocInput = () => {
     if (isComposingRef.current) return;
+    const inputMeta = pendingInputMetaRef.current;
+    pendingInputMetaRef.current = null;
     if (tryApplyAutoMarkdownPrefix()) {
       setAutocomplete(null);
       return;
@@ -1867,10 +2336,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     if (tryFinalizeInlineTriggerAtCaret()) {
       setAutocomplete(null);
       setActiveToken(null);
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
       return;
     }
-    emitMarkdownFromDom();
+    emitMarkdownFromDom(inputMeta ?? { label: 'Typing', coalesceKey: 'doc-type' });
     detectDocAutocomplete();
   };
 
@@ -1905,13 +2374,15 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           autocomplete.query.trim().length >= 1
         ) {
           if (autocomplete.kind === 'person' && !/\s/.test(autocomplete.query.trim())) {
+            recordPreEditSelection();
             const span = createPersonTokenSpan(autocomplete.query.trim());
             replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
-            emitMarkdownFromDom();
+            emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
           } else if (autocomplete.kind === 'label') {
+            recordPreEditSelection();
             const span = createLabelTokenSpan(autocomplete.query.trim());
             replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
-            emitMarkdownFromDom();
+            emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
           }
         }
         setAutocomplete(null);
@@ -1953,6 +2424,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
       if (isTask || isDec || isHeading || isQuote) {
         e.preventDefault();
+        recordPreEditSelection();
         const isEmpty = !(blk.textContent || '').trim();
 
         // Pressing Enter on an empty Task, Decision, or Quote exits back to normal Paragraph
@@ -1961,7 +2433,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           p.innerHTML = '<br>';
           blk.replaceWith(p);
           placeCaretAtStart(p);
-          emitMarkdownFromDom();
+          emitMarkdownFromDom({ label: 'Convert to paragraph', coalesceKey: null });
           refreshSelectionToolbarState();
           return;
         }
@@ -1988,7 +2460,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
         blk.after(nextBlock);
         placeCaretAtStart(nextBlock);
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'New paragraph', coalesceKey: null });
         refreshSelectionToolbarState();
         return;
       }
@@ -2005,11 +2477,12 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
       if (isTask || isDec || isHeading || isQuote) {
         e.preventDefault();
+        recordPreEditSelection();
         const p = document.createElement('p');
         p.innerHTML = blk.innerHTML || '<br>';
         blk.replaceWith(p);
         placeCaretAtStart(p);
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Convert to paragraph', coalesceKey: null });
         refreshSelectionToolbarState();
         return;
       }
@@ -2017,8 +2490,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const prevEl = blk.previousElementSibling as HTMLElement | null;
       if (prevEl && prevEl.classList.contains('doc-image-block')) {
         e.preventDefault();
+        recordPreEditSelection();
         prevEl.remove();
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Remove image', coalesceKey: null });
         return;
       }
     }
@@ -2028,8 +2502,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const nextEl = blk.nextElementSibling as HTMLElement | null;
       if (nextEl && nextEl.classList.contains('doc-image-block')) {
         e.preventDefault();
+        recordPreEditSelection();
         nextEl.remove();
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Remove image', coalesceKey: null });
         return;
       }
     }
@@ -2047,6 +2522,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     e.preventDefault();
     e.stopPropagation();
+    recordPreEditSelection();
 
     const dir = handleEl.getAttribute('data-resize-dir') || 'se';
     const imgEl = figureEl.querySelector('img');
@@ -2088,7 +2564,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         pill.textContent = `${latestPx}px`;
       }
       suppressImageClickUntilRef.current = performance.now() + 260;
-      emitMarkdownFromDom();
+      emitMarkdownFromDom({ label: 'Resize image', coalesceKey: null });
     };
 
     window.addEventListener('pointermove', onPointerMove);
@@ -2129,10 +2605,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const rect = taskEl.getBoundingClientRect();
       if (e.clientX - rect.left <= 30) {
         e.preventDefault();
+        recordPreEditSelection();
         const curr = (taskEl.getAttribute('data-status') || 'todo') as TaskStatus;
         const next = TASK_CYCLE[(TASK_CYCLE.indexOf(curr) + 1) % TASK_CYCLE.length];
         taskEl.setAttribute('data-status', next);
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Update task status', coalesceKey: null });
         return;
       }
     }
@@ -2142,10 +2619,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const rect = decEl.getBoundingClientRect();
       if (e.clientX - rect.left <= 98) {
         e.preventDefault();
+        recordPreEditSelection();
         const curr = (decEl.getAttribute('data-status') || 'agreed') as DecisionStatus;
         const next = DECISION_CYCLE[(DECISION_CYCLE.indexOf(curr) + 1) % DECISION_CYCLE.length];
         decEl.setAttribute('data-status', next);
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Update decision status', coalesceKey: null });
       }
     }
   };
@@ -2162,6 +2640,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
       const action = actionBtn.getAttribute('data-img-action');
       if (action === 'preset') {
+        recordPreEditSelection();
         const preset = actionBtn.getAttribute('data-preset') || '100%';
         figureEl.style.width = preset;
         figureEl.setAttribute('data-width', preset);
@@ -2172,7 +2651,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         if (pill) {
           pill.textContent = preset;
         }
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Resize image', coalesceKey: null });
         return;
       }
 
@@ -2182,6 +2661,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       }
 
       if (action === 'delete') {
+        recordPreEditSelection();
         const root = docRef.current;
         const nextSib = figureEl.nextElementSibling as HTMLElement | null;
         const prevSib = figureEl.previousElementSibling as HTMLElement | null;
@@ -2196,7 +2676,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         } else if (prevSib && !prevSib.classList.contains('doc-image-block')) {
           placeCaretAtEnd(prevSib);
         }
-        emitMarkdownFromDom();
+        emitMarkdownFromDom({ label: 'Remove image', coalesceKey: null });
         return;
       }
     }
@@ -2237,6 +2717,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     const root = docRef.current;
     if (!root) return;
 
+    recordPreEditSelection();
+
     const htmlData = e.clipboardData.getData('text/html');
     const plainData = e.clipboardData.getData('text/plain');
     const imageFiles = extractImageFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
@@ -2266,7 +2748,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     if (!cleanHtml) return;
 
     document.execCommand('insertHTML', false, cleanHtml);
-    emitMarkdownFromDom();
+    emitMarkdownFromDom({ label: 'Paste', coalesceKey: null });
     refreshSelectionToolbarState();
   };
 
@@ -2347,8 +2829,43 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       {/* Unified Sticky Word-Style Formatting & Actions Ribbon */}
       <div className="doc-ribbon no-print" onClick={(e) => e.stopPropagation()}>
         <div className="doc-ribbon-group">
+          <button
+            id="btn-editor-undo"
+            type="button"
+            className="doc-fmt-btn"
+            disabled={!canUndo}
+            aria-label="Undo"
+            title={
+              canUndo && undoLabel
+                ? `Undo: ${undoLabel} (${UNDO_SHORTCUT_HINT})`
+                : `Undo (${UNDO_SHORTCUT_HINT})`
+            }
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onUndo?.()}
+          >
+            <Undo2 size={14} />
+          </button>
+          <button
+            id="btn-editor-redo"
+            type="button"
+            className="doc-fmt-btn"
+            disabled={!canRedo}
+            aria-label="Redo"
+            title={
+              canRedo && redoLabel
+                ? `Redo: ${redoLabel} (${REDO_SHORTCUT_HINT})`
+                : `Redo (${REDO_SHORTCUT_HINT})`
+            }
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onRedo?.()}
+          >
+            <Redo2 size={14} />
+          </button>
+
           {!rawMode && (
             <>
+              <span className="doc-ribbon-sep" />
+
               <select
                 className="doc-block-select"
                 aria-label="Paragraph style"
@@ -2604,8 +3121,26 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             className="note-title-input"
             placeholder="Untitled document"
             value={note.title}
-            onChange={(e) => patchNote({ title: e.target.value })}
+            onFocus={syncTitleSelectionBefore}
+            onSelect={syncTitleSelectionBefore}
+            onChange={(e) => {
+              const prevLen = noteRef.current.title.length;
+              const nextVal = e.target.value;
+              const delta = nextVal.length - prevLen;
+              let coalesceKey: string | null = 'title-type';
+              let wordBoundary = false;
+              if (delta === 1) {
+                const pos = (e.target.selectionStart ?? nextVal.length) - 1;
+                wordBoundary = /\s/.test(nextVal[pos] || '');
+              } else if (delta === -1) {
+                coalesceKey = 'title-delete';
+              } else if (Math.abs(delta) > 1) {
+                coalesceKey = null;
+              }
+              patchNote({ title: nextVal }, { label: 'Edit title', coalesceKey, wordBoundary });
+            }}
             onKeyDown={(e) => {
+              syncTitleSelectionBefore();
               if ((e.key === 'Enter' || e.key === 'ArrowDown') && docRef.current) {
                 e.preventDefault();
                 docRef.current.focus();
@@ -2658,7 +3193,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 type="date"
                 className="meta-date-input"
                 value={note.date}
-                onChange={(e) => patchNote({ date: e.target.value })}
+                onChange={(e) =>
+                  patchNote({ date: e.target.value }, { label: 'Change date', coalesceKey: 'note-date' })
+                }
               />
               <select
                 id="note-space-select"
@@ -2687,7 +3224,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     if (e.target.value === '__new_project__') {
                       setNewProjectPrompt(true);
                     } else {
-                      patchNote({ projectId: e.target.value || null });
+                      patchNote(
+                        { projectId: e.target.value || null },
+                        { label: 'Change project', coalesceKey: null }
+                      );
                     }
                   }}
                 >
@@ -2712,8 +3252,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     onChange={(e) => setNewClientName(e.target.value)}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && newClientName.trim()) {
-                        const cId = onAddClient(newClientName.trim());
-                        patchNote({ scope: 'client', clientId: cId, projectId: null });
+                        const cId = onAddClient(newClientName.trim(), undefined, {
+                          recordHistory: false,
+                        });
+                        patchNote(
+                          { scope: 'client', clientId: cId, projectId: null },
+                          { label: 'Change space', coalesceKey: null }
+                        );
                         setNewClientName('');
                         setNewClientPrompt(false);
                       } else if (e.key === 'Escape') {
@@ -2739,8 +3284,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     onKeyDown={(e) => {
                       if (e.key === 'Enter' && newProjectName.trim()) {
                         const pScope = note.scope === 'client' ? 'client' : 'internal';
-                        const pId = onAddProject(newProjectName.trim(), pScope, note.clientId);
-                        patchNote({ projectId: pId });
+                        const pId = onAddProject(newProjectName.trim(), pScope, note.clientId, {
+                          recordHistory: false,
+                        });
+                        patchNote({ projectId: pId }, { label: 'Change project', coalesceKey: null });
                         setNewProjectName('');
                         setNewProjectPrompt(false);
                       } else if (e.key === 'Escape') {
@@ -2770,7 +3317,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     title="Remove participant"
                     onClick={(e) => {
                       e.stopPropagation();
-                      patchNote({ participants: note.participants.filter((x) => x !== pName) });
+                      patchNote(
+                        { participants: note.participants.filter((x) => x !== pName) },
+                        { label: 'Remove participant', coalesceKey: null }
+                      );
                     }}
                   >
                     <X size={11} />
@@ -2819,7 +3369,12 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     onClick={(e) => {
                       e.stopPropagation();
                       lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
-                      onUpdateNote(removeLabelFromNote(note, lbl));
+                      onUpdateNote(removeLabelFromNote(note, lbl), {
+                        label: 'Remove label',
+                        coalesceKey: null,
+                        selectionBefore: selectionBeforeRef.current,
+                        selectionAfter: captureCurrentEditorSelection(),
+                      });
                     }}
                   >
                     <X size={11} />
@@ -2900,10 +3455,40 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             className="raw-markdown-textarea"
             value={note.body}
             placeholder="Write plain Markdown… Use @[Name], #label, [[Note Title]], - [ ] Task, or - [D:agreed] Decision"
+            onFocus={syncRawSelectionBefore}
+            onSelect={syncRawSelectionBefore}
+            onKeyDown={syncRawSelectionBefore}
             onChange={(e) => {
-              lastEmittedMarkdownRef.current = e.target.value;
-              patchNote({ body: e.target.value });
-              detectRawAutocomplete(e.target.value, e.target.selectionStart ?? 0, e.target);
+              const prevLen = noteRef.current.body.length;
+              const nextVal = e.target.value;
+              const delta = nextVal.length - prevLen;
+              lastEmittedMarkdownRef.current = nextVal;
+              let coalesceKey: string | null = null;
+              let label = 'Edit Markdown';
+              let wordBoundary = false;
+              if (delta === 1) {
+                const pos = (e.target.selectionStart ?? nextVal.length) - 1;
+                const ch = nextVal[pos] || '';
+                if (ch === '\n') {
+                  coalesceKey = null;
+                  label = 'New line';
+                } else {
+                  coalesceKey = 'raw-type';
+                  label = 'Typing';
+                  wordBoundary = /\s/.test(ch);
+                }
+              } else if (delta === -1) {
+                coalesceKey = 'raw-delete';
+                label = 'Delete text';
+              } else if (delta > 1) {
+                coalesceKey = null;
+                label = 'Paste text';
+              } else if (delta < -1) {
+                coalesceKey = null;
+                label = 'Delete selection';
+              }
+              patchNote({ body: nextVal }, { label, coalesceKey, wordBoundary });
+              detectRawAutocomplete(nextVal, e.target.selectionStart ?? 0, e.target);
             }}
             onPaste={handleRawPaste}
           />
@@ -2925,6 +3510,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             }}
             onCompositionStart={() => {
               isComposingRef.current = true;
+              recordPreEditSelection();
             }}
             onCompositionEnd={() => {
               isComposingRef.current = false;
