@@ -130,6 +130,13 @@ export interface RelatedNoteMatch {
 
 export type ActiveMainView = 'notes' | 'tasks' | 'decisions' | 'reports' | 'people';
 
+export type InitialLayoutMode = 'focus' | 'standard';
+
+export interface WorkspacePreferences {
+  startupLayout: InitialLayoutMode;
+  focusOnNewNote: boolean;
+}
+
 export interface NoteFilter {
   kind: 'all' | 'inbox' | 'internal' | 'client' | 'project' | 'label' | 'person';
   clientId?: string;

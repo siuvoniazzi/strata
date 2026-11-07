@@ -2,7 +2,9 @@ import React, { useMemo, useState } from 'react';
 import {
   Check,
   Copy,
+  ExternalLink,
   FilePlus2,
+  FileText,
   Gavel,
   Loader2,
   Printer,
@@ -20,7 +22,12 @@ import type {
 } from '../types';
 import { formatAiEngineLabel, generateExecutiveBriefWithAiOrFallback } from '../utils/aiProvider';
 import { buildDeterministicExecutiveBrief } from '../utils/contextEngine';
-import { extractInlineMentions, getAllNoteLabels, parseNoteItems } from '../utils/markdown';
+import {
+  extractInlineMentions,
+  getAllNoteLabels,
+  parseNoteItems,
+  stripMarkdownFormatting,
+} from '../utils/markdown';
 import { AiLoadingState } from './AiLoadingState';
 import { RichInlineText } from './RichInlineText';
 import { RichMarkdown } from './RichMarkdown';
@@ -33,6 +40,8 @@ interface ReportsViewProps {
   initialLabelFilter?: string;
   initialClientFilter?: string;
   initialPersonFilter?: string;
+  embeddedInOverlay?: boolean;
+  activeEditorNoteId?: string;
   onOpenNote: (noteId: string) => void;
   onOpenNoteByTitle?: (noteTitle: string) => void;
   onUpdateTaskStatus: (task: ParsedTask, status: TaskStatus) => void;
@@ -53,6 +62,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   initialLabelFilter = '',
   initialClientFilter = '',
   initialPersonFilter = '',
+  embeddedInOverlay = false,
+  activeEditorNoteId,
   onOpenNote,
   onOpenNoteByTitle,
   onUpdateTaskStatus,
@@ -61,10 +72,34 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   onDeleteDecision,
   onSaveBriefAsNote,
 }) => {
+  const allPeopleNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const p of directory.people) {
+      map.set(p.name.toLowerCase(), p.name);
+    }
+    for (const n of notes) {
+      for (const part of n.participants) {
+        const key = part.trim().toLowerCase();
+        if (key && !map.has(key)) map.set(key, part.trim());
+      }
+      for (const ment of extractInlineMentions(n.body, directory.people)) {
+        const key = ment.trim().toLowerCase();
+        if (key && !map.has(key)) map.set(key, ment.trim());
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => a.localeCompare(b));
+  }, [directory.people, notes]);
+
   const [clientId, setClientId] = useState(initialClientFilter);
   const [projectId, setProjectId] = useState('');
   const [labelFilter, setLabelFilter] = useState(initialLabelFilter);
-  const [personFilter, setPersonFilter] = useState(initialPersonFilter);
+  const [personFilter, setPersonFilter] = useState(() => {
+    if (!initialPersonFilter) return '';
+    const canonical = allPeopleNames.find(
+      (name) => name.toLowerCase() === initialPersonFilter.trim().toLowerCase()
+    );
+    return canonical || initialPersonFilter.trim();
+  });
   const [topicQuery, setTopicQuery] = useState('');
   const [dateRange, setDateRange] = useState<'all' | '7d' | '30d'>('all');
 
@@ -207,21 +242,48 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     if (found) onOpenNote(found.id);
   };
 
+  const applyPersonFilter = (rawName: string) => {
+    const trimmed = rawName.trim();
+    if (!trimmed) {
+      setPersonFilter('');
+      return;
+    }
+    const canonical = allPeopleNames.find(
+      (name) => name.toLowerCase() === trimmed.toLowerCase()
+    );
+    setPersonFilter(canonical || trimmed);
+  };
+
+  const labelOptions = useMemo(() => {
+    if (!labelFilter || allLabels.includes(labelFilter)) return allLabels;
+    return [labelFilter, ...allLabels];
+  }, [allLabels, labelFilter]);
+
+  const peopleOptions = useMemo(() => {
+    if (
+      !personFilter ||
+      allPeopleNames.some((name) => name.toLowerCase() === personFilter.toLowerCase())
+    ) {
+      return allPeopleNames;
+    }
+    return [personFilter, ...allPeopleNames];
+  }, [allPeopleNames, personFilter]);
+
   const renderInline = (text: string) => (
     <RichInlineText
       text={text}
       people={directory.people}
       clients={directory.clients}
       notes={notes}
-      onClickPerson={(pName) => setPersonFilter(pName)}
+      onClickPerson={applyPersonFilter}
       onClickLabel={(lbl) => setLabelFilter(lbl)}
       onClickNoteLink={handleOpenNoteLink}
     />
   );
 
   return (
-    <div className="page-scroll">
-      <div className="page-container">
+    <div className={embeddedInOverlay ? 'overlay-report-view' : 'page-scroll'}>
+      <div className={embeddedInOverlay ? 'page-container overlay-page-container' : 'page-container'}>
         <div className="page-header">
           <div>
             <h1 className="page-h1">{reportHeading}</h1>
@@ -300,7 +362,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             onChange={(e) => setLabelFilter(e.target.value)}
           >
             <option value="">All #Labels / Topics</option>
-            {allLabels.map((l) => (
+            {labelOptions.map((l) => (
               <option key={l} value={l}>
                 #{l}
               </option>
@@ -310,12 +372,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
           <select
             className="meta-select"
             value={personFilter}
-            onChange={(e) => setPersonFilter(e.target.value)}
+            onChange={(e) => applyPersonFilter(e.target.value)}
           >
             <option value="">All @People</option>
-            {directory.people.map((p) => (
-              <option key={p.id} value={p.name}>
-                @{p.name}
+            {peopleOptions.map((name) => (
+              <option key={name} value={name}>
+                @{name}
               </option>
             ))}
           </select>
@@ -431,7 +493,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       people={directory.people}
                       clients={directory.clients}
                       notes={notes}
-                      onClickPerson={(pName) => setPersonFilter(pName)}
+                      onClickPerson={applyPersonFilter}
                       onClickLabel={(lbl) => setLabelFilter(lbl)}
                       onClickNoteLink={handleOpenNoteLink}
                     />
@@ -441,6 +503,131 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             )}
           </div>
         )}
+
+        {/* Matched Notes Rollup */}
+        <div className="surface-panel">
+          <strong style={{ fontSize: 14.5 }}>
+            Matched Notes ({filteredData.matchingNotes.length})
+          </strong>
+          {filteredData.matchingNotes.length === 0 ? (
+            <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>
+              No notes match the active filters.
+            </span>
+          ) : (
+            <div className="report-notes-grid">
+              {filteredData.matchingNotes.map((n) => {
+                const noteClient = n.clientId
+                  ? directory.clients.find((c) => c.id === n.clientId)
+                  : undefined;
+                const noteProject = n.projectId
+                  ? directory.projects.find((p) => p.id === n.projectId)
+                  : undefined;
+                const noteLabels = getAllNoteLabels(n);
+                const notePeople = Array.from(
+                  new Set([
+                    ...n.participants,
+                    ...extractInlineMentions(n.body, directory.people),
+                  ])
+                );
+                const cleanPreview = stripMarkdownFormatting(n.body);
+                const snippet =
+                  cleanPreview.length > 200
+                    ? `${cleanPreview.slice(0, 200).trimEnd()}…`
+                    : cleanPreview;
+                const isActiveBelow = Boolean(activeEditorNoteId && activeEditorNoteId === n.id);
+
+                return (
+                  <div
+                    key={n.id}
+                    className={`report-note-card ${isActiveBelow ? 'is-active-origin' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => onOpenNote(n.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        onOpenNote(n.id);
+                      }
+                    }}
+                  >
+                    <div className="report-note-card-top">
+                      <div className="report-note-card-title-row">
+                        <FileText size={14} className="report-note-icon" />
+                        <span className="report-note-card-title">
+                          {n.title || 'Untitled Note'}
+                        </span>
+                        {isActiveBelow && (
+                          <span className="report-origin-badge" title="Currently open underneath this overlay">
+                            Current note
+                          </span>
+                        )}
+                      </div>
+                      <div className="report-note-card-meta">
+                        {noteClient ? (
+                          <span className="context-chip" style={{ cursor: 'pointer' }} onClick={(e) => {
+                            e.stopPropagation();
+                            setClientId(noteClient.id);
+                          }}>
+                            <span
+                              className="client-dot"
+                              style={{ background: noteClient.color }}
+                            />
+                            {noteClient.name}
+                            {noteProject ? ` · ${noteProject.name}` : ''}
+                          </span>
+                        ) : n.scope === 'internal' ? (
+                          <span className="context-chip" onClick={(e) => {
+                            e.stopPropagation();
+                            setClientId('__internal__');
+                          }}>
+                            Internal{noteProject ? ` · ${noteProject.name}` : ''}
+                          </span>
+                        ) : null}
+                        <span className="due-chip">{n.date}</span>
+                        <span className="report-note-open-hint no-print">
+                          <ExternalLink size={11} /> {embeddedInOverlay ? 'Preview' : 'Open'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {snippet && <div className="report-note-card-snippet">{snippet}</div>}
+
+                    {(noteLabels.length > 0 || notePeople.length > 0) && (
+                      <div className="report-note-card-pills">
+                        {notePeople.slice(0, 5).map((pName) => (
+                          <button
+                            key={`p-${pName}`}
+                            type="button"
+                            className="pill pill-person"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              applyPersonFilter(pName);
+                            }}
+                          >
+                            @{pName}
+                          </button>
+                        ))}
+                        {noteLabels.slice(0, 6).map((lbl) => (
+                          <button
+                            key={`l-${lbl}`}
+                            type="button"
+                            className="pill pill-label"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setLabelFilter(lbl);
+                            }}
+                          >
+                            #{lbl}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
 
         {/* Decisions Log Rollup */}
         <div className="surface-panel">
@@ -534,7 +721,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         <button
                           type="button"
                           className="pill pill-person"
-                          onClick={() => setPersonFilter(t.owner!)}
+                          onClick={() => applyPersonFilter(t.owner!)}
                         >
                           @{t.owner}
                         </button>

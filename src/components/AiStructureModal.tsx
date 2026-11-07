@@ -1,14 +1,28 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Code2, Copy, KeyRound, Loader2, ShieldCheck, Sparkles, X } from 'lucide-react';
+import {
+  Check,
+  Code2,
+  Copy,
+  KeyRound,
+  Loader2,
+  Maximize2,
+  PanelLeft,
+  Settings,
+  ShieldCheck,
+  Sparkles,
+  X,
+} from 'lucide-react';
 import type {
   AiConfig,
   AiProviderType,
   AiStructureProposal,
   Note,
   WorkspaceDirectory,
+  WorkspacePreferences,
 } from '../types';
 import { formatAiEngineLabel, generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
 import { serializeTaskLine } from '../utils/markdown';
+import { saveWorkspacePreferences } from '../utils/preferences';
 import { AiLoadingState } from './AiLoadingState';
 import { RichMarkdown } from './RichMarkdown';
 
@@ -334,12 +348,32 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
 
 interface AiSettingsModalProps {
   config: AiConfig;
+  preferences: WorkspacePreferences;
   onSave: (next: AiConfig) => void;
+  onSavePreferences: (next: WorkspacePreferences) => void;
   onClose: () => void;
 }
 
-export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({ config, onSave, onClose }) => {
+export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
+  config,
+  preferences,
+  onSave,
+  onSavePreferences,
+  onClose,
+}) => {
   const [draft, setDraft] = useState<AiConfig>(config);
+  const [draftPrefs, setDraftPrefs] = useState<WorkspacePreferences>(preferences);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
 
   const handleProviderSelect = (provider: AiProviderType) => {
     const defaultModel: Record<AiProviderType, string> = {
@@ -359,106 +393,193 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({ config, onSave
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card" style={{ maxWidth: 560 }} onClick={(e) => e.stopPropagation()}>
+      <div className="modal-card" style={{ maxWidth: 600 }} onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <ShieldCheck size={16} />
-            <strong>AI Engine &amp; Corporate Compliance Settings</strong>
+            <Settings size={16} />
+            <strong>Workspace &amp; AI Settings</strong>
           </div>
-          <button type="button" className="btn btn-icon btn-ghost" onClick={onClose}>
+          <button
+            type="button"
+            className="btn btn-icon btn-ghost"
+            onClick={onClose}
+            aria-label="Close settings"
+          >
             <X size={16} />
           </button>
         </div>
 
         <div className="modal-body">
-          <div
-            style={{
-              padding: '9px 12px',
-              borderRadius: 'var(--radius-sm)',
-              background: 'var(--bg-surface-subtle)',
-              border: '1px solid var(--border-subtle)',
-              fontSize: 12,
-              color: 'var(--text-secondary)',
-            }}
-          >
-            <strong>Local-Only Key Storage:</strong> API keys stay exclusively in this browser's{' '}
-            <code>localStorage</code> and are <strong>never</strong> written into synced OneDrive <code>.md</code> or{' '}
-            <code>.zip</code> files. When set to <em>Local Smart Engine</em>, zero note text leaves your laptop.
-          </div>
+          {/* Focus & Initial Startup Behavior */}
+          <div className="settings-section">
+            <div className="settings-section-title">
+              <Maximize2 size={13} />
+              <span>Focus Mode &amp; Initial Behavior</span>
+            </div>
 
-          <div className="form-field">
-            <label className="form-label">Provider</label>
-            <select
-              className="form-input"
-              value={draft.provider}
-              onChange={(e) => handleProviderSelect(e.target.value as AiProviderType)}
-            >
-              <option value="local">Local Smart Engine (Default — 100% Offline, Zero API Key)</option>
-              <option value="azure">Azure OpenAI Service (Corporate Approved Tenant)</option>
-              <option value="openai">OpenAI / Corporate OpenAI-Compatible Gateway</option>
-              <option value="gemini">Google Gemini API</option>
-              <option value="anthropic">Anthropic Claude API</option>
-            </select>
-          </div>
+            <div className="form-field">
+              <span className="form-label">Initial View (When Opening Home URL)</span>
+              <div className="settings-choice-grid" role="radiogroup" aria-label="Initial workspace view">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={draftPrefs.startupLayout === 'focus'}
+                  className={`settings-choice-card ${
+                    draftPrefs.startupLayout === 'focus' ? 'selected' : ''
+                  }`}
+                  onClick={() =>
+                    setDraftPrefs({ ...draftPrefs, startupLayout: 'focus' })
+                  }
+                >
+                  <div className="settings-choice-header">
+                    <Maximize2 size={14} />
+                    <span>Focus Mode</span>
+                    <span className="settings-default-pill">Default</span>
+                  </div>
+                  <span className="settings-choice-desc">
+                    Hide all side panels and open directly into a centered note.
+                  </span>
+                </button>
 
-          {draft.provider !== 'local' && (
-            <>
-              {(draft.provider === 'openai' || draft.provider === 'azure') && (
-                <div className="form-field">
-                  <label className="form-label">
-                    {draft.provider === 'azure'
-                      ? 'Azure Resource Endpoint (e.g., https://my-corp.openai.azure.com)'
-                      : 'Base URL (OpenAI or Internal Corporate Gateway)'}
-                  </label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={draft.baseUrl || ''}
-                    placeholder={
-                      draft.provider === 'azure'
-                        ? 'https://your-company.openai.azure.com'
-                        : 'https://api.openai.com/v1'
-                    }
-                    onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
-                  />
-                </div>
-              )}
-
-              {draft.provider === 'azure' ? (
-                <div className="form-field">
-                  <label className="form-label">Azure Deployment Name</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={draft.azureDeployment || ''}
-                    placeholder="gpt-4o"
-                    onChange={(e) => setDraft({ ...draft, azureDeployment: e.target.value })}
-                  />
-                </div>
-              ) : (
-                <div className="form-field">
-                  <label className="form-label">Model Name</label>
-                  <input
-                    type="text"
-                    className="form-input"
-                    value={draft.model}
-                    onChange={(e) => setDraft({ ...draft, model: e.target.value })}
-                  />
-                </div>
-              )}
-
-              <div className="form-field">
-                <label className="form-label">API Key</label>
-                <input
-                  type="password"
-                  className="form-input"
-                  placeholder="Paste approved API key…"
-                  value={draft.apiKey}
-                  onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
-                />
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={draftPrefs.startupLayout === 'standard'}
+                  className={`settings-choice-card ${
+                    draftPrefs.startupLayout === 'standard' ? 'selected' : ''
+                  }`}
+                  onClick={() =>
+                    setDraftPrefs({ ...draftPrefs, startupLayout: 'standard' })
+                  }
+                >
+                  <div className="settings-choice-header">
+                    <PanelLeft size={14} />
+                    <span>Standard Workspace</span>
+                  </div>
+                  <span className="settings-choice-desc">
+                    Show Left Navigation, Note List, and Context Radar on launch.
+                  </span>
+                </button>
               </div>
-            </>
-          )}
+            </div>
+
+            <label className="settings-toggle-row" htmlFor="pref-focus-on-new-note">
+              <input
+                id="pref-focus-on-new-note"
+                type="checkbox"
+                checked={draftPrefs.focusOnNewNote}
+                onChange={(e) =>
+                  setDraftPrefs({ ...draftPrefs, focusOnNewNote: e.target.checked })
+                }
+              />
+              <div className="settings-toggle-copy">
+                <span className="settings-toggle-label">
+                  Automatically enter Focus Mode when opening a new note
+                </span>
+                <span className="settings-toggle-desc">
+                  Centers the note and hides side panels whenever you spin up a new note (<code>Alt+N</code>). Press{' '}
+                  <code>Alt+Z</code> anytime to toggle panels.
+                </span>
+              </div>
+            </label>
+          </div>
+
+          {/* AI Engine & Corporate Compliance */}
+          <div className="settings-section">
+            <div className="settings-section-title">
+              <ShieldCheck size={13} />
+              <span>AI Engine &amp; Corporate Compliance</span>
+            </div>
+
+            <div
+              style={{
+                padding: '9px 12px',
+                borderRadius: 'var(--radius-sm)',
+                background: 'var(--bg-surface-subtle)',
+                border: '1px solid var(--border-subtle)',
+                fontSize: 12,
+                color: 'var(--text-secondary)',
+              }}
+            >
+              <strong>Local-Only Key Storage:</strong> API keys stay exclusively in this browser's{' '}
+              <code>localStorage</code> and are <strong>never</strong> written into synced OneDrive <code>.md</code> or{' '}
+              <code>.zip</code> files. When set to <em>Local Smart Engine</em>, zero note text leaves your laptop.
+            </div>
+
+            <div className="form-field">
+              <label className="form-label">Provider</label>
+              <select
+                className="form-input"
+                value={draft.provider}
+                onChange={(e) => handleProviderSelect(e.target.value as AiProviderType)}
+              >
+                <option value="local">Local Smart Engine (Default — 100% Offline, Zero API Key)</option>
+                <option value="azure">Azure OpenAI Service (Corporate Approved Tenant)</option>
+                <option value="openai">OpenAI / Corporate OpenAI-Compatible Gateway</option>
+                <option value="gemini">Google Gemini API</option>
+                <option value="anthropic">Anthropic Claude API</option>
+              </select>
+            </div>
+
+            {draft.provider !== 'local' && (
+              <>
+                {(draft.provider === 'openai' || draft.provider === 'azure') && (
+                  <div className="form-field">
+                    <label className="form-label">
+                      {draft.provider === 'azure'
+                        ? 'Azure Resource Endpoint (e.g., https://my-corp.openai.azure.com)'
+                        : 'Base URL (OpenAI or Internal Corporate Gateway)'}
+                    </label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={draft.baseUrl || ''}
+                      placeholder={
+                        draft.provider === 'azure'
+                          ? 'https://your-company.openai.azure.com'
+                          : 'https://api.openai.com/v1'
+                      }
+                      onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
+                    />
+                  </div>
+                )}
+
+                {draft.provider === 'azure' ? (
+                  <div className="form-field">
+                    <label className="form-label">Azure Deployment Name</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={draft.azureDeployment || ''}
+                      placeholder="gpt-4o"
+                      onChange={(e) => setDraft({ ...draft, azureDeployment: e.target.value })}
+                    />
+                  </div>
+                ) : (
+                  <div className="form-field">
+                    <label className="form-label">Model Name</label>
+                    <input
+                      type="text"
+                      className="form-input"
+                      value={draft.model}
+                      onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                    />
+                  </div>
+                )}
+
+                <div className="form-field">
+                  <label className="form-label">API Key</label>
+                  <input
+                    type="password"
+                    className="form-input"
+                    placeholder="Paste approved API key…"
+                    value={draft.apiKey}
+                    onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
+                  />
+                </div>
+              </>
+            )}
+          </div>
         </div>
 
         <div className="modal-footer">
@@ -469,12 +590,14 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({ config, onSave
             type="button"
             className="btn btn-primary"
             onClick={() => {
+              saveWorkspacePreferences(draftPrefs);
+              onSavePreferences(draftPrefs);
               saveAiConfig(draft);
               onSave(draft);
               onClose();
             }}
           >
-            Save AI Configuration
+            Save Settings
           </button>
         </div>
       </div>

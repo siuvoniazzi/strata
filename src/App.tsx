@@ -20,6 +20,7 @@ import {
   Plus,
   RotateCcw,
   Search,
+  Settings,
   Sun,
   Trash2,
   Upload,
@@ -36,6 +37,11 @@ import {
 } from './components/DirectoryViews';
 import { HybridEditor } from './components/HybridEditor';
 import { ReportsView } from './components/ReportsView';
+import {
+  WorkspaceOverlay,
+  isSameOverlayEntry,
+  type OverlayEntry,
+} from './components/WorkspaceOverlay';
 import type {
   ActiveMainView,
   AiConfig,
@@ -49,6 +55,7 @@ import type {
   Project,
   TaskStatus,
   WorkspaceDirectory,
+  WorkspacePreferences,
 } from './types';
 import {
   getAiActivitySnapshot,
@@ -56,6 +63,7 @@ import {
   subscribeAiActivity,
 } from './utils/aiProvider';
 import { hydrateImagesFromIdb } from './utils/imageStore';
+import { loadWorkspacePreferences } from './utils/preferences';
 import {
   computeNoteFilePath,
   deleteDecisionFromBody,
@@ -117,7 +125,9 @@ function makeFreshNote(partial?: Partial<Note>): Note {
 
 export function App() {
   const seed = useMemo(() => createSeedWorkspace(), []);
+  const initialPrefs = useMemo(() => loadWorkspacePreferences(), []);
 
+  const [preferences, setPreferences] = useState<WorkspacePreferences>(initialPrefs);
   const [notes, setNotes] = useState<Note[]>(seed.notes);
   const [directory, setDirectory] = useState<WorkspaceDirectory>(seed.directory);
   const [activeNoteId, setActiveNoteId] = useState<string>(seed.notes[0]?.id || '');
@@ -130,17 +140,22 @@ export function App() {
     clientId?: string;
     person?: string;
   }>({});
+  const [overlayStack, setOverlayStack] = useState<OverlayEntry[]>([]);
 
   const [isMobile, setIsMobile] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth <= 860 : false
   );
-  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
-    typeof window !== 'undefined' ? window.innerWidth > 860 : true
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    if (initialPrefs.startupLayout === 'focus') return false;
+    return typeof window !== 'undefined' ? window.innerWidth > 860 : true;
+  });
+  const [noteListOpen, setNoteListOpen] = useState<boolean>(
+    () => initialPrefs.startupLayout !== 'focus'
   );
-  const [noteListOpen, setNoteListOpen] = useState(true);
-  const [radarOpen, setRadarOpen] = useState<boolean>(() =>
-    typeof window !== 'undefined' ? window.innerWidth > 1180 : true
-  );
+  const [radarOpen, setRadarOpen] = useState<boolean>(() => {
+    if (initialPrefs.startupLayout === 'focus') return false;
+    return typeof window !== 'undefined' ? window.innerWidth > 1180 : true;
+  });
   const [mobileNotesPane, setMobileNotesPane] = useState<'list' | 'editor'>('editor');
   const [radarRequestedTab, setRadarRequestedTab] = useState<'context' | 'ask' | 'outline' | null>(null);
   const prevPanelsRef = useRef<{ sidebar: boolean; noteList: boolean; radar: boolean } | null>(null);
@@ -211,8 +226,6 @@ export function App() {
       if (e.matches) {
         setSidebarOpen(false);
         setRadarOpen(false);
-      } else {
-        setSidebarOpen(true);
       }
     };
     mq.addEventListener('change', onChange);
@@ -261,6 +274,7 @@ export function App() {
         ]);
 
         if (!mounted) return;
+        const startupMode = loadWorkspacePreferences().startupLayout;
 
         if (savedNotes && savedDir) {
           if (!demoPurgedV2) {
@@ -269,6 +283,7 @@ export function App() {
             setDirectory(purged.directory);
             setActiveNoteId(purged.notes[0]?.id || '');
             if (
+              startupMode === 'standard' &&
               typeof window !== 'undefined' &&
               window.innerWidth <= 860 &&
               (purged.notes.length > 1 || purged.notes[0]?.title.trim() || purged.notes[0]?.body.trim())
@@ -294,6 +309,7 @@ export function App() {
             setDirectory(savedDir);
             setActiveNoteId(hydratedNotes[0].id);
             if (
+              startupMode === 'standard' &&
               typeof window !== 'undefined' &&
               window.innerWidth <= 860 &&
               (hydratedNotes.length > 1 ||
@@ -369,7 +385,26 @@ export function App() {
     }
   }, [undoSnapshot, dirHandle, dirPermission]);
 
+  const openOverlay = useCallback((entry: OverlayEntry) => {
+    setOverlayStack([entry]);
+  }, []);
+
+  const pushOverlay = useCallback((entry: OverlayEntry) => {
+    setOverlayStack((prev) =>
+      isSameOverlayEntry(prev[prev.length - 1], entry) ? prev : [...prev, entry]
+    );
+  }, []);
+
+  const popOverlay = useCallback(() => {
+    setOverlayStack((prev) => (prev.length > 1 ? prev.slice(0, -1) : []));
+  }, []);
+
+  const closeOverlay = useCallback(() => {
+    setOverlayStack([]);
+  }, []);
+
   const openNoteEditor = useCallback((id: string) => {
+    setOverlayStack([]);
     setActiveNoteId(id);
     setMainView('notes');
     setMobileNotesPane('editor');
@@ -380,6 +415,7 @@ export function App() {
   }, []);
 
   const applyNotesFilter = useCallback((nextFilter: NoteFilter) => {
+    setOverlayStack([]);
     setMainView('notes');
     setNoteFilter(nextFilter);
     setNoteListOpen(true);
@@ -391,12 +427,38 @@ export function App() {
   }, []);
 
   const switchPrimaryView = useCallback((view: ActiveMainView) => {
+    setOverlayStack([]);
     setMainView(view);
     if (typeof window !== 'undefined' && window.innerWidth <= 860) {
       setSidebarOpen(false);
       setRadarOpen(false);
     }
   }, []);
+
+  const openNewNoteInEditor = useCallback(
+    (id: string) => {
+      setOverlayStack([]);
+      setActiveNoteId(id);
+      setMainView('notes');
+      setMobileNotesPane('editor');
+      if (preferences.focusOnNewNote) {
+        if (sidebarOpen || noteListOpen || radarOpen) {
+          prevPanelsRef.current = {
+            sidebar: sidebarOpen,
+            noteList: noteListOpen,
+            radar: radarOpen,
+          };
+        }
+        setSidebarOpen(false);
+        setNoteListOpen(false);
+        setRadarOpen(false);
+      } else if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+        setSidebarOpen(false);
+        setRadarOpen(false);
+      }
+    },
+    [preferences.focusOnNewNote, sidebarOpen, noteListOpen, radarOpen]
+  );
 
   // Global keyboard shortcuts: Ctrl/Cmd+K (Command Palette), Alt+N (Instant New Note)
   const handleSpinUpNote = useCallback(() => {
@@ -416,17 +478,11 @@ export function App() {
     });
 
     setNotes((prev) => [fresh, ...prev]);
-    setActiveNoteId(fresh.id);
-    setMainView('notes');
-    setMobileNotesPane('editor');
-    if (typeof window !== 'undefined' && window.innerWidth <= 860) {
-      setSidebarOpen(false);
-      setRadarOpen(false);
-    }
+    openNewNoteInEditor(fresh.id);
     setTimeout(() => {
       document.getElementById('note-title-input')?.focus();
     }, 30);
-  }, [noteFilter]);
+  }, [noteFilter, openNewNoteInEditor]);
 
   const isFocusMode =
     mainView === 'notes' &&
@@ -508,10 +564,43 @@ export function App() {
           projectId: activeNote.projectId,
         });
         setNotes((prev) => [created, ...prev]);
-        openNoteEditor(created.id);
+        openNewNoteInEditor(created.id);
       }
     },
-    [notes, activeNote.scope, activeNote.clientId, activeNote.projectId, openNoteEditor]
+    [notes, activeNote.scope, activeNote.clientId, activeNote.projectId, openNoteEditor, openNewNoteInEditor]
+  );
+
+  const handlePeekOrCreateNoteByTitle = useCallback(
+    (targetTitle: string) => {
+      const found = notes.find(
+        (x) => x.title.toLowerCase() === targetTitle.toLowerCase()
+      );
+      if (found) {
+        if (found.id === activeNote.id) {
+          setOverlayStack([]);
+        } else {
+          const entry: OverlayEntry = { kind: 'note', noteId: found.id };
+          setOverlayStack((prev) =>
+            prev.length > 0
+              ? isSameOverlayEntry(prev[prev.length - 1], entry)
+                ? prev
+                : [...prev, entry]
+              : [entry]
+          );
+        }
+      } else {
+        const created = makeFreshNote({
+          title: targetTitle,
+          scope: activeNote.scope,
+          clientId: activeNote.clientId,
+          projectId: activeNote.projectId,
+        });
+        setNotes((prev) => [created, ...prev]);
+        const entry: OverlayEntry = { kind: 'note', noteId: created.id };
+        setOverlayStack((prev) => (prev.length > 0 ? [...prev, entry] : [entry]));
+      }
+    },
+    [notes, activeNote.id, activeNote.scope, activeNote.clientId, activeNote.projectId]
   );
 
   const allWorkspaceLabels = useMemo(() => {
@@ -956,6 +1045,7 @@ export function App() {
       people: [],
       customLabels: [],
     };
+    setOverlayStack([]);
     setNotes([fresh]);
     setDirectory(emptyDir);
     setActiveNoteId(fresh.id);
@@ -968,6 +1058,7 @@ export function App() {
     !sidebarOpen ? 'sidebar-collapsed' : '',
     mainView !== 'notes' || !radarOpen ? 'radar-collapsed' : '',
     isFocusMode ? 'focus-mode' : '',
+    mainView === 'notes' && overlayStack.length > 0 ? 'has-workspace-overlay' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -1518,8 +1609,12 @@ export function App() {
                       className="pill pill-label"
                       onClick={() => applyNotesFilter({ kind: 'label', label: lbl })}
                       onDoubleClick={() => {
-                        setReportInitialFilter({ label: lbl });
-                        switchPrimaryView('reports');
+                        if (mainView === 'notes') {
+                          openOverlay({ kind: 'report', label: lbl });
+                        } else {
+                          setReportInitialFilter({ label: lbl });
+                          switchPrimaryView('reports');
+                        }
                       }}
                       title="Click to filter notes · Double-click to open Topic Report"
                     >
@@ -1680,10 +1775,18 @@ export function App() {
                   type="button"
                   className={`btn btn-icon ${aiActivity.isBusy ? 'ai-pill-busy' : 'btn-ghost'}`}
                   onClick={() => setShowAiSettings(true)}
-                  title={aiActivity.isBusy ? `${aiActivity.label} (${aiActivity.providerLabel})` : 'Configure AI Engine'}
-                  aria-label={aiActivity.isBusy ? aiActivity.label || 'AI request in progress' : 'Configure AI Engine'}
+                  title={
+                    aiActivity.isBusy
+                      ? `${aiActivity.label} (${aiActivity.providerLabel})`
+                      : 'Workspace & AI Settings'
+                  }
+                  aria-label={
+                    aiActivity.isBusy
+                      ? aiActivity.label || 'AI request in progress'
+                      : 'Workspace & AI Settings'
+                  }
                 >
-                  {aiActivity.isBusy ? <Loader2 size={15} className="ai-spin" /> : <KeyRound size={15} />}
+                  {aiActivity.isBusy ? <Loader2 size={15} className="ai-spin" /> : <Settings size={16} />}
                 </button>
 
                 <button
@@ -1731,6 +1834,17 @@ export function App() {
               </div>
 
               <div className="topbar-right">
+                {!sidebarOpen && (
+                  <button
+                    type="button"
+                    className="btn btn-xs btn-primary"
+                    onClick={handleSpinUpNote}
+                    title="Spin up a fresh note immediately (Alt+N)"
+                  >
+                    <FilePlus2 size={12} /> New Note <span className="kbd" style={{ background: 'rgba(255,255,255,0.2)', color: '#fff', borderColor: 'transparent' }}>Alt+N</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   className="btn btn-xs"
@@ -1746,7 +1860,7 @@ export function App() {
                   title={
                     aiActivity.isBusy
                       ? `${aiActivity.label} (${aiActivity.providerLabel})`
-                      : 'Configure AI Provider (Local Smart Engine, Azure OpenAI, Gemini, OpenAI, Anthropic)'
+                      : 'Configure AI Provider & Workspace Settings'
                   }
                 >
                   {aiActivity.isBusy ? (
@@ -1760,6 +1874,17 @@ export function App() {
                       {aiConfig.provider === 'local' ? 'AI: Local' : `AI: ${aiConfig.provider.toUpperCase()}`}
                     </>
                   )}
+                </button>
+
+                <button
+                  id="btn-workspace-settings"
+                  type="button"
+                  className="btn btn-icon btn-ghost"
+                  onClick={() => setShowAiSettings(true)}
+                  title="Workspace & Initial Focus Mode Settings"
+                  aria-label="Workspace Settings"
+                >
+                  <Settings size={15} />
                 </button>
 
                 <button
@@ -1845,10 +1970,9 @@ export function App() {
                           <button
                             type="button"
                             className="btn btn-xs btn-soft"
-                            onClick={() => {
-                              setReportInitialFilter({ label: noteFilter.label });
-                              switchPrimaryView('reports');
-                            }}
+                            onClick={() =>
+                              openOverlay({ kind: 'report', label: noteFilter.label })
+                            }
                           >
                             Topic Report
                           </button>
@@ -1942,12 +2066,9 @@ export function App() {
               onAddClient={(name) => handleAddClient(name)}
               onAddProject={handleAddProject}
               onEnsurePerson={handleEnsurePerson}
-              onNavigateLabel={(lbl) => {
-                setReportInitialFilter({ label: lbl });
-                switchPrimaryView('reports');
-              }}
-              onNavigatePerson={(pName) => applyNotesFilter({ kind: 'person', personName: pName })}
-              onNavigateOrCreateNoteByTitle={handleOpenOrCreateNoteByTitle}
+              onNavigateLabel={(lbl) => openOverlay({ kind: 'report', label: lbl })}
+              onNavigatePerson={(pName) => openOverlay({ kind: 'report', person: pName })}
+              onNavigateOrCreateNoteByTitle={handlePeekOrCreateNoteByTitle}
               onOpenAiStructure={() => setShowAiStructure(true)}
               onOpenQuickAsk={() => {
                 setSidebarOpen(false);
@@ -1987,7 +2108,7 @@ export function App() {
                 labels: ['report'],
               });
               setNotes((prev) => [saved, ...prev]);
-              openNoteEditor(saved.id);
+              openNewNoteInEditor(saved.id);
             }}
           />
         )}
@@ -2161,12 +2282,55 @@ export function App() {
             });
             if (isMobile) setRadarOpen(false);
           }}
-          onOpenNote={openNoteEditor}
-          onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
-          onSelectPerson={(pName) => applyNotesFilter({ kind: 'person', personName: pName })}
-          onSelectLabel={(lbl) => applyNotesFilter({ kind: 'label', label: lbl })}
+          onOpenNote={(nId) => {
+            if (nId !== activeNote.id) {
+              openOverlay({ kind: 'note', noteId: nId });
+            }
+          }}
+          onOpenNoteByTitle={handlePeekOrCreateNoteByTitle}
+          onSelectPerson={(pName) => openOverlay({ kind: 'report', person: pName })}
+          onSelectLabel={(lbl) => openOverlay({ kind: 'report', label: lbl })}
           onToggleRemoteTaskStatus={handleUpdateRemoteTaskStatus}
           onCollapse={() => setRadarOpen(false)}
+        />
+      )}
+
+      {/* Dismissible Note Context Overlay (#topic reports, @person dossiers/notes, [[Note]] previews) */}
+      {mainView === 'notes' && overlayStack.length > 0 && (
+        <WorkspaceOverlay
+          stack={overlayStack}
+          originNoteId={activeNote.id}
+          originNoteTitle={activeNote.title}
+          notes={notes}
+          directory={directory}
+          allLabels={allWorkspaceLabels}
+          aiConfig={aiConfig}
+          suspendEscape={showCommandPalette || showAiStructure || showAiSettings}
+          onBack={popOverlay}
+          onClose={closeOverlay}
+          onPushEntry={pushOverlay}
+          onOpenNoteInEditor={openNoteEditor}
+          onOpenOrPeekNoteByTitle={handlePeekOrCreateNoteByTitle}
+          onOpenFullReportsView={(filter) => {
+            setReportInitialFilter(filter);
+            switchPrimaryView('reports');
+          }}
+          onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
+          onDeleteTask={handleDeleteRemoteTask}
+          onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
+          onDeleteDecision={handleDeleteRemoteDecision}
+          onSaveBriefAsNote={(title, body, cId, pId) => {
+            const saved = makeFreshNote({
+              title,
+              body,
+              scope: cId ? 'client' : 'internal',
+              clientId: cId,
+              projectId: pId,
+              labels: ['report'],
+            });
+            setNotes((prev) => [saved, ...prev]);
+            pushOverlay({ kind: 'note', noteId: saved.id });
+          }}
         />
       )}
 
@@ -2214,7 +2378,32 @@ export function App() {
       {showAiSettings && (
         <AiSettingsModal
           config={aiConfig}
+          preferences={preferences}
           onSave={setAiConfig}
+          onSavePreferences={(nextPrefs) => {
+            const layoutChanged = nextPrefs.startupLayout !== preferences.startupLayout;
+            setPreferences(nextPrefs);
+            if (layoutChanged) {
+              if (nextPrefs.startupLayout === 'focus') {
+                if (sidebarOpen || noteListOpen || radarOpen) {
+                  prevPanelsRef.current = {
+                    sidebar: sidebarOpen,
+                    noteList: noteListOpen,
+                    radar: radarOpen,
+                  };
+                }
+                setMainView('notes');
+                setMobileNotesPane('editor');
+                setSidebarOpen(false);
+                setNoteListOpen(false);
+                setRadarOpen(false);
+              } else {
+                setSidebarOpen(typeof window !== 'undefined' ? window.innerWidth > 860 : true);
+                setNoteListOpen(true);
+                setRadarOpen(typeof window !== 'undefined' ? window.innerWidth > 1180 : true);
+              }
+            }
+          }}
           onClose={() => setShowAiSettings(false)}
         />
       )}
@@ -2229,13 +2418,24 @@ export function App() {
           onClose={() => setShowCommandPalette(false)}
           onNewNote={handleSpinUpNote}
           onToggleFocusMode={handleToggleFocusMode}
+          onOpenSettings={() => setShowAiSettings(true)}
           onDeleteCurrentNote={() => handleDeleteNote(activeNote.id)}
           onSelectNote={openNoteEditor}
           onOpenReportForLabel={(lbl) => {
-            setReportInitialFilter({ label: lbl });
-            switchPrimaryView('reports');
+            if (mainView === 'notes') {
+              openOverlay({ kind: 'report', label: lbl });
+            } else {
+              setReportInitialFilter({ label: lbl });
+              switchPrimaryView('reports');
+            }
           }}
-          onOpenPersonNotes={(name) => applyNotesFilter({ kind: 'person', personName: name })}
+          onOpenPersonNotes={(name) => {
+            if (mainView === 'notes') {
+              openOverlay({ kind: 'report', person: name });
+            } else {
+              applyNotesFilter({ kind: 'person', personName: name });
+            }
+          }}
           onSwitchMainView={switchPrimaryView}
           onTriggerAiStructure={() => {
             switchPrimaryView('notes');

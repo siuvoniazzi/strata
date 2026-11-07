@@ -11,6 +11,7 @@ import {
   Minimize2,
   Moon,
   Search,
+  Settings,
   Sparkles,
   Sun,
   Trash2,
@@ -28,6 +29,7 @@ interface CommandPaletteProps {
   onClose: () => void;
   onNewNote: () => void;
   onToggleFocusMode?: () => void;
+  onOpenSettings?: () => void;
   onDeleteCurrentNote: () => void;
   onSelectNote: (noteId: string) => void;
   onOpenReportForLabel: (label: string) => void;
@@ -47,6 +49,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onClose,
   onNewNote,
   onToggleFocusMode,
+  onOpenSettings,
   onDeleteCurrentNote,
   onSelectNote,
   onOpenReportForLabel,
@@ -143,6 +146,17 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         icon: theme === 'light' ? <Moon size={14} /> : <Sun size={14} />,
         action: onToggleTheme,
       },
+      ...(onOpenSettings
+        ? [
+            {
+              id: 'act-workspace-settings',
+              title: 'Workspace & AI Settings (Initial Focus Mode, New-Note Behavior, AI Engine)',
+              category: 'Settings',
+              icon: <Settings size={14} />,
+              action: onOpenSettings,
+            },
+          ]
+        : []),
     ];
 
     for (const n of notes) {
@@ -189,6 +203,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     isFocusMode,
     onNewNote,
     onToggleFocusMode,
+    onOpenSettings,
     onDeleteCurrentNote,
     onTriggerAiStructure,
     onSwitchMainView,
