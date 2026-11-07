@@ -1,14 +1,13 @@
-import type { DecisionStatus, Person, TaskStatus } from '../types';
+import type { Person, TaskStatus } from '../types';
 import { registerDataUrlAssetSync, resolveImageSrc } from './imageStore';
-import { formatPersonMention, resolveKnownPersonName } from './markdown';
-
-const STATUS_CHAR_TO_TASK: Record<string, TaskStatus> = {
-  ' ': 'todo',
-  '/': 'doing',
-  '?': 'waiting',
-  x: 'done',
-  X: 'done',
-};
+import {
+  formatPersonMention,
+  matchDecisionLine,
+  matchRationaleLine,
+  matchTaskLine,
+  normalizeDecisionStatus,
+  resolveKnownPersonName,
+} from './markdown';
 
 const TASK_TO_STATUS_CHAR: Record<string, string> = {
   todo: ' ',
@@ -238,15 +237,19 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     return '<p><br></p>';
   }
 
-  const lines = markdown.split('\n');
+  const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
   const htmlBlocks: string[] = [];
   let i = 0;
 
   const isBulletLine = (line: string) =>
-    /^\s*[-*•]\s+(.*)$/.test(line) &&
-    !/^\s*[-*]\s*\[(?:[ /?xX]|D(?::[a-z]+)?)\](?:\s|$)/i.test(line);
+    /^\s*[-*+•]\s+(.*)$/.test(line) &&
+    !matchDecisionLine(line) &&
+    !matchTaskLine(line);
 
-  const isOrderedLine = (line: string) => /^\s*\d+\.\s+(.*)$/.test(line);
+  const isOrderedLine = (line: string) =>
+    /^\s*\d+[.)]\s+(.*)$/.test(line) &&
+    !matchDecisionLine(line) &&
+    !matchTaskLine(line);
 
   while (i < lines.length) {
     const line = lines[i];
@@ -267,16 +270,16 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     }
 
     // 1. Decision block (+ optional indented Rationale sub-line)
-    const decMatch = line.match(/^\s*[-*]\s*\[D(?::(agreed|proposed|superseded))?\](?:\s+(.*))?$/i);
+    const decMatch = matchDecisionLine(line);
     if (decMatch) {
-      const status = ((decMatch[1] || 'agreed').toLowerCase() as DecisionStatus);
-      const inner = renderBlockInlineHtml(decMatch[2] || '', knownPeople);
+      const status = decMatch.status;
+      const inner = renderBlockInlineHtml(decMatch.text || '', knownPeople);
       htmlBlocks.push(`<p class="doc-decision" data-status="${status}">${inner || '<br>'}</p>`);
 
       if (i + 1 < lines.length) {
-        const ratMatch = lines[i + 1].match(/^\s*>\s*(?:Rationale:\s*)?(.*)$/i);
-        if (ratMatch) {
-          const ratInner = renderBlockInlineHtml(ratMatch[1] || '', knownPeople);
+        const ratText = matchRationaleLine(lines[i + 1]);
+        if (ratText !== null) {
+          const ratInner = renderBlockInlineHtml(ratText, knownPeople);
           htmlBlocks.push(`<blockquote class="doc-rationale">${ratInner || '<br>'}</blockquote>`);
           i += 2;
           continue;
@@ -286,11 +289,11 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       continue;
     }
 
-    // 2. Task block (- [ ] / - [/] / - [?] / - [x])
-    const taskMatch = line.match(/^\s*[-*]\s*\[([ /?xX])\](?:\s+(.*))?$/);
+    // 2. Task block (- [ ] / - [/] / - [?] / - [x], including double-bulleted variants)
+    const taskMatch = matchTaskLine(line);
     if (taskMatch) {
-      const status = STATUS_CHAR_TO_TASK[taskMatch[1]] || 'todo';
-      const inner = renderBlockInlineHtml(taskMatch[2] || '', knownPeople);
+      const status = taskMatch.status;
+      const inner = renderBlockInlineHtml(taskMatch.text || '', knownPeople);
       htmlBlocks.push(`<p class="doc-task" data-status="${status}">${inner || '<br>'}</p>`);
       i++;
       continue;
@@ -300,7 +303,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     if (isBulletLine(line)) {
       const items: string[] = [];
       while (i < lines.length && isBulletLine(lines[i])) {
-        const m = lines[i].match(/^\s*[-*•]\s+(.*)$/);
+        const m = lines[i].match(/^\s*[-*+•]\s+(.*)$/);
         const itemHtml = renderBlockInlineHtml(m ? m[1] : '', knownPeople);
         items.push(`<li>${itemHtml || '<br>'}</li>`);
         i++;
@@ -313,7 +316,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     if (isOrderedLine(line)) {
       const items: string[] = [];
       while (i < lines.length && isOrderedLine(lines[i])) {
-        const m = lines[i].match(/^\s*\d+\.\s+(.*)$/);
+        const m = lines[i].match(/^\s*\d+[.)]\s+(.*)$/);
         const itemHtml = renderBlockInlineHtml(m ? m[1] : '', knownPeople);
         items.push(`<li>${itemHtml || '<br>'}</li>`);
         i++;
@@ -323,7 +326,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     }
 
     // 5. Headings
-    const h3Match = line.match(/^#{3,6}\s+(.*)$/);
+    const h3Match = line.match(/^\s*#{3,6}\s+(.*)$/);
     if (h3Match) {
       const inner = renderBlockInlineHtml(h3Match[1], knownPeople);
       htmlBlocks.push(`<h3>${inner || '<br>'}</h3>`);
@@ -331,7 +334,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       continue;
     }
 
-    const h2Match = line.match(/^##\s+(.*)$/);
+    const h2Match = line.match(/^\s*##\s+(.*)$/);
     if (h2Match) {
       const inner = renderBlockInlineHtml(h2Match[1], knownPeople);
       htmlBlocks.push(`<h2>${inner || '<br>'}</h2>`);
@@ -339,7 +342,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       continue;
     }
 
-    const h1Match = line.match(/^#\s+(.*)$/);
+    const h1Match = line.match(/^\s*#\s+(.*)$/);
     if (h1Match) {
       const inner = renderBlockInlineHtml(h1Match[1], knownPeople);
       htmlBlocks.push(`<h1>${inner || '<br>'}</h1>`);
@@ -509,11 +512,23 @@ function hasNestedBlockElements(el: HTMLElement): boolean {
 export function domToMarkdown(root: HTMLElement): string {
   const lines: string[] = [];
 
+  const serializeListItemOrParagraph = (raw: string, listPrefix?: string): string => {
+    const dec = matchDecisionLine(raw);
+    if (dec && dec.text) {
+      return `- [D:${dec.status}] ${dec.text}`;
+    }
+    const task = matchTaskLine(raw);
+    if (task && task.text) {
+      return `- [${task.statusChar}] ${task.text}`;
+    }
+    return listPrefix ? `${listPrefix}${raw}` : raw;
+  };
+
   const walkContainer = (container: HTMLElement) => {
     let inlineBuffer = '';
     const flushInlineBuffer = () => {
       if (inlineBuffer) {
-        lines.push(inlineBuffer);
+        lines.push(serializeListItemOrParagraph(inlineBuffer));
         inlineBuffer = '';
       }
     };
@@ -552,7 +567,7 @@ export function domToMarkdown(root: HTMLElement): string {
       if (tag === 'UL') {
         Array.from(el.children).forEach((child) => {
           if (child.tagName.toUpperCase() === 'LI') {
-            lines.push(`- ${serializeInlineChildren(child)}`);
+            lines.push(serializeListItemOrParagraph(serializeInlineChildren(child), '- '));
           }
         });
         return;
@@ -562,7 +577,7 @@ export function domToMarkdown(root: HTMLElement): string {
         let num = 1;
         Array.from(el.children).forEach((child) => {
           if (child.tagName.toUpperCase() === 'LI') {
-            lines.push(`${num++}. ${serializeInlineChildren(child)}`);
+            lines.push(serializeListItemOrParagraph(serializeInlineChildren(child), `${num++}. `));
           }
         });
         return;
@@ -602,13 +617,17 @@ export function domToMarkdown(root: HTMLElement): string {
       if (el.classList.contains('doc-task')) {
         const status = el.getAttribute('data-status') || 'todo';
         const char = TASK_TO_STATUS_CHAR[status] || ' ';
-        lines.push(`- [${char}] ${serializeInlineChildren(el)}`);
+        const inner = serializeInlineChildren(el);
+        const stripped = matchTaskLine(inner);
+        lines.push(`- [${char}] ${stripped && stripped.text ? stripped.text : inner}`);
         return;
       }
 
       if (el.classList.contains('doc-decision')) {
-        const status = el.getAttribute('data-status') || 'agreed';
-        lines.push(`- [D:${status}] ${serializeInlineChildren(el)}`);
+        const status = normalizeDecisionStatus(el.getAttribute('data-status'));
+        const inner = serializeInlineChildren(el);
+        const stripped = matchDecisionLine(inner);
+        lines.push(`- [D:${status}] ${stripped && stripped.text ? stripped.text : inner}`);
         return;
       }
 
@@ -617,7 +636,7 @@ export function domToMarkdown(root: HTMLElement): string {
         return;
       }
 
-      lines.push(serializeInlineChildren(el));
+      lines.push(serializeListItemOrParagraph(serializeInlineChildren(el)));
     });
 
     flushInlineBuffer();
@@ -647,8 +666,8 @@ function isSafePastedImageSrc(src: string): boolean {
 }
 
 /**
- * Sanitizes pasted rich HTML (e.g., from Word, Outlook, Teams, or Docs) into clean Strata HTML
- * without inline font/background styles.
+ * Sanitizes pasted rich HTML (e.g., from Word, Outlook, Teams, Copilot, ChatGPT, or Docs) into clean Strata HTML
+ * without inline font/background styles, promoting any task/decision list items or paragraphs into rich blocks.
  */
 export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []): string {
   const parser = new DOMParser();
@@ -662,7 +681,7 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
     const el = node as HTMLElement;
     const tag = el.tagName.toUpperCase();
 
-    if (tag === 'STYLE' || tag === 'SCRIPT' || tag === 'META') return '';
+    if (tag === 'STYLE' || tag === 'SCRIPT' || tag === 'META' || tag === 'INPUT') return '';
     if (tag === 'BR') return '<br>';
     if (tag === 'IMG') return '';
 
@@ -675,11 +694,48 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
       inner += cleanInline(c);
     });
 
-    if (tag === 'STRONG' || tag === 'B') return `<strong>${inner}</strong>`;
-    if (tag === 'EM' || tag === 'I') return `<em>${inner}</em>`;
-    if (tag === 'S' || tag === 'STRIKE' || tag === 'DEL') return `<s>${inner}</s>`;
-    if (tag === 'CODE') return `<code>${inner}</code>`;
+    if (tag === 'STRONG' || tag === 'B') return inner ? `<strong>${inner}</strong>` : '';
+    if (tag === 'EM' || tag === 'I') return inner ? `<em>${inner}</em>` : '';
+    if (tag === 'S' || tag === 'STRIKE' || tag === 'DEL') return inner ? `<s>${inner}</s>` : '';
+    if (tag === 'CODE') return inner ? `<code>${inner}</code>` : '';
     return inner;
+  };
+
+  const stripLeadingMarkerFromClone = (
+    sourceEl: HTMLElement,
+    kind: 'decision' | 'task' | 'rationale'
+  ): HTMLElement => {
+    const clone = sourceEl.cloneNode(true) as HTMLElement;
+    clone.querySelectorAll('input[type="checkbox"]').forEach((inp) => inp.remove());
+    const fullText = (clone.textContent || '').replace(/\u00A0/g, ' ');
+    const prefixRegex =
+      kind === 'decision'
+        ? /^\s*(?:(?:[-*+•]|\d+[.)])\s*)*(?:\[[ /?xX]?\]\s*)?[*_`]{0,2}\[D(?::[a-zA-ZäöüÄÖÜß_-]+)?\][*_`]{0,2}\s*/i
+        : kind === 'task'
+        ? /^\s*(?:(?:[-*+•]|\d+[.)])\s*)*[*_`]{0,2}\[[ /?xX]?\][*_`]{0,2}\s*/
+        : /^\s*(?:[-*+•]\s*)?>\s*(?:(?:Rationale|Begründung|Reason)\s*:\s*)?/i;
+    const m = fullText.match(prefixRegex);
+    if (m && m[0].length > 0) {
+      let toStrip = m[0].length;
+      const walker = doc.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+      const textNodes: Text[] = [];
+      let curr: Node | null;
+      while ((curr = walker.nextNode())) {
+        textNodes.push(curr as Text);
+      }
+      for (const tn of textNodes) {
+        if (toStrip <= 0) break;
+        const val = (tn.nodeValue || '').replace(/\u00A0/g, ' ');
+        if (val.length <= toStrip) {
+          toStrip -= val.length;
+          tn.nodeValue = '';
+        } else {
+          tn.nodeValue = val.slice(toStrip);
+          toStrip = 0;
+        }
+      }
+    }
+    return clone;
   };
 
   const outBlocks: string[] = [];
@@ -692,11 +748,66 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
     outBlocks.push(buildImageBlockHtml({ src: rawSrc, alt, width }));
   };
 
+  const tryBuildSpecialBlockFromElement = (el: HTMLElement): string | null => {
+    const rawText = (el.textContent || '').replace(/\u00A0/g, ' ').trim();
+    const checkbox = el.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+
+    const decMatch = matchDecisionLine(rawText);
+    if (decMatch) {
+      const strippedClone = stripLeadingMarkerFromClone(el, 'decision');
+      const inner = cleanInline(strippedClone).trim();
+      return `<p class="doc-decision" data-status="${escAttr(decMatch.status)}">${inner || '<br>'}</p>`;
+    }
+
+    const taskMatch = matchTaskLine(rawText);
+    if (taskMatch || checkbox) {
+      const status: TaskStatus = taskMatch
+        ? taskMatch.status
+        : checkbox?.checked || checkbox?.hasAttribute('checked')
+        ? 'done'
+        : 'todo';
+      const strippedClone = stripLeadingMarkerFromClone(el, 'task');
+      const inner = cleanInline(strippedClone).trim();
+      return `<p class="doc-task" data-status="${escAttr(status)}">${inner || '<br>'}</p>`;
+    }
+
+    const prevBlock = outBlocks[outBlocks.length - 1] || '';
+    if (prevBlock.startsWith('<p class="doc-decision"')) {
+      const ratMatch = matchRationaleLine(rawText);
+      if (ratMatch !== null) {
+        const strippedClone = stripLeadingMarkerFromClone(el, 'rationale');
+        const inner = cleanInline(strippedClone).trim();
+        return `<blockquote class="doc-rationale">${inner || '<br>'}</blockquote>`;
+      }
+    }
+
+    return null;
+  };
+
   const cleanBlocks = (container: Node) => {
     container.childNodes.forEach((node) => {
       if (node.nodeType === Node.TEXT_NODE) {
         const txt = (node.nodeValue || '').trim();
-        if (txt) outBlocks.push(`<p>${inlineMarkdownToHtml(txt, knownPeople)}</p>`);
+        if (!txt) return;
+        const decMatch = matchDecisionLine(txt);
+        if (decMatch) {
+          outBlocks.push(
+            `<p class="doc-decision" data-status="${escAttr(decMatch.status)}">${
+              renderBlockInlineHtml(decMatch.text, knownPeople) || '<br>'
+            }</p>`
+          );
+          return;
+        }
+        const taskMatch = matchTaskLine(txt);
+        if (taskMatch) {
+          outBlocks.push(
+            `<p class="doc-task" data-status="${escAttr(taskMatch.status)}">${
+              renderBlockInlineHtml(taskMatch.text, knownPeople) || '<br>'
+            }</p>`
+          );
+          return;
+        }
+        outBlocks.push(`<p>${inlineMarkdownToHtml(txt, knownPeople)}</p>`);
         return;
       }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
@@ -734,36 +845,83 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
       if (tag === 'UL' || tag === 'OL') {
         const listTag = tag.toLowerCase();
         const items: string[] = [];
-        Array.from(el.children).forEach((li) => {
-          if (li.tagName.toUpperCase() === 'LI') {
-            items.push(`<li>${cleanInline(li) || '<br>'}</li>`);
+        const flushListItems = () => {
+          if (items.length > 0) {
+            outBlocks.push(`<${listTag}>${items.join('')}</${listTag}>`);
+            items.length = 0;
+          }
+        };
+
+        Array.from(el.children).forEach((child) => {
+          if (child.tagName.toUpperCase() !== 'LI') return;
+          const li = child as HTMLElement;
+
+          // Extract any nested <ul>/<ol> inside <li> so we can process the <li>'s own line and nested lists cleanly
+          const nestedLists = Array.from(li.children).filter((c) => {
+            const t = c.tagName.toUpperCase();
+            return t === 'UL' || t === 'OL';
+          });
+
+          const ownLiClone = li.cloneNode(true) as HTMLElement;
+          Array.from(ownLiClone.children).forEach((c) => {
+            const t = c.tagName.toUpperCase();
+            if (t === 'UL' || t === 'OL') c.remove();
+          });
+
+          const specialBlock = tryBuildSpecialBlockFromElement(ownLiClone);
+          if (specialBlock) {
+            flushListItems();
+            outBlocks.push(specialBlock);
+          } else {
+            const inlineHtml = cleanInline(ownLiClone).trim();
+            if (inlineHtml || nestedLists.length === 0) {
+              items.push(`<li>${inlineHtml || '<br>'}</li>`);
+            }
+          }
+
+          if (nestedLists.length > 0) {
+            flushListItems();
+            nestedLists.forEach((nl) => cleanBlocks(nl));
           }
         });
-        if (items.length) outBlocks.push(`<${listTag}>${items.join('')}</${listTag}>`);
+
+        flushListItems();
         return;
       }
 
-      if (tag === 'H1' || tag === 'H2' || tag === 'H3') {
-        const hTag = tag.toLowerCase();
+      if (tag === 'H1' || tag === 'H2' || tag === 'H3' || tag === 'H4' || tag === 'H5' || tag === 'H6') {
+        const hTag = tag === 'H1' || tag === 'H2' ? tag.toLowerCase() : 'h3';
         outBlocks.push(`<${hTag}>${cleanInline(el) || '<br>'}</${hTag}>`);
         return;
       }
 
       if (tag === 'BLOCKQUOTE') {
-        const cls = el.classList.contains('doc-rationale') ? ' class="doc-rationale"' : '';
-        outBlocks.push(`<blockquote${cls}>${cleanInline(el) || '<br>'}</blockquote>`);
+        const rawText = (el.textContent || '').replace(/\u00A0/g, ' ').trim();
+        const prevBlock = outBlocks[outBlocks.length - 1] || '';
+        const isRat =
+          el.classList.contains('doc-rationale') ||
+          (prevBlock.startsWith('<p class="doc-decision"') &&
+            /^(?:Rationale|Begründung|Reason)\s*:/i.test(rawText));
+        if (isRat) {
+          const stripped = stripLeadingMarkerFromClone(el, 'rationale');
+          outBlocks.push(`<blockquote class="doc-rationale">${cleanInline(stripped) || '<br>'}</blockquote>`);
+        } else {
+          outBlocks.push(`<blockquote>${cleanInline(el) || '<br>'}</blockquote>`);
+        }
         return;
       }
 
       if (el.classList.contains('doc-task')) {
         const st = escAttr(el.getAttribute('data-status') || 'todo');
-        outBlocks.push(`<p class="doc-task" data-status="${st}">${cleanInline(el) || '<br>'}</p>`);
+        const stripped = stripLeadingMarkerFromClone(el, 'task');
+        outBlocks.push(`<p class="doc-task" data-status="${st}">${cleanInline(stripped) || '<br>'}</p>`);
         return;
       }
 
       if (el.classList.contains('doc-decision')) {
-        const st = escAttr(el.getAttribute('data-status') || 'agreed');
-        outBlocks.push(`<p class="doc-decision" data-status="${st}">${cleanInline(el) || '<br>'}</p>`);
+        const st = escAttr(normalizeDecisionStatus(el.getAttribute('data-status')));
+        const stripped = stripLeadingMarkerFromClone(el, 'decision');
+        outBlocks.push(`<p class="doc-decision" data-status="${st}">${cleanInline(stripped) || '<br>'}</p>`);
         return;
       }
 
@@ -771,17 +929,27 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
         if (hasNestedBlockElements(el)) {
           cleanBlocks(el);
         } else {
-          const inner = cleanInline(el);
-          if (inner || (tag === 'P' && !el.querySelector('img'))) {
-            outBlocks.push(`<p>${inner || '<br>'}</p>`);
+          const specialBlock = tryBuildSpecialBlockFromElement(el);
+          if (specialBlock) {
+            outBlocks.push(specialBlock);
+          } else {
+            const inner = cleanInline(el);
+            if (inner || (tag === 'P' && !el.querySelector('img'))) {
+              outBlocks.push(`<p>${inner || '<br>'}</p>`);
+            }
           }
           el.querySelectorAll('img').forEach(emitImgElement);
         }
         return;
       }
 
-      const fallback = cleanInline(el);
-      if (fallback) outBlocks.push(`<p>${fallback}</p>`);
+      const specialFallback = tryBuildSpecialBlockFromElement(el);
+      if (specialFallback) {
+        outBlocks.push(specialFallback);
+      } else {
+        const fallback = cleanInline(el);
+        if (fallback) outBlocks.push(`<p>${fallback}</p>`);
+      }
       el.querySelectorAll('img').forEach(emitImgElement);
     });
   };

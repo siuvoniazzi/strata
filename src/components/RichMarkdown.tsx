@@ -3,6 +3,7 @@ import { Gavel } from 'lucide-react';
 import type { Client, DecisionStatus, Note, Person, TaskStatus } from '../types';
 import { parseAltAndWidth } from '../utils/docSerializer';
 import { resolveImageSrc } from '../utils/imageStore';
+import { matchDecisionLine, matchRationaleLine, matchTaskLine } from '../utils/markdown';
 import { RichInlineText } from './RichInlineText';
 
 export interface RichMarkdownProps {
@@ -16,14 +17,6 @@ export interface RichMarkdownProps {
   onClickLabel?: (label: string) => void;
   onClickNoteLink?: (noteTitle: string) => void;
 }
-
-const STATUS_CHAR_TO_TASK: Record<string, TaskStatus> = {
-  ' ': 'todo',
-  '/': 'doing',
-  '?': 'waiting',
-  x: 'done',
-  X: 'done',
-};
 
 interface ParsedListItem {
   indent: number;
@@ -51,23 +44,23 @@ function splitTableCells(line: string): string[] {
 function parseListLine(line: string): ParsedListItem | null {
   if (isHorizontalRule(line)) return null;
 
-  const decMatch = line.match(/^([ \t]*)[-*+•]\s*\[D(?::(agreed|proposed|superseded))?\]\s+(.+)$/i);
-  if (decMatch) {
+  const decMatch = matchDecisionLine(line);
+  if (decMatch && decMatch.text) {
     return {
-      indent: decMatch[1].replace(/\t/g, '  ').length,
+      indent: decMatch.indent.replace(/\t/g, '  ').length,
       ordered: false,
-      content: decMatch[3].trim(),
-      decisionStatus: ((decMatch[2] || 'agreed').toLowerCase() as DecisionStatus),
+      content: decMatch.text,
+      decisionStatus: decMatch.status,
     };
   }
 
-  const taskMatch = line.match(/^([ \t]*)[-*+•]\s*\[([ /?xX])\]\s+(.+)$/);
-  if (taskMatch) {
+  const taskMatch = matchTaskLine(line);
+  if (taskMatch && taskMatch.text) {
     return {
-      indent: taskMatch[1].replace(/\t/g, '  ').length,
+      indent: taskMatch.indent.replace(/\t/g, '  ').length,
       ordered: false,
-      content: taskMatch[3].trim(),
-      taskStatus: STATUS_CHAR_TO_TASK[taskMatch[2]] || 'todo',
+      content: taskMatch.text,
+      taskStatus: taskMatch.status,
     };
   }
 
@@ -392,9 +385,9 @@ export const RichMarkdown: React.FC<RichMarkdownProps> = ({
         if (parsedItem) {
           // Capture optional indented `> Rationale: ...` line directly beneath a Decision item
           if (parsedItem.decisionStatus && i + 1 < lines.length) {
-            const ratMatch = lines[i + 1].match(/^\s*>\s*(?:Rationale:\s*)?(.+)$/i);
-            if (ratMatch) {
-              parsedItem.rationale = ratMatch[1].trim();
+            const ratText = matchRationaleLine(lines[i + 1]);
+            if (ratText !== null && ratText) {
+              parsedItem.rationale = ratText;
               collected.push(parsedItem);
               i += 2;
               continue;

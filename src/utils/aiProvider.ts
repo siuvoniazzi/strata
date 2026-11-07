@@ -15,7 +15,10 @@ import {
   extractInlineLabels,
   extractInlineMentions,
   formatPersonMention,
+  matchDecisionLine,
+  matchTaskLine,
   normalizeLabel,
+  normalizeStructuredMarkdown,
   serializeTaskLine,
 } from './markdown';
 
@@ -230,7 +233,7 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
   }
 
   // 4. Extract implicit Tasks and Decisions from prose lines
-  const rawLines = note.body.split('\n');
+  const rawLines = note.body.replace(/\r\n?/g, '\n').split('\n');
   const extractedTasks: AiStructureProposal['extractedTasks'] = [];
   const extractedDecisions: AiStructureProposal['extractedDecisions'] = [];
   const discussionLines: string[] = [];
@@ -240,7 +243,7 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
     if (!trimmed) continue;
 
     // Skip already structured tasks/decisions when scanning for *new* implicit ones, but preserve in restructured
-    if (/^[-*]\s*\[[ /?xX]\]/.test(trimmed) || /^[-*]\s*\[D(?::[a-z]+)?\]/i.test(trimmed)) {
+    if (matchTaskLine(trimmed) || matchDecisionLine(trimmed)) {
       continue;
     }
 
@@ -250,18 +253,23 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
       continue;
     }
 
-    const strippedBullet = trimmed.replace(/^[-*•]\s*/, '');
+    const strippedBullet = trimmed.replace(/^(?:[-*+•]\s+)+/, '');
 
-    // Implicit Decision patterns
-    const decPattern = /^(?:decision|decided|agreed|we agreed|proposal|proposed)\s*[:\-—]?\s*(.+)$/i;
+    // Implicit Decision patterns (English & German)
+    const decPattern =
+      /^(?:decision|decided|agreed|we agreed|proposal|proposed|entscheid|entscheidung|entschieden|beschlossen|vereinbart|vorschlag|vorgeschlagen)\s*[:\-—]?\s*(.+)$/i;
     const inlineDecMatch =
       strippedBullet.match(decPattern) ||
-      (/\b(?:we agreed to|decided to|approved moving to|will standardize on)\b/i.test(strippedBullet)
+      (/\b(?:we agreed to|decided to|approved moving to|will standardize on|kann weggelassen werden|wird weggelassen|wurde beschlossen)\b/i.test(
+        strippedBullet
+      )
         ? [strippedBullet, strippedBullet]
         : null);
 
     if (inlineDecMatch) {
-      const status: DecisionStatus = /\bpropos/i.test(strippedBullet) ? 'proposed' : 'agreed';
+      const status: DecisionStatus = /\b(?:propos|vorschlag|vorgeschlagen|kann\s+\w+\s+werden)\b/i.test(strippedBullet)
+        ? 'proposed'
+        : 'agreed';
       let statement = inlineDecMatch[1].trim();
       for (const p of directory.people) {
         const esc = p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -278,20 +286,29 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
       continue;
     }
 
-    // Implicit Task patterns
-    const taskPrefix = /^(?:todo|action|action item|next step|follow[- ]?up)\s*[:\-—]?\s*(.+)$/i;
+    // Implicit Task patterns (English & German)
+    const taskPrefix =
+      /^(?:todo|action|action item|next step|follow[- ]?up|aufgabe|pendent|pendenz)\s*[:\-—]?\s*(.+)$/i;
     const personWillPattern = directory.people.find((p) => {
       const first = p.name.split(/\s+/)[0];
-      return new RegExp(`\\b(?:${p.name}|${first})\\s+(?:will|to|needs to|going to)\\s+`, 'i').test(strippedBullet);
+      return new RegExp(`\\b(?:${p.name}|${first})\\s+(?:will|to|needs to|going to|wird|muss|soll)\\s+`, 'i').test(
+        strippedBullet
+      );
     });
 
     const prefMatch = strippedBullet.match(taskPrefix);
-    if (prefMatch || personWillPattern || /\b(?:need to send|follow up with|schedule a|share revised)\b/i.test(strippedBullet)) {
+    if (
+      prefMatch ||
+      personWillPattern ||
+      /\b(?:need to send|follow up with|schedule a|share revised|beschaffen|abklären|einholen)\b/i.test(strippedBullet)
+    ) {
       const rawTaskText = (prefMatch ? prefMatch[1] : strippedBullet).trim();
       const mentions = extractInlineMentions(rawTaskText, directory.people);
       const owner = mentions[0] || personWillPattern?.name || null;
       const dueDate = inferRelativeDueDate(rawTaskText, note.date);
-      const priority: TaskPriority | null = /\b(?:urgent|asap|critical|high priority|blocker)\b/i.test(rawTaskText)
+      const priority: TaskPriority | null = /\b(?:urgent|asap|critical|high priority|blocker|dringend)\b/i.test(
+        rawTaskText
+      )
         ? 'high'
         : null;
 
@@ -311,8 +328,9 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
       const esc = p.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       enrichedLine = enrichedLine.replace(new RegExp(`(?<!@\\[?)\\b${esc}\\b`, 'g'), formatPersonMention(p.name));
     }
-    if (trimmed.startsWith('#')) {
-      discussionLines.push(trimmed);
+    const isStandaloneBoldHeading = /^\*\*[^*\n]+\*\*:?$/.test(trimmed);
+    if (trimmed.startsWith('#') || isStandaloneBoldHeading) {
+      discussionLines.push(enrichedLine);
     } else {
       discussionLines.push(`- ${enrichedLine}`);
     }
@@ -336,12 +354,18 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
   }
 
   // 6. Compose clean Restructured Markdown Body
-  const existingTaskLines = rawLines.filter((l) => /^\s*[-*]\s*\[[ /?xX]\]/.test(l));
-  const existingDecisionLines = rawLines.filter((l) => /^\s*[-*]\s*\[D(?::[a-z]+)?\]/i.test(l));
+  const existingTaskLines = rawLines
+    .map((l) => matchTaskLine(l))
+    .filter((m): m is NonNullable<typeof m> => Boolean(m && m.text))
+    .map((m) => `- [${m.statusChar}] ${m.text}`);
+  const existingDecisionLines = rawLines
+    .map((l) => matchDecisionLine(l))
+    .filter((m): m is NonNullable<typeof m> => Boolean(m && m.text))
+    .map((m) => `- [D:${m.status}] ${m.text}`);
 
   const sections: string[] = [];
   if (discussionLines.length > 0) {
-    const hasHeading = discussionLines.some((l) => l.startsWith('#'));
+    const hasHeading = discussionLines.some((l) => l.startsWith('#') || /^\*\*[^*]+\*\*$/.test(l));
     if (!hasHeading) sections.push('## Discussion & Context');
     sections.push(...discussionLines);
   }
@@ -380,7 +404,7 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
     suggestedLabels: Array.from(labelSet).filter(Boolean),
     extractedTasks,
     extractedDecisions,
-    restructuredBody: sections.join('\n').trim() || note.body,
+    restructuredBody: normalizeStructuredMarkdown(sections.join('\n').trim() || note.body),
     usedProvider: 'Local Smart Engine (Zero-Network)',
   };
 }
@@ -480,7 +504,7 @@ export async function generateStructureProposal(
   "suggestedLabels": ["lowercase-tag"],
   "extractedTasks": [{"text": "string", "owner": "Full Name or null", "dueDate": "YYYY-MM-DD or null", "priority": "high|medium|low|null", "labels": []}],
   "extractedDecisions": [{"text": "string", "status": "agreed|proposed|superseded", "stakeholders": ["Full Name"], "rationale": "string or null", "labels": []}],
-  "restructuredBody": "Clean markdown using @[Full Name] for people, #tag for labels, '- [ ] Task @[Owner] due:YYYY-MM-DD' for tasks, and '- [D:agreed] Decision' for decisions."
+  "restructuredBody": "Clean markdown using @[Full Name] for people, #tag for labels, '- [ ] Task @[Owner] due:YYYY-MM-DD' for tasks, and '- [D:agreed] Decision' or '- [D:proposed] Decision' for decisions. IMPORTANT: Every task and decision line MUST start at the beginning of a line with a single '- [ ] ' or '- [D:...] ' prefix (never double-bullet like '- - [ ]' or '• - [D:...]')."
 }
 Preserve the original language and factual precision of the note.`;
 
@@ -519,7 +543,9 @@ ${note.body}`;
         extractedDecisions: Array.isArray(parsed.extractedDecisions)
           ? parsed.extractedDecisions
           : localProposal.extractedDecisions,
-        restructuredBody: parsed.restructuredBody || localProposal.restructuredBody,
+        restructuredBody: normalizeStructuredMarkdown(
+          unwrapOuterMarkdownFence(parsed.restructuredBody || localProposal.restructuredBody)
+        ),
         usedProvider: formatAiEngineLabel(config),
       };
     } catch {

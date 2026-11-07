@@ -21,7 +21,7 @@ import type {
   WorkspacePreferences,
 } from '../types';
 import { formatAiEngineLabel, generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
-import { serializeTaskLine } from '../utils/markdown';
+import { normalizeStructuredMarkdown, serializeTaskLine } from '../utils/markdown';
 import { saveWorkspacePreferences } from '../utils/preferences';
 import { AiLoadingState } from './AiLoadingState';
 import { RichMarkdown } from './RichMarkdown';
@@ -71,7 +71,7 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
     let nextBody = note.body;
 
     if (bodyMode === 'replace') {
-      nextBody = proposal.restructuredBody;
+      nextBody = normalizeStructuredMarkdown(proposal.restructuredBody);
     } else if (bodyMode === 'append') {
       const additions: string[] = [];
       if (proposal.extractedDecisions.length > 0) {
@@ -96,8 +96,12 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
         );
       }
       if (additions.length > 0) {
-        nextBody = `${additions.join('\n')}\n\n---\n\n${note.body}`;
+        nextBody = normalizeStructuredMarkdown(`${additions.join('\n')}\n\n---\n\n${note.body}`);
+      } else {
+        nextBody = normalizeStructuredMarkdown(note.body);
       }
+    } else {
+      nextBody = normalizeStructuredMarkdown(note.body);
     }
 
     const updated: Note = {
@@ -124,8 +128,8 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
       'Structure the following meeting note into clean Markdown using:',
       '- @[Full Name] for people mentions',
       '- #label for topics',
-      '- "- [ ] Action item @[Owner] due:YYYY-MM-DD" for tasks',
-      '- "- [D:agreed] Decision statement" for decisions',
+      '- "- [ ] Action item @[Owner] due:YYYY-MM-DD" for tasks (top-level line, never double-bulleted like "- - [ ]")',
+      '- "- [D:agreed] Decision statement" or "- [D:proposed] Decision statement" for decisions (top-level line, never double-bulleted)',
       '',
       `Title: ${note.title}`,
       `Date: ${note.date}`,

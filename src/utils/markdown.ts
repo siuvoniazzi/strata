@@ -52,8 +52,11 @@ export function stripMarkdownFormatting(text: string): string {
     })
     .replace(/^\s*(?:---+|\*\*\*+|___+)\s*$/gm, '')
     .replace(/^\s*#{1,6}\s+/gm, '')
-    .replace(/^\s*[-*+•]\s*\[(?:[ /?xX]|D(?::[a-z]+)?)\]\s*/gim, '')
-    .replace(/^\s*>\s*(?:Rationale:\s*)?/gim, '')
+    .replace(
+      /^\s*(?:(?:[-*+•]|\d+[.)])\s*)*(?:\[[ /?xX]?\]\s*)?[*_`]{0,2}\[(?:[ /?xX]?|D(?::[a-zA-ZäöüÄÖÜß_-]+)?)\][*_`]{0,2}\s*/gim,
+      ''
+    )
+    .replace(/^\s*(?:[-*+•]\s*)?>\s*(?:(?:Rationale|Begründung|Reason)\s*:\s*)?/gim, '')
     .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, '')
     .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, target: string, alias?: string) =>
       (alias || target).trim()
@@ -161,6 +164,7 @@ export function getAllNoteLabels(note: Note): string[] {
 }
 
 const STATUS_CHAR_TO_TASK: Record<string, TaskStatus> = {
+  '': 'todo',
   ' ': 'todo',
   '/': 'doing',
   '?': 'waiting',
@@ -175,6 +179,152 @@ const TASK_TO_STATUS_CHAR: Record<TaskStatus, string> = {
   done: 'x',
 };
 
+export function normalizeDecisionStatus(raw?: string | null): DecisionStatus {
+  const s = (raw || '').trim().toLowerCase();
+  if (
+    s === 'proposed' ||
+    s === 'proposal' ||
+    s === 'open' ||
+    s === 'pending' ||
+    s === 'draft' ||
+    s === 'review' ||
+    s === 'vorgeschlagen' ||
+    s === 'offen'
+  ) {
+    return 'proposed';
+  }
+  if (
+    s === 'superseded' ||
+    s === 'rejected' ||
+    s === 'archived' ||
+    s === 'dropped' ||
+    s === 'obsolete' ||
+    s === 'verworfen' ||
+    s === 'überholt'
+  ) {
+    return 'superseded';
+  }
+  return 'agreed';
+}
+
+/**
+ * Matches a Decision line even when AI / Markdown exporters double-prefix bullets (e.g. `- - [D:proposed] ...`,
+ * `• - [D:agreed] ...`, `1. - [D] ...`, or bare `[D:proposed] ...`).
+ */
+export function matchDecisionLine(rawLine: string): {
+  indent: string;
+  status: DecisionStatus;
+  text: string;
+} | null {
+  const clean = rawLine.replace(/\r$/, '');
+  const m = clean.match(
+    /^([ \t]*)(?:(?:[-*+•]|\d+[.)])\s*)*(?:\[[ /?xX]?\]\s*)?[*_`]{0,2}\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\](?!\()[*_`]{0,2}(?:\s+(.*)|\s*)$/i
+  );
+  if (!m) return null;
+  return {
+    indent: m[1] || '',
+    status: normalizeDecisionStatus(m[2]),
+    text: (m[3] || '').trim(),
+  };
+}
+
+/**
+ * Matches a Task line even when AI / Markdown exporters double-prefix bullets (e.g. `- - [ ] ...`,
+ * `• - [x] ...`, `1. [ ] ...`, `- [] ...`, or bare `[ ] ...`).
+ */
+export function matchTaskLine(rawLine: string): {
+  indent: string;
+  status: TaskStatus;
+  statusChar: string;
+  text: string;
+} | null {
+  const clean = rawLine.replace(/\r$/, '');
+  if (matchDecisionLine(clean)) return null;
+  const m = clean.match(
+    /^([ \t]*)(?:((?:[-*+•]|\d+[.)])\s*)+)?[*_`]{0,2}\[([ /?xX]?)\](?!\()[*_`]{0,2}(?:\s+(.*)|\s*)$/
+  );
+  if (!m) return null;
+  const hasListMarker = Boolean(m[2]);
+  const rawChar = m[3] || '';
+  const text = (m[4] || '').trim();
+  // Avoid turning a standalone empty `[]` on a plain line with no list marker and no text into a task
+  if (!hasListMarker && rawChar === '' && !text) {
+    return null;
+  }
+  const status = STATUS_CHAR_TO_TASK[rawChar] || 'todo';
+  const statusChar = TASK_TO_STATUS_CHAR[status] || ' ';
+  return {
+    indent: m[1] || '',
+    status,
+    statusChar,
+    text,
+  };
+}
+
+/**
+ * Matches an optional Rationale sub-line beneath a Decision block.
+ */
+export function matchRationaleLine(rawLine: string): string | null {
+  const clean = rawLine.replace(/\r$/, '');
+  const m = clean.match(/^\s*(?:[-*+•]\s*)?>\s*(?:(?:Rationale|Begründung|Reason)\s*:\s*)?(.*)$/i);
+  if (!m) return null;
+  return (m[1] || '').trim();
+}
+
+/**
+ * Normalizes AI-generated or pasted Markdown so task and decision lines always use canonical
+ * top-level Strata syntax (`- [ ] ...` and `- [D:agreed|proposed|superseded] ...`) without double bullets.
+ */
+export function normalizeStructuredMarkdown(markdown: string): string {
+  if (!markdown) return '';
+  const lines = markdown.replace(/\r\n?/g, '\n').split('\n');
+  const out: string[] = [];
+  let inCodeFence = false;
+  let prevWasDecision = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      inCodeFence = !inCodeFence;
+      out.push(line);
+      prevWasDecision = false;
+      continue;
+    }
+    if (inCodeFence) {
+      out.push(line);
+      continue;
+    }
+
+    const dec = matchDecisionLine(line);
+    if (dec) {
+      out.push(`- [D:${dec.status}]${dec.text ? ` ${dec.text}` : ''}`);
+      prevWasDecision = true;
+      continue;
+    }
+
+    const task = matchTaskLine(line);
+    if (task) {
+      out.push(`- [${task.statusChar}]${task.text ? ` ${task.text}` : ''}`);
+      prevWasDecision = false;
+      continue;
+    }
+
+    if (prevWasDecision) {
+      const rat = matchRationaleLine(line);
+      if (rat !== null) {
+        out.push(`  > Rationale: ${rat}`);
+        prevWasDecision = false;
+        continue;
+      }
+    }
+
+    out.push(line);
+    prevWasDecision = false;
+  }
+
+  return out.join('\n');
+}
+
 /**
  * Parses inline Tasks and Decisions from a Note's Markdown body.
  */
@@ -182,7 +332,7 @@ export function parseNoteItems(
   note: Note,
   knownPeople: Person[] = []
 ): { tasks: ParsedTask[]; decisions: ParsedDecision[] } {
-  const lines = note.body.split('\n');
+  const lines = note.body.replace(/\r\n?/g, '\n').split('\n');
   const tasks: ParsedTask[] = [];
   const decisions: ParsedDecision[] = [];
   const noteLevelLabels = note.labels.map(normalizeLabel).filter(Boolean);
@@ -190,11 +340,11 @@ export function parseNoteItems(
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // 1. Check Decision syntax: - [D] or - [D:agreed] / - [D:proposed] / - [D:superseded]
-    const decMatch = line.match(/^\s*[-*]\s*\[D(?::(agreed|proposed|superseded))?\]\s+(.+)$/i);
-    if (decMatch) {
-      const status = ((decMatch[1] || 'agreed').toLowerCase() as DecisionStatus);
-      const rawContent = decMatch[2].trim();
+    // 1. Check Decision syntax: - [D] or - [D:agreed] / - [D:proposed] / - [D:superseded] (including double-bulleted variants)
+    const decMatch = matchDecisionLine(line);
+    if (decMatch && decMatch.text) {
+      const status = decMatch.status;
+      const rawContent = decMatch.text;
       const inlineLabels = extractInlineLabels(rawContent);
       const stakeholders = extractInlineMentions(rawContent, knownPeople);
 
@@ -206,9 +356,9 @@ export function parseNoteItems(
       let rationale: string | null = null;
       let rationaleLineIndex: number | null = null;
       if (i + 1 < lines.length) {
-        const nextMatch = lines[i + 1].match(/^\s*>\s*(?:Rationale:\s*)?(.+)$/i);
-        if (nextMatch) {
-          rationale = nextMatch[1].trim();
+        const ratText = matchRationaleLine(lines[i + 1]);
+        if (ratText) {
+          rationale = ratText;
           rationaleLineIndex = i + 1;
         }
       }
@@ -232,11 +382,11 @@ export function parseNoteItems(
       continue;
     }
 
-    // 2. Check Task syntax: - [ ] / - [/] / - [?] / - [x]
-    const taskMatch = line.match(/^\s*[-*]\s*\[([ /?xX])\]\s+(.+)$/);
-    if (taskMatch) {
-      const status = STATUS_CHAR_TO_TASK[taskMatch[1]] || 'todo';
-      const rawContent = taskMatch[2].trim();
+    // 2. Check Task syntax: - [ ] / - [/] / - [?] / - [x] (including double-bulleted variants)
+    const taskMatch = matchTaskLine(line);
+    if (taskMatch && taskMatch.text) {
+      const status = taskMatch.status;
+      const rawContent = taskMatch.text;
       const inlineLabels = extractInlineLabels(rawContent);
       const mentions = extractInlineMentions(rawContent, knownPeople);
       const owner = mentions[0] || null;
@@ -322,16 +472,15 @@ export function updateTaskInBody(
   lineIndex: number,
   updates: Partial<{ status: TaskStatus; owner: string | null; dueDate: string | null; priority: TaskPriority | null }>
 ): string {
-  const lines = body.split('\n');
+  const lines = body.replace(/\r\n?/g, '\n').split('\n');
   if (lineIndex < 0 || lineIndex >= lines.length) return body;
   const line = lines[lineIndex];
-  const m = line.match(/^(\s*[-*]\s*\[)([ /?xX])(\]\s+)(.+)$/);
-  if (!m) return body;
+  const parsed = matchTaskLine(line);
+  if (!parsed) return body;
 
-  const prefixIndent = m[1];
-  const currentStatus = STATUS_CHAR_TO_TASK[m[2]] || 'todo';
+  const currentStatus = parsed.status;
   const nextStatus = updates.status ?? currentStatus;
-  let content = m[4];
+  let content = parsed.text;
 
   if (updates.dueDate !== undefined) {
     content = content.replace(/\s*\bdue:\d{4}-\d{2}-\d{2}\b/gi, '');
@@ -348,7 +497,7 @@ export function updateTaskInBody(
     if (updates.owner) content = `${content.trim()} ${formatPersonMention(updates.owner)}`;
   }
 
-  lines[lineIndex] = `${prefixIndent}${TASK_TO_STATUS_CHAR[nextStatus]}] ${content.replace(/\s{2,}/g, ' ').trim()}`;
+  lines[lineIndex] = `${parsed.indent}- [${TASK_TO_STATUS_CHAR[nextStatus]}] ${content.replace(/\s{2,}/g, ' ').trim()}`;
   return lines.join('\n');
 }
 
@@ -360,19 +509,19 @@ export function updateDecisionInBody(
   lineIndex: number,
   updates: Partial<{ status: DecisionStatus; rationale: string | null }>
 ): string {
-  const lines = body.split('\n');
+  const lines = body.replace(/\r\n?/g, '\n').split('\n');
   if (lineIndex < 0 || lineIndex >= lines.length) return body;
   const line = lines[lineIndex];
-  const m = line.match(/^(\s*[-*]\s*\[D)(?::(agreed|proposed|superseded))?(\]\s+.+)$/i);
-  if (!m) return body;
+  const parsed = matchDecisionLine(line);
+  if (!parsed) return body;
 
-  const currentStatus = ((m[2] || 'agreed').toLowerCase() as DecisionStatus);
+  const currentStatus = parsed.status;
   const nextStatus = updates.status ?? currentStatus;
-  lines[lineIndex] = `${m[1]}:${nextStatus}${m[3]}`;
+  lines[lineIndex] = `${parsed.indent}- [D:${nextStatus}] ${parsed.text}`;
 
   if (updates.rationale !== undefined) {
     const hasExistingRationale =
-      lineIndex + 1 < lines.length && /^\s*>\s*(?:Rationale:\s*)?(.+)$/i.test(lines[lineIndex + 1]);
+      lineIndex + 1 < lines.length && matchRationaleLine(lines[lineIndex + 1]) !== null;
     if (updates.rationale && updates.rationale.trim()) {
       const ratLine = `  > Rationale: ${updates.rationale.trim()}`;
       if (hasExistingRationale) {
@@ -392,7 +541,7 @@ export function updateDecisionInBody(
  * Deletes a Task line from a note's Markdown body.
  */
 export function deleteTaskFromBody(body: string, lineIndex: number): string {
-  const lines = body.split('\n');
+  const lines = body.replace(/\r\n?/g, '\n').split('\n');
   if (lineIndex < 0 || lineIndex >= lines.length) return body;
   lines.splice(lineIndex, 1);
   return lines.join('\n');
@@ -402,10 +551,10 @@ export function deleteTaskFromBody(body: string, lineIndex: number): string {
  * Deletes a Decision line (and its indented Rationale sub-line if present) from a note's Markdown body.
  */
 export function deleteDecisionFromBody(body: string, lineIndex: number): string {
-  const lines = body.split('\n');
+  const lines = body.replace(/\r\n?/g, '\n').split('\n');
   if (lineIndex < 0 || lineIndex >= lines.length) return body;
   const hasRationale =
-    lineIndex + 1 < lines.length && /^\s*>\s*(?:Rationale:\s*)?(.+)$/i.test(lines[lineIndex + 1]);
+    lineIndex + 1 < lines.length && matchRationaleLine(lines[lineIndex + 1]) !== null;
   lines.splice(lineIndex, hasRationale ? 2 : 1);
   return lines.join('\n');
 }

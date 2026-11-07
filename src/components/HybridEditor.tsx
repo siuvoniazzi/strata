@@ -39,6 +39,9 @@ import {
   detectUnlinkedPeopleInText,
   formatPersonMention,
   getAllNoteLabels,
+  matchDecisionLine,
+  matchTaskLine,
+  normalizeDecisionStatus,
   normalizeLabel,
   parseMeetingInviteText,
   parseNoteItems,
@@ -497,6 +500,104 @@ function findEditableBlock(node: Node | null, root: HTMLElement): HTMLElement | 
     curr = curr.parentNode;
   }
   return null;
+}
+
+function stripLeadingMarkerFromBlockDom(blk: HTMLElement, kind: 'decision' | 'task'): void {
+  blk.querySelectorAll('input[type="checkbox"]').forEach((inp) => inp.remove());
+  const fullText = (blk.textContent || '').replace(/\u00A0/g, ' ');
+  const prefixRegex =
+    kind === 'decision'
+      ? /^\s*(?:(?:[-*+•]|\d+[.)])\s*)*(?:\[[ /?xX]?\]\s*)?[*_`]{0,2}\[D(?::[a-zA-ZäöüÄÖÜß_-]+)?\][*_`]{0,2}\s*/i
+      : /^\s*(?:(?:[-*+•]|\d+[.)])\s*)*[*_`]{0,2}\[[ /?xX]?\][*_`]{0,2}\s*/;
+  const m = fullText.match(prefixRegex);
+  if (!m || m[0].length === 0) return;
+
+  let toStrip = m[0].length;
+  const walker = document.createTreeWalker(blk, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  let curr: Node | null;
+  while ((curr = walker.nextNode())) {
+    textNodes.push(curr as Text);
+  }
+  for (const tn of textNodes) {
+    if (toStrip <= 0) break;
+    const val = (tn.nodeValue || '').replace(/\u00A0/g, ' ');
+    if (val.length <= toStrip) {
+      toStrip -= val.length;
+      tn.nodeValue = '';
+    } else {
+      tn.nodeValue = val.slice(toStrip);
+      toStrip = 0;
+    }
+  }
+  blk.querySelectorAll('strong, b, em, i, s, strike, del, code').forEach((inlineEl) => {
+    if (!inlineEl.textContent && !inlineEl.querySelector('img, br')) {
+      inlineEl.remove();
+    }
+  });
+}
+
+function upgradeInlineTaskAndDecisionBlocks(root: HTMLElement): void {
+  // 1. Promote any blocks carrying paste markers (survived from insertHTML merging into <p> or <li>)
+  const markers = Array.from(root.querySelectorAll('span[data-strata-block]'));
+  for (const marker of markers) {
+    const kind = marker.getAttribute('data-strata-block');
+    const status = marker.getAttribute('data-strata-status') || (kind === 'decision' ? 'agreed' : 'todo');
+    const blk = findEditableBlock(marker, root);
+    marker.remove();
+    if (!blk || (kind !== 'decision' && kind !== 'task')) continue;
+
+    stripLeadingMarkerFromBlockDom(blk, kind);
+    const targetClass = kind === 'decision' ? 'doc-decision' : 'doc-task';
+    if (blk.tagName.toUpperCase() === 'P' && blk.classList.contains(targetClass)) {
+      blk.setAttribute('data-status', status);
+      if (!blk.innerHTML.trim()) blk.innerHTML = '<br>';
+      continue;
+    }
+
+    const p = document.createElement('p');
+    p.className = targetClass;
+    p.setAttribute('data-status', status);
+    p.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
+    replaceBlockElement(blk, p);
+  }
+
+  // 2. Upgrade any <p>, <div>, or <li> whose text begins with a task or decision marker followed by text
+  const blocks = getOrderedDocBlocks(root);
+  for (const blk of blocks) {
+    if (!blk.isConnected) continue;
+    if (
+      blk.classList.contains('doc-task') ||
+      blk.classList.contains('doc-decision') ||
+      blk.classList.contains('doc-image-block')
+    ) {
+      continue;
+    }
+    const tag = blk.tagName.toUpperCase();
+    if (tag !== 'P' && tag !== 'DIV' && tag !== 'LI') continue;
+
+    const rawText = (blk.textContent || '').replace(/\u00A0/g, ' ').trim();
+    const decMatch = matchDecisionLine(rawText);
+    if (decMatch && decMatch.text) {
+      stripLeadingMarkerFromBlockDom(blk, 'decision');
+      const p = document.createElement('p');
+      p.className = 'doc-decision';
+      p.setAttribute('data-status', decMatch.status);
+      p.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
+      replaceBlockElement(blk, p);
+      continue;
+    }
+
+    const taskMatch = matchTaskLine(rawText);
+    if (taskMatch && taskMatch.text) {
+      stripLeadingMarkerFromBlockDom(blk, 'task');
+      const p = document.createElement('p');
+      p.className = 'doc-task';
+      p.setAttribute('data-status', taskMatch.status);
+      p.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
+      replaceBlockElement(blk, p);
+    }
+  }
 }
 
 function getSelectedEditableBlocks(root: HTMLElement): HTMLElement[] {
@@ -1883,11 +1984,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       !blk.classList.contains('doc-task') &&
       !blk.classList.contains('doc-decision');
 
-    // Inside a fresh <li> (e.g. user typed "- " which became <li>, then typed "[ ] " or "[D] ")
+    // Inside a fresh <li> (e.g. user typed "- " which became <li>, then typed "[ ] ", "- [ ] ", "[D] ", or "- [D:proposed] ")
     if (tag === 'LI') {
-      const liTaskMatch = prefix.match(/^\[([ /?xX])\]\s$/);
+      const liTaskMatch = prefix.match(/^\s*(?:[-*+•]\s*)*\[([ /?xX])?\]\s$/);
       if (liTaskMatch) {
-        const ch = liTaskMatch[1].toLowerCase();
+        const ch = (liTaskMatch[1] || ' ').toLowerCase();
         const st: TaskStatus = ch === 'x' ? 'done' : ch === '/' ? 'doing' : ch === '?' ? 'waiting' : 'todo';
         return stripPrefixAndConvert(() => {
           const p = document.createElement('p');
@@ -1896,9 +1997,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           return p;
         });
       }
-      const liDecMatch = prefix.match(/^\[D(?::(agreed|proposed|superseded))?\]\s$/i);
+      const liDecMatch = prefix.match(/^\s*(?:[-*+•]\s*)*\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\]\s$/i);
       if (liDecMatch) {
-        const st = (liDecMatch[1] || 'agreed').toLowerCase();
+        const st = normalizeDecisionStatus(liDecMatch[1]);
         return stripPrefixAndConvert(() => {
           const p = document.createElement('p');
           p.className = 'doc-decision';
@@ -1929,7 +2030,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         return bq;
       });
     }
-    if (/^(?:[-*]\s*)?\[([ /?xX])?\]\s$/.test(prefix)) {
+    if (/^\s*(?:[-*+•]\s*)*\[([ /?xX])?\]\s$/.test(prefix)) {
       const m = prefix.match(/\[([ /?xX])?\]/);
       const ch = (m?.[1] || ' ').toLowerCase();
       const st: TaskStatus = ch === 'x' ? 'done' : ch === '/' ? 'doing' : ch === '?' ? 'waiting' : 'todo';
@@ -1940,9 +2041,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         return p;
       });
     }
-    if (/^(?:[-*]\s*)?\[D(?::(agreed|proposed|superseded))?\]\s$/i.test(prefix)) {
-      const m = prefix.match(/\[D(?::(agreed|proposed|superseded))?\]/i);
-      const st = (m?.[1] || 'agreed').toLowerCase();
+    if (/^\s*(?:[-*+•]\s*)*\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\]\s$/i.test(prefix)) {
+      const m = prefix.match(/\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\]/i);
+      const st = normalizeDecisionStatus(m?.[1]);
       return stripPrefixAndConvert(() => {
         const p = document.createElement('p');
         p.className = 'doc-decision';
@@ -2734,7 +2835,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     e.preventDefault();
 
     const looksLikeMarkdown =
-      /(?:^|\n)\s*(?:#{1,3}\s|[-*]\s*\[(?:[ /?xX]|D)|[-*]\s+|\d+\.\s+|>\s|!\[[^\]]*\]\([^)]+\))/i.test(
+      /(?:^|\n)\s*(?:#{1,6}\s|(?:[-*+•]\s*)*\[(?:[ /?xX]?|D(?::[a-zA-ZäöüÄÖÜß_-]+)?)\](?:\s|$)|[-*+•]\s+|\d+[.)]\s+|>\s|!\[[^\]]*\]\([^)]+\))/i.test(
         plainData
       ) || /@\[[^\]]+\]|\[\[[^\]]+\]\]/.test(plainData);
 
@@ -2743,11 +2844,19 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       cleanHtml = sanitizePastedHtml(htmlData, directory.people);
     }
     if (!cleanHtml && plainData) {
-      cleanHtml = markdownToHtml(plainData.replace(/\r\n/g, '\n'), directory.people);
+      cleanHtml = markdownToHtml(plainData.replace(/\r\n?/g, '\n'), directory.people);
     }
     if (!cleanHtml) return;
 
-    document.execCommand('insertHTML', false, cleanHtml);
+    // Tag decision and task blocks with a marker span so if browser `insertHTML` merges the first block
+    // into an existing <p> or <li> at the caret, upgradeInlineTaskAndDecisionBlocks promotes it cleanly.
+    const htmlWithMarkers = cleanHtml.replace(
+      /<p class="doc-(decision|task)" data-status="([^"]*)">/g,
+      '<p class="doc-$1" data-status="$2"><span data-strata-block="$1" data-strata-status="$2"></span>'
+    );
+
+    document.execCommand('insertHTML', false, htmlWithMarkers);
+    upgradeInlineTaskAndDecisionBlocks(root);
     emitMarkdownFromDom({ label: 'Paste', coalesceKey: null });
     refreshSelectionToolbarState();
   };
