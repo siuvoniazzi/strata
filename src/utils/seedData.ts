@@ -124,7 +124,7 @@ export function createBlankInitialNote(): Note {
 
 export function createSeedWorkspace(): { notes: Note[]; directory: WorkspaceDirectory } {
   return {
-    notes: [createBlankInitialNote()],
+    notes: [],
     directory: {
       clients: [],
       projects: [],
@@ -155,7 +155,7 @@ export function purgeLegacyDemoData(
     filteredLabels.length !== directory.customLabels.length;
 
   return {
-    notes: filteredNotes.length > 0 ? filteredNotes : [createBlankInitialNote()],
+    notes: filteredNotes,
     directory: {
       clients: filteredClients,
       projects: filteredProjects,

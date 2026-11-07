@@ -102,6 +102,7 @@ interface UndoSnapshot {
   notes: Note[];
   directory: WorkspaceDirectory;
   activeNoteId: string;
+  draftNote: Note | null;
 }
 
 function makeFreshNote(partial?: Partial<Note>): Note {
@@ -123,14 +124,50 @@ function makeFreshNote(partial?: Partial<Note>): Note {
   };
 }
 
+function areStringArraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function hasNoteChangedFromDraft(candidate: Note, baseline: Note): boolean {
+  return (
+    candidate.title !== baseline.title ||
+    candidate.body !== baseline.body ||
+    candidate.date !== baseline.date ||
+    candidate.scope !== baseline.scope ||
+    candidate.clientId !== baseline.clientId ||
+    candidate.projectId !== baseline.projectId ||
+    !areStringArraysEqual(candidate.participants, baseline.participants) ||
+    !areStringArraysEqual(candidate.labels, baseline.labels)
+  );
+}
+
+function isUntouchedBlankNote(n: Note): boolean {
+  return (
+    !n.title.trim() &&
+    !n.body.trim() &&
+    n.scope === 'inbox' &&
+    !n.clientId &&
+    !n.projectId &&
+    n.participants.length === 0 &&
+    n.labels.length === 0
+  );
+}
+
 export function App() {
   const seed = useMemo(() => createSeedWorkspace(), []);
   const initialPrefs = useMemo(() => loadWorkspacePreferences(), []);
+  const [initialDraft] = useState<Note>(() => makeFreshNote());
 
   const [preferences, setPreferences] = useState<WorkspacePreferences>(initialPrefs);
+  const [draftNote, setDraftNote] = useState<Note | null>(initialDraft);
+  const draftBaselineRef = useRef<Note | null>(initialDraft);
   const [notes, setNotes] = useState<Note[]>(seed.notes);
   const [directory, setDirectory] = useState<WorkspaceDirectory>(seed.directory);
-  const [activeNoteId, setActiveNoteId] = useState<string>(seed.notes[0]?.id || '');
+  const [activeNoteId, setActiveNoteId] = useState<string>(initialDraft.id);
   const [mainView, setMainView] = useState<ActiveMainView>('notes');
   const [noteFilter, setNoteFilter] = useState<NoteFilter>({ kind: 'all' });
   const [listSearch, setListSearch] = useState('');
@@ -260,6 +297,15 @@ export function App() {
     return () => window.removeEventListener('paste', onPasteCapture, true);
   }, []);
 
+  // Focus the fresh note title immediately on desktop startup without mutating note content
+  useEffect(() => {
+    if (typeof window === 'undefined' || window.innerWidth <= 860) return;
+    const t = window.setTimeout(() => {
+      document.getElementById('note-title-input')?.focus();
+    }, 30);
+    return () => window.clearTimeout(t);
+  }, []);
+
   // Hydrate workspace from IndexedDB + one-time purge of v1 demo records
   useEffect(() => {
     let mounted = true;
@@ -274,28 +320,28 @@ export function App() {
         ]);
 
         if (!mounted) return;
-        const startupMode = loadWorkspacePreferences().startupLayout;
 
         if (savedNotes && savedDir) {
           if (!demoPurgedV2) {
             const purged = purgeLegacyDemoData(savedNotes, savedDir);
-            setNotes(purged.notes);
+            const cleanedNotes = purged.notes.filter((n) => !isUntouchedBlankNote(n));
+            setNotes((prev) => {
+              if (prev.length === 0) return cleanedNotes;
+              const hydratedIds = new Set(cleanedNotes.map((n) => n.id));
+              const newlyEdited = prev.filter((n) => !hydratedIds.has(n.id));
+              return [...newlyEdited, ...cleanedNotes];
+            });
             setDirectory(purged.directory);
-            setActiveNoteId(purged.notes[0]?.id || '');
-            if (
-              startupMode === 'standard' &&
-              typeof window !== 'undefined' &&
-              window.innerWidth <= 860 &&
-              (purged.notes.length > 1 || purged.notes[0]?.title.trim() || purged.notes[0]?.body.trim())
-            ) {
-              setMobileNotesPane('list');
-            }
-            await idbSet('notes', purged.notes);
+            await idbSet('notes', cleanedNotes);
             await idbSet('directory', purged.directory);
             await idbSet('demoPurgedV2', true);
 
-            if (purged.didPurge && persistedHandle.handle && persistedHandle.permission === 'granted') {
-              const keptIds = new Set(purged.notes.map((n) => n.id));
+            if (
+              (purged.didPurge || cleanedNotes.length !== purged.notes.length) &&
+              persistedHandle.handle &&
+              persistedHandle.permission === 'granted'
+            ) {
+              const keptIds = new Set(cleanedNotes.map((n) => n.id));
               for (const oldNote of savedNotes) {
                 if (!keptIds.has(oldNote.id) && oldNote.filePath) {
                   removeNestedFileIfExists(persistedHandle.handle, oldNote.filePath).catch(() => {});
@@ -304,23 +350,28 @@ export function App() {
               writeDirectoryMetadata(persistedHandle.handle, purged.directory).catch(() => {});
             }
           } else {
-            const hydratedNotes = savedNotes.length > 0 ? savedNotes : seed.notes;
-            setNotes(hydratedNotes);
+            const cleanedNotes = savedNotes.filter((n) => !isUntouchedBlankNote(n));
+            setNotes((prev) => {
+              if (prev.length === 0) return cleanedNotes;
+              const hydratedIds = new Set(cleanedNotes.map((n) => n.id));
+              const newlyEdited = prev.filter((n) => !hydratedIds.has(n.id));
+              return [...newlyEdited, ...cleanedNotes];
+            });
             setDirectory(savedDir);
-            setActiveNoteId(hydratedNotes[0].id);
-            if (
-              startupMode === 'standard' &&
-              typeof window !== 'undefined' &&
-              window.innerWidth <= 860 &&
-              (hydratedNotes.length > 1 ||
-                hydratedNotes[0]?.title.trim() ||
-                hydratedNotes[0]?.body.trim())
-            ) {
-              setMobileNotesPane('list');
+
+            if (cleanedNotes.length !== savedNotes.length) {
+              await idbSet('notes', cleanedNotes);
+              if (persistedHandle.handle && persistedHandle.permission === 'granted') {
+                const keptIds = new Set(cleanedNotes.map((n) => n.id));
+                for (const oldNote of savedNotes) {
+                  if (!keptIds.has(oldNote.id) && oldNote.filePath) {
+                    removeNestedFileIfExists(persistedHandle.handle, oldNote.filePath).catch(() => {});
+                  }
+                }
+              }
             }
           }
         } else {
-          await idbSet('notes', seed.notes);
           await idbSet('directory', seed.directory);
           await idbSet('demoPurgedV2', true);
         }
@@ -365,12 +416,13 @@ export function App() {
         notes,
         directory,
         activeNoteId,
+        draftNote,
       });
       undoTimerRef.current = window.setTimeout(() => {
         setUndoSnapshot(null);
       }, 7000);
     },
-    [notes, directory, activeNoteId]
+    [notes, directory, activeNoteId, draftNote]
   );
 
   const handleUndo = useCallback(() => {
@@ -378,6 +430,8 @@ export function App() {
     if (undoTimerRef.current) window.clearTimeout(undoTimerRef.current);
     setNotes(undoSnapshot.notes);
     setDirectory(undoSnapshot.directory);
+    setDraftNote(undoSnapshot.draftNote);
+    draftBaselineRef.current = undoSnapshot.draftNote;
     setActiveNoteId(undoSnapshot.activeNoteId);
     setUndoSnapshot(null);
     if (dirHandle && dirPermission === 'granted') {
@@ -404,6 +458,10 @@ export function App() {
   }, []);
 
   const openNoteEditor = useCallback((id: string) => {
+    if (draftBaselineRef.current && draftBaselineRef.current.id !== id) {
+      draftBaselineRef.current = null;
+      setDraftNote(null);
+    }
     setOverlayStack([]);
     setActiveNoteId(id);
     setMainView('notes');
@@ -477,7 +535,8 @@ export function App() {
       participants: noteFilter.personName ? [noteFilter.personName] : [],
     });
 
-    setNotes((prev) => [fresh, ...prev]);
+    draftBaselineRef.current = fresh;
+    setDraftNote(fresh);
     openNewNoteInEditor(fresh.id);
     setTimeout(() => {
       document.getElementById('note-title-input')?.focus();
@@ -546,8 +605,33 @@ export function App() {
   }, [handleSpinUpNote, handleToggleFocusMode]);
 
   const activeNote = useMemo(() => {
-    return notes.find((n) => n.id === activeNoteId) || notes[0] || makeFreshNote();
-  }, [notes, activeNoteId]);
+    const savedMatch = notes.find((n) => n.id === activeNoteId);
+    if (savedMatch) return savedMatch;
+    if (draftNote && draftNote.id === activeNoteId) return draftNote;
+    return notes[0] || draftNote || initialDraft;
+  }, [notes, activeNoteId, draftNote, initialDraft]);
+
+  const syncSingleNoteToDisk = useCallback(
+    async (updatedNote: Note, previousPath?: string, customDir?: WorkspaceDirectory) => {
+      if (!dirHandle || dirPermission !== 'granted') return;
+      try {
+        const nextPath = await writeNoteToFolder(
+          dirHandle,
+          updatedNote,
+          customDir || directory,
+          previousPath
+        );
+        if (nextPath !== updatedNote.filePath) {
+          setNotes((prev) =>
+            prev.map((n) => (n.id === updatedNote.id ? { ...n, filePath: nextPath } : n))
+          );
+        }
+      } catch {
+        setSyncStatus('Sync warning — check folder access');
+      }
+    },
+    [dirHandle, dirPermission, directory]
+  );
 
   const handleOpenOrCreateNoteByTitle = useCallback(
     (targetTitle: string) => {
@@ -557,17 +641,30 @@ export function App() {
       if (found) {
         openNoteEditor(found.id);
       } else {
-        const created = makeFreshNote({
+        const raw = makeFreshNote({
           title: targetTitle,
           scope: activeNote.scope,
           clientId: activeNote.clientId,
           projectId: activeNote.projectId,
         });
+        const created = { ...raw, filePath: computeNoteFilePath(raw, directory) };
+        draftBaselineRef.current = null;
+        setDraftNote(null);
         setNotes((prev) => [created, ...prev]);
+        syncSingleNoteToDisk(created);
         openNewNoteInEditor(created.id);
       }
     },
-    [notes, activeNote.scope, activeNote.clientId, activeNote.projectId, openNoteEditor, openNewNoteInEditor]
+    [
+      notes,
+      activeNote.scope,
+      activeNote.clientId,
+      activeNote.projectId,
+      directory,
+      syncSingleNoteToDisk,
+      openNoteEditor,
+      openNewNoteInEditor,
+    ]
   );
 
   const handlePeekOrCreateNoteByTitle = useCallback(
@@ -589,18 +686,28 @@ export function App() {
           );
         }
       } else {
-        const created = makeFreshNote({
+        const raw = makeFreshNote({
           title: targetTitle,
           scope: activeNote.scope,
           clientId: activeNote.clientId,
           projectId: activeNote.projectId,
         });
+        const created = { ...raw, filePath: computeNoteFilePath(raw, directory) };
         setNotes((prev) => [created, ...prev]);
+        syncSingleNoteToDisk(created);
         const entry: OverlayEntry = { kind: 'note', noteId: created.id };
         setOverlayStack((prev) => (prev.length > 0 ? [...prev, entry] : [entry]));
       }
     },
-    [notes, activeNote.id, activeNote.scope, activeNote.clientId, activeNote.projectId]
+    [
+      notes,
+      activeNote.id,
+      activeNote.scope,
+      activeNote.clientId,
+      activeNote.projectId,
+      directory,
+      syncSingleNoteToDisk,
+    ]
   );
 
   const allWorkspaceLabels = useMemo(() => {
@@ -648,34 +755,25 @@ export function App() {
     });
   }, [notes, noteFilter, listSearch, directory.people]);
 
-  const syncSingleNoteToDisk = useCallback(
-    async (updatedNote: Note, previousPath?: string, customDir?: WorkspaceDirectory) => {
-      if (!dirHandle || dirPermission !== 'granted') return;
-      try {
-        const nextPath = await writeNoteToFolder(
-          dirHandle,
-          updatedNote,
-          customDir || directory,
-          previousPath
-        );
-        if (nextPath !== updatedNote.filePath) {
-          setNotes((prev) =>
-            prev.map((n) => (n.id === updatedNote.id ? { ...n, filePath: nextPath } : n))
-          );
-        }
-      } catch {
-        setSyncStatus('Sync warning — check folder access');
-      }
-    },
-    [dirHandle, dirPermission, directory]
-  );
-
   const handleUpdateNote = useCallback(
     (updated: Note) => {
+      const baseline = draftBaselineRef.current;
+      if (baseline && baseline.id === updated.id) {
+        if (!hasNoteChangedFromDraft(updated, baseline)) {
+          return;
+        }
+        draftBaselineRef.current = null;
+        setDraftNote(null);
+      }
+
       const prevNote = notes.find((n) => n.id === updated.id);
       const computedPath = computeNoteFilePath(updated, directory);
       const withPath = { ...updated, filePath: computedPath };
-      setNotes((prev) => prev.map((n) => (n.id === updated.id ? withPath : n)));
+      setNotes((prev) =>
+        prev.some((n) => n.id === updated.id)
+          ? prev.map((n) => (n.id === updated.id ? withPath : n))
+          : [withPath, ...prev]
+      );
       syncSingleNoteToDisk(withPath, prevNote?.filePath);
     },
     [notes, directory, syncSingleNoteToDisk]
@@ -683,18 +781,42 @@ export function App() {
 
   const handleDeleteNote = useCallback(
     (noteId: string) => {
+      if (draftNote && draftNote.id === noteId) {
+        if (notes.length > 0) {
+          draftBaselineRef.current = null;
+          setDraftNote(null);
+          setActiveNoteId(notes[0].id);
+          if (typeof window !== 'undefined' && window.innerWidth <= 860) {
+            setMobileNotesPane('list');
+          }
+        } else {
+          const fresh = makeFreshNote();
+          draftBaselineRef.current = fresh;
+          setDraftNote(fresh);
+          setActiveNoteId(fresh.id);
+          setMobileNotesPane('editor');
+        }
+        return;
+      }
+
       const target = notes.find((n) => n.id === noteId);
       if (!target) return;
       pushUndo(`Deleted note "${target.title || 'Untitled Note'}"`);
       const remaining = notes.filter((n) => n.id !== noteId);
       if (remaining.length === 0) {
         const fresh = makeFreshNote();
-        setNotes([fresh]);
+        draftBaselineRef.current = fresh;
+        setDraftNote(fresh);
+        setNotes([]);
         setActiveNoteId(fresh.id);
         setMobileNotesPane('editor');
       } else {
         setNotes(remaining);
-        if (activeNoteId === noteId) setActiveNoteId(remaining[0].id);
+        if (activeNoteId === noteId) {
+          draftBaselineRef.current = null;
+          setDraftNote(null);
+          setActiveNoteId(remaining[0].id);
+        }
         if (typeof window !== 'undefined' && window.innerWidth <= 860) {
           setMobileNotesPane('list');
         }
@@ -703,7 +825,7 @@ export function App() {
         removeNestedFileIfExists(dirHandle, target.filePath);
       }
     },
-    [notes, activeNoteId, dirHandle, dirPermission, pushUndo]
+    [draftNote, notes, activeNoteId, dirHandle, dirPermission, pushUndo]
   );
 
   const handleEnsurePerson = useCallback(
@@ -1024,7 +1146,12 @@ export function App() {
       const synced = await syncWorkspaceWithFolder(picked, notes, directory);
       setNotes(synced.notes);
       setDirectory(synced.directory);
-      if (synced.notes.length > 0 && !synced.notes.some((n) => n.id === activeNoteId)) {
+      const isEditingDraft = draftBaselineRef.current?.id === activeNoteId;
+      if (
+        !isEditingDraft &&
+        synced.notes.length > 0 &&
+        !synced.notes.some((n) => n.id === activeNoteId)
+      ) {
         setActiveNoteId(synced.notes[0].id);
       }
       setSyncStatus(`Synced: ${picked.name}`);
@@ -1045,8 +1172,10 @@ export function App() {
       people: [],
       customLabels: [],
     };
+    draftBaselineRef.current = fresh;
+    setDraftNote(fresh);
     setOverlayStack([]);
-    setNotes([fresh]);
+    setNotes([]);
     setDirectory(emptyDir);
     setActiveNoteId(fresh.id);
     setNoteFilter({ kind: 'all' });
@@ -1690,7 +1819,7 @@ export function App() {
                     const res = await importFilesIntoWorkspace(e.target.files, notes, directory);
                     setNotes(res.notes);
                     setDirectory(res.directory);
-                    if (res.notes[0]) setActiveNoteId(res.notes[0].id);
+                    if (res.notes[0]) openNoteEditor(res.notes[0].id);
                     e.target.value = '';
                   }
                 }}
@@ -1827,7 +1956,10 @@ export function App() {
                   {mainView === 'notes' && activeNote && (
                     <>
                       <ChevronRight size={13} />
-                      <span className="breadcrumb-active">{activeNote.title || 'Untitled Note'}</span>
+                      <span className="breadcrumb-active">
+                        {activeNote.title ||
+                          (draftNote?.id === activeNote.id ? 'New Note' : 'Untitled Note')}
+                      </span>
                     </>
                   )}
                 </div>
@@ -2099,7 +2231,7 @@ export function App() {
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
             onDeleteDecision={handleDeleteRemoteDecision}
             onSaveBriefAsNote={(title, body, cId, pId) => {
-              const saved = makeFreshNote({
+              const raw = makeFreshNote({
                 title,
                 body,
                 scope: cId ? 'client' : 'internal',
@@ -2107,7 +2239,11 @@ export function App() {
                 projectId: pId,
                 labels: ['report'],
               });
+              const saved = { ...raw, filePath: computeNoteFilePath(raw, directory) };
+              draftBaselineRef.current = null;
+              setDraftNote(null);
               setNotes((prev) => [saved, ...prev]);
+              syncSingleNoteToDisk(saved);
               openNewNoteInEditor(saved.id);
             }}
           />
@@ -2320,7 +2456,7 @@ export function App() {
           onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
           onDeleteDecision={handleDeleteRemoteDecision}
           onSaveBriefAsNote={(title, body, cId, pId) => {
-            const saved = makeFreshNote({
+            const raw = makeFreshNote({
               title,
               body,
               scope: cId ? 'client' : 'internal',
@@ -2328,7 +2464,9 @@ export function App() {
               projectId: pId,
               labels: ['report'],
             });
+            const saved = { ...raw, filePath: computeNoteFilePath(raw, directory) };
             setNotes((prev) => [saved, ...prev]);
+            syncSingleNoteToDisk(saved);
             pushOverlay({ kind: 'note', noteId: saved.id });
           }}
         />
