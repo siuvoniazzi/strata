@@ -385,18 +385,93 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
   };
 }
 
+export interface AiActivitySnapshot {
+  activeCount: number;
+  isBusy: boolean;
+  label: string | null;
+  providerLabel: string | null;
+}
+
+export function formatAiEngineLabel(config: AiConfig): string {
+  if (config.provider === 'local' || !config.apiKey.trim()) {
+    return 'Local Smart Engine';
+  }
+  if (config.provider === 'azure') {
+    return `AZURE (${config.azureDeployment || config.model || 'gpt-4o'})`;
+  }
+  return `${config.provider.toUpperCase()} (${config.model})`;
+}
+
+let nextRequestId = 1;
+const activeAiRequests = new Map<number, { label: string; providerLabel: string }>();
+const aiListeners = new Set<() => void>();
+let currentAiSnapshot: AiActivitySnapshot = {
+  activeCount: 0,
+  isBusy: false,
+  label: null,
+  providerLabel: null,
+};
+
+function emitAiActivity(): void {
+  const entries = Array.from(activeAiRequests.values());
+  const latest = entries[entries.length - 1] || null;
+  currentAiSnapshot = {
+    activeCount: entries.length,
+    isBusy: entries.length > 0,
+    label: latest ? latest.label : null,
+    providerLabel: latest ? latest.providerLabel : null,
+  };
+  for (const listener of aiListeners) {
+    listener();
+  }
+}
+
+export function subscribeAiActivity(listener: () => void): () => void {
+  aiListeners.add(listener);
+  return () => {
+    aiListeners.delete(listener);
+  };
+}
+
+export function getAiActivitySnapshot(): AiActivitySnapshot {
+  return currentAiSnapshot;
+}
+
+async function withAiActivity<T>(
+  label: string,
+  config: AiConfig,
+  fn: () => Promise<T>
+): Promise<T> {
+  const reqId = nextRequestId++;
+  const providerLabel = formatAiEngineLabel(config);
+  activeAiRequests.set(reqId, { label, providerLabel });
+  emitAiActivity();
+
+  const isOfflineEngine = config.provider === 'local' || !config.apiKey.trim();
+  try {
+    if (isOfflineEngine) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 240));
+    }
+    return await fn();
+  } finally {
+    activeAiRequests.delete(reqId);
+    emitAiActivity();
+  }
+}
+
 export async function generateStructureProposal(
   note: Note,
   directory: WorkspaceDirectory,
   config: AiConfig
 ): Promise<AiStructureProposal> {
-  const localProposal = buildLocalStructureProposal(note, directory);
-  if (config.provider === 'local' || !config.apiKey.trim()) {
-    return localProposal;
-  }
+  return withAiActivity('AI: Structuring note…', config, async () => {
+    const localProposal = buildLocalStructureProposal(note, directory);
+    if (config.provider === 'local' || !config.apiKey.trim()) {
+      return localProposal;
+    }
 
-  try {
-    const systemPrompt = `You are an executive note-structuring assistant. Return STRICT JSON matching this schema:
+    try {
+      const systemPrompt = `You are an executive note-structuring assistant. Return STRICT JSON matching this schema:
 {
   "suggestedTitle": "string",
   "clientName": "string or null",
@@ -409,7 +484,7 @@ export async function generateStructureProposal(
 }
 Preserve the original language and factual precision of the note.`;
 
-    const userPrompt = `Known Clients: ${directory.clients.map((c) => c.name).join(', ') || 'None'}
+      const userPrompt = `Known Clients: ${directory.clients.map((c) => c.name).join(', ') || 'None'}
 Known Projects: ${directory.projects.map((p) => p.name).join(', ') || 'None'}
 Known People: ${directory.people.map((p) => `${p.name}${p.role ? ` (${p.role})` : ''}`).join(', ') || 'None'}
 Note Date: ${note.date}
@@ -417,39 +492,46 @@ Current Title: ${note.title}
 Current Body:
 ${note.body}`;
 
-    const raw = await callConfiguredLlm(systemPrompt, userPrompt, config);
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return localProposal;
-    const parsed = JSON.parse(jsonMatch[0]);
+      const raw = await callConfiguredLlm(systemPrompt, userPrompt, config);
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return localProposal;
+      const parsed = JSON.parse(jsonMatch[0]);
 
-    const matchedClient = parsed.clientName
-      ? directory.clients.find((c) => c.name.toLowerCase() === String(parsed.clientName).toLowerCase())
-      : null;
-    const matchedProj = parsed.projectName
-      ? directory.projects.find((p) => p.name.toLowerCase() === String(parsed.projectName).toLowerCase())
-      : null;
+      const matchedClient = parsed.clientName
+        ? directory.clients.find((c) => c.name.toLowerCase() === String(parsed.clientName).toLowerCase())
+        : null;
+      const matchedProj = parsed.projectName
+        ? directory.projects.find((p) => p.name.toLowerCase() === String(parsed.projectName).toLowerCase())
+        : null;
 
-    return {
-      suggestedTitle: parsed.suggestedTitle || localProposal.suggestedTitle,
-      suggestedScope: matchedClient ? 'client' : matchedProj ? matchedProj.scope : localProposal.suggestedScope,
-      suggestedClientId: matchedClient?.id ?? localProposal.suggestedClientId,
-      suggestedProjectId: matchedProj?.id ?? localProposal.suggestedProjectId,
-      suggestedParticipants: Array.isArray(parsed.suggestedParticipants)
-        ? parsed.suggestedParticipants
-        : localProposal.suggestedParticipants,
-      suggestedLabels: Array.isArray(parsed.suggestedLabels)
-        ? parsed.suggestedLabels.map(normalizeLabel).filter(Boolean)
-        : localProposal.suggestedLabels,
-      extractedTasks: Array.isArray(parsed.extractedTasks) ? parsed.extractedTasks : localProposal.extractedTasks,
-      extractedDecisions: Array.isArray(parsed.extractedDecisions)
-        ? parsed.extractedDecisions
-        : localProposal.extractedDecisions,
-      restructuredBody: parsed.restructuredBody || localProposal.restructuredBody,
-      usedProvider: `${config.provider.toUpperCase()} (${config.model})`,
-    };
-  } catch {
-    return localProposal;
-  }
+      return {
+        suggestedTitle: parsed.suggestedTitle || localProposal.suggestedTitle,
+        suggestedScope: matchedClient ? 'client' : matchedProj ? matchedProj.scope : localProposal.suggestedScope,
+        suggestedClientId: matchedClient?.id ?? localProposal.suggestedClientId,
+        suggestedProjectId: matchedProj?.id ?? localProposal.suggestedProjectId,
+        suggestedParticipants: Array.isArray(parsed.suggestedParticipants)
+          ? parsed.suggestedParticipants
+          : localProposal.suggestedParticipants,
+        suggestedLabels: Array.isArray(parsed.suggestedLabels)
+          ? parsed.suggestedLabels.map(normalizeLabel).filter(Boolean)
+          : localProposal.suggestedLabels,
+        extractedTasks: Array.isArray(parsed.extractedTasks) ? parsed.extractedTasks : localProposal.extractedTasks,
+        extractedDecisions: Array.isArray(parsed.extractedDecisions)
+          ? parsed.extractedDecisions
+          : localProposal.extractedDecisions,
+        restructuredBody: parsed.restructuredBody || localProposal.restructuredBody,
+        usedProvider: formatAiEngineLabel(config),
+      };
+    } catch {
+      return localProposal;
+    }
+  });
+}
+
+function unwrapOuterMarkdownFence(raw: string): string {
+  const trimmed = raw.trim();
+  const match = trimmed.match(/^```(?:markdown|md)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
+  return match ? match[1].trim() : trimmed;
 }
 
 export async function askWorkspaceWithAiOrFallback(
@@ -458,30 +540,34 @@ export async function askWorkspaceWithAiOrFallback(
   directory: WorkspaceDirectory,
   config: AiConfig
 ): Promise<{ answerMarkdown: string; citedNotes: Note[]; usedProvider: string }> {
-  const localResult = localAskWorkspace(question, allNotes, directory);
-  if (config.provider === 'local' || !config.apiKey.trim() || localResult.citedNotes.length === 0) {
-    return { ...localResult, usedProvider: 'Local Context Index' };
-  }
+  return withAiActivity('AI: Answering query…', config, async () => {
+    const localResult = localAskWorkspace(question, allNotes, directory);
+    if (config.provider === 'local' || !config.apiKey.trim() || localResult.citedNotes.length === 0) {
+      return { ...localResult, usedProvider: 'Local Context Index' };
+    }
 
-  try {
-    const contextDump = localResult.citedNotes
-      .map((n) => `--- NOTE: [[${n.title}]] (${n.date}) ---\n${n.body}`)
-      .join('\n\n');
+    try {
+      const contextDump = localResult.citedNotes
+        .map((n) => `--- NOTE: [[${n.title}]] (${n.date}) ---\n${n.body}`)
+        .join('\n\n');
 
-    const answer = await callConfiguredLlm(
-      'Answer concisely using ONLY the provided notes. Cite source notes inline using [[Exact Note Title]]. Highlight relevant decisions and open tasks.',
-      `Question: ${question}\n\nNotes:\n${contextDump}`,
-      config
-    );
+      const answer = await callConfiguredLlm(
+        'Answer concisely using ONLY the provided notes. Cite source notes inline using [[Exact Note Title]]. Highlight relevant decisions and open tasks.',
+        `Question: ${question}\n\nNotes:\n${contextDump}`,
+        config
+      );
 
-    return {
-      answerMarkdown: answer.trim() || localResult.answerMarkdown,
-      citedNotes: localResult.citedNotes,
-      usedProvider: `${config.provider.toUpperCase()} (${config.model})`,
-    };
-  } catch {
-    return { ...localResult, usedProvider: 'Local Context Index (Fallback)' };
-  }
+      const cleanedAnswer = unwrapOuterMarkdownFence(answer);
+
+      return {
+        answerMarkdown: cleanedAnswer || localResult.answerMarkdown,
+        citedNotes: localResult.citedNotes,
+        usedProvider: formatAiEngineLabel(config),
+      };
+    } catch {
+      return { ...localResult, usedProvider: 'Local Context Index (Fallback)' };
+    }
+  });
 }
 
 export async function generateExecutiveBriefWithAiOrFallback(params: {
@@ -491,27 +577,30 @@ export async function generateExecutiveBriefWithAiOrFallback(params: {
   decisions: ParsedDecision[];
   config: AiConfig;
 }): Promise<{ markdown: string; usedProvider: string }> {
-  const fallback = buildDeterministicExecutiveBrief(params);
-  if (params.config.provider === 'local' || !params.config.apiKey.trim()) {
-    return { markdown: fallback, usedProvider: 'Local Structured Synthesizer' };
-  }
+  return withAiActivity('AI: Synthesizing brief…', params.config, async () => {
+    const fallback = buildDeterministicExecutiveBrief(params);
+    if (params.config.provider === 'local' || !params.config.apiKey.trim()) {
+      return { markdown: fallback, usedProvider: 'Local Structured Synthesizer' };
+    }
 
-  try {
-    const context = params.notes
-      .slice(0, 10)
-      .map((n) => `[[${n.title}]] (${n.date}):\n${n.body.slice(0, 1200)}`)
-      .join('\n\n');
+    try {
+      const context = params.notes
+        .slice(0, 10)
+        .map((n) => `[[${n.title}]] (${n.date}):\n${n.body.slice(0, 1200)}`)
+        .join('\n\n');
 
-    const md = await callConfiguredLlm(
-      'Write a crisp, high-signal executive status report in Markdown with sections for Executive Summary, Key Decisions, Open Action Items (with @owners & due dates), and Risks/Dependencies. Cite notes using [[Note Title]].',
-      `Report Topic: ${params.heading}\n\nSource Notes:\n${context}`,
-      params.config
-    );
-    return {
-      markdown: md.trim() || fallback,
-      usedProvider: `${params.config.provider.toUpperCase()} (${params.config.model})`,
-    };
-  } catch {
-    return { markdown: fallback, usedProvider: 'Local Structured Synthesizer (Fallback)' };
-  }
+      const md = await callConfiguredLlm(
+        'Write a crisp, high-signal executive status report in Markdown with sections for Executive Summary, Key Decisions, Open Action Items (with @owners & due dates), and Risks/Dependencies. Cite notes using [[Note Title]].',
+        `Report Topic: ${params.heading}\n\nSource Notes:\n${context}`,
+        params.config
+      );
+      const cleanedMd = unwrapOuterMarkdownFence(md);
+      return {
+        markdown: cleanedMd || fallback,
+        usedProvider: formatAiEngineLabel(params.config),
+      };
+    } catch {
+      return { markdown: fallback, usedProvider: 'Local Structured Synthesizer (Fallback)' };
+    }
+  });
 }

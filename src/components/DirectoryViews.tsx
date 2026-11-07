@@ -26,6 +26,7 @@ import {
   normalizeLabel,
   parseNoteItems,
 } from '../utils/markdown';
+import { RichInlineText } from './RichInlineText';
 
 const TASK_CYCLE: TaskStatus[] = ['todo', 'doing', 'waiting', 'done'];
 const DEC_CYCLE: DecisionStatus[] = ['agreed', 'proposed', 'superseded'];
@@ -76,9 +77,19 @@ export const TasksGlobalView: React.FC<{
   notes: Note[];
   directory: WorkspaceDirectory;
   onOpenNote: (noteId: string) => void;
+  onOpenNoteByTitle?: (noteTitle: string) => void;
+  onSelectLabel?: (label: string) => void;
   onUpdateTaskStatus: (task: ParsedTask, status: TaskStatus) => void;
   onDeleteTask: (task: ParsedTask) => void;
-}> = ({ notes, directory, onOpenNote, onUpdateTaskStatus, onDeleteTask }) => {
+}> = ({
+  notes,
+  directory,
+  onOpenNote,
+  onOpenNoteByTitle,
+  onSelectLabel,
+  onUpdateTaskStatus,
+  onDeleteTask,
+}) => {
   const [statusFilter, setStatusFilter] = useState<'open' | TaskStatus | 'all'>('open');
   const [spaceFilter, setSpaceFilter] = useState('');
   const [projectFilter, setProjectFilter] = useState('');
@@ -93,6 +104,15 @@ export const TasksGlobalView: React.FC<{
     () => new Map(directory.projects.map((p) => [p.id, p])),
     [directory.projects],
   );
+
+  const handleOpenNoteLink = (targetTitle: string) => {
+    if (onOpenNoteByTitle) {
+      onOpenNoteByTitle(targetTitle);
+      return;
+    }
+    const found = notes.find((n) => n.title.toLowerCase() === targetTitle.toLowerCase());
+    if (found) onOpenNote(found.id);
+  };
 
   const availableProjects = useMemo(() => {
     if (spaceFilter === '__internal__') {
@@ -257,6 +277,11 @@ export const TasksGlobalView: React.FC<{
                 clientById,
                 projectById,
               );
+              const inlineMentions = extractInlineMentions(t.text, directory.people);
+              const ownerAlreadyInline = Boolean(
+                t.owner &&
+                  inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase()),
+              );
               return (
                 <div
                   key={t.id}
@@ -270,8 +295,26 @@ export const TasksGlobalView: React.FC<{
                     >
                       {t.status}
                     </button>
-                    <span className="task-text">{t.text}</span>
-                    {t.owner && <span className="pill pill-person">@{t.owner}</span>}
+                    <span className="task-text">
+                      <RichInlineText
+                        text={t.text}
+                        people={directory.people}
+                        clients={directory.clients}
+                        notes={notes}
+                        onClickPerson={(pName) => setOwnerFilter(pName)}
+                        onClickLabel={onSelectLabel}
+                        onClickNoteLink={handleOpenNoteLink}
+                      />
+                    </span>
+                    {t.owner && !ownerAlreadyInline && (
+                      <button
+                        type="button"
+                        className="pill pill-person"
+                        onClick={() => setOwnerFilter(t.owner!)}
+                      >
+                        @{t.owner}
+                      </button>
+                    )}
                   </div>
                   <div className="task-right">
                     {ctx && (
@@ -318,9 +361,21 @@ export const DecisionsGlobalView: React.FC<{
   notes: Note[];
   directory: WorkspaceDirectory;
   onOpenNote: (noteId: string) => void;
+  onOpenNoteByTitle?: (noteTitle: string) => void;
+  onSelectPerson?: (personName: string) => void;
+  onSelectLabel?: (label: string) => void;
   onUpdateDecisionStatus: (decision: ParsedDecision, status: DecisionStatus) => void;
   onDeleteDecision: (decision: ParsedDecision) => void;
-}> = ({ notes, directory, onOpenNote, onUpdateDecisionStatus, onDeleteDecision }) => {
+}> = ({
+  notes,
+  directory,
+  onOpenNote,
+  onOpenNoteByTitle,
+  onSelectPerson,
+  onSelectLabel,
+  onUpdateDecisionStatus,
+  onDeleteDecision,
+}) => {
   const [statusFilter, setStatusFilter] = useState<'all' | DecisionStatus>('all');
   const [spaceFilter, setSpaceFilter] = useState('');
   const [projectFilter, setProjectFilter] = useState('');
@@ -334,6 +389,15 @@ export const DecisionsGlobalView: React.FC<{
     () => new Map(directory.projects.map((p) => [p.id, p])),
     [directory.projects],
   );
+
+  const handleOpenNoteLink = (targetTitle: string) => {
+    if (onOpenNoteByTitle) {
+      onOpenNoteByTitle(targetTitle);
+      return;
+    }
+    const found = notes.find((n) => n.title.toLowerCase() === targetTitle.toLowerCase());
+    if (found) onOpenNote(found.id);
+  };
 
   const availableProjects = useMemo(() => {
     if (spaceFilter === '__internal__') {
@@ -479,6 +543,10 @@ export const DecisionsGlobalView: React.FC<{
                 clientById,
                 projectById,
               );
+              const inlineMentions = extractInlineMentions(d.text, directory.people);
+              const extraStakeholders = d.stakeholders.filter(
+                (s) => !inlineMentions.some((m) => m.toLowerCase() === s.toLowerCase()),
+              );
               return (
                 <div key={d.id} className="decision-inline-card">
                   <div className="decision-main">
@@ -490,8 +558,18 @@ export const DecisionsGlobalView: React.FC<{
                       >
                         <Gavel size={11} /> {d.status}
                       </button>
-                      <span style={{ fontWeight: 550 }}>{d.text}</span>
-                      {d.stakeholders.map((s) => (
+                      <span style={{ fontWeight: 550 }}>
+                        <RichInlineText
+                          text={d.text}
+                          people={directory.people}
+                          clients={directory.clients}
+                          notes={notes}
+                          onClickPerson={onSelectPerson}
+                          onClickLabel={onSelectLabel}
+                          onClickNoteLink={handleOpenNoteLink}
+                        />
+                      </span>
+                      {extraStakeholders.map((s) => (
                         <span key={s} className="pill pill-person">
                           @{s}
                         </span>
@@ -527,7 +605,20 @@ export const DecisionsGlobalView: React.FC<{
                       </button>
                     </div>
                   </div>
-                  {d.rationale && <div className="decision-rationale">Rationale: {d.rationale}</div>}
+                  {d.rationale && (
+                    <div className="decision-rationale">
+                      Rationale:{' '}
+                      <RichInlineText
+                        text={d.rationale}
+                        people={directory.people}
+                        clients={directory.clients}
+                        notes={notes}
+                        onClickPerson={onSelectPerson}
+                        onClickLabel={onSelectLabel}
+                        onClickNoteLink={handleOpenNoteLink}
+                      />
+                    </div>
+                  )}
                 </div>
               );
             })

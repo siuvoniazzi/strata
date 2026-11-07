@@ -317,7 +317,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     }
 
     // 5. Headings
-    const h3Match = line.match(/^###\s+(.*)$/);
+    const h3Match = line.match(/^#{3,6}\s+(.*)$/);
     if (h3Match) {
       const inner = inlineMarkdownToHtml(h3Match[1], knownPeople);
       htmlBlocks.push(`<h3>${inner || '<br>'}</h3>`);
@@ -342,7 +342,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     }
 
     // 6. Horizontal Rule
-    if (/^\s*---+\s*$/.test(line)) {
+    if (/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line)) {
       htmlBlocks.push('<hr>');
       i++;
       continue;

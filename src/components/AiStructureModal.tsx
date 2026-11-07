@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Check, Copy, KeyRound, ShieldCheck, Sparkles, X } from 'lucide-react';
+import { Check, Code2, Copy, KeyRound, Loader2, ShieldCheck, Sparkles, X } from 'lucide-react';
 import type {
   AiConfig,
   AiProviderType,
@@ -7,11 +7,14 @@ import type {
   Note,
   WorkspaceDirectory,
 } from '../types';
-import { generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
+import { formatAiEngineLabel, generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
 import { serializeTaskLine } from '../utils/markdown';
+import { AiLoadingState } from './AiLoadingState';
+import { RichMarkdown } from './RichMarkdown';
 
 interface AiStructureModalProps {
   note: Note;
+  allNotes?: Note[];
   directory: WorkspaceDirectory;
   aiConfig: AiConfig;
   onClose: () => void;
@@ -21,6 +24,7 @@ interface AiStructureModalProps {
 
 export const AiStructureModal: React.FC<AiStructureModalProps> = ({
   note,
+  allNotes = [],
   directory,
   aiConfig,
   onClose,
@@ -31,6 +35,7 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
   const [proposal, setProposal] = useState<AiStructureProposal | null>(null);
   const [applyMetadata, setApplyMetadata] = useState(true);
   const [bodyMode, setBodyMode] = useState<'append' | 'replace' | 'none'>('replace');
+  const [showRawDiff, setShowRawDiff] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
 
   useEffect(() => {
@@ -133,6 +138,14 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
             <strong>Structure &amp; Extract — Review Before Applying</strong>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className={`btn btn-xs ${showRawDiff ? 'btn-soft' : 'btn-ghost'}`}
+              onClick={() => setShowRawDiff((v) => !v)}
+              title="Toggle raw Markdown view"
+            >
+              <Code2 size={12} /> {showRawDiff ? 'Formatted View' : 'Raw .md'}
+            </button>
             <button type="button" className="btn btn-xs" onClick={handleCopyCopilotPrompt}>
               {copiedPrompt ? <Check size={12} /> : <Copy size={12} />}
               {copiedPrompt ? 'Copied' : 'Copy Prompt'}
@@ -148,9 +161,11 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
 
         <div className="modal-body">
           {loading || !proposal ? (
-            <div style={{ padding: 28, textAlign: 'center', color: 'var(--text-secondary)' }}>
-              Analyzing note structure, people, labels, decisions, and tasks…
-            </div>
+            <AiLoadingState
+              title="Analyzing & structuring note…"
+              subtitle="Detecting @people, Client/Project context, #labels, implicit decisions, and tasks"
+              providerLabel={formatAiEngineLabel(aiConfig)}
+            />
           ) : (
             <>
               <div
@@ -251,13 +266,41 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
                   <div className="form-label" style={{ marginBottom: 4 }}>
                     Current Note Body
                   </div>
-                  <div className="diff-pane">{note.body || '(Empty)'}</div>
+                  {showRawDiff ? (
+                    <div className="diff-pane">{note.body || '(Empty)'}</div>
+                  ) : (
+                    <div className="diff-pane diff-pane-rich">
+                      {note.body.trim() ? (
+                        <RichMarkdown
+                          markdown={note.body}
+                          people={directory.people}
+                          clients={directory.clients}
+                          notes={allNotes}
+                          compact
+                        />
+                      ) : (
+                        <span style={{ color: 'var(--text-muted)' }}>(Empty)</span>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <div className="form-label" style={{ marginBottom: 4 }}>
-                    Proposed Structured Markdown
+                    Proposed Structured Note
                   </div>
-                  <div className="diff-pane">{proposal.restructuredBody}</div>
+                  {showRawDiff ? (
+                    <div className="diff-pane">{proposal.restructuredBody}</div>
+                  ) : (
+                    <div className="diff-pane diff-pane-rich">
+                      <RichMarkdown
+                        markdown={proposal.restructuredBody}
+                        people={directory.people}
+                        clients={directory.clients}
+                        notes={allNotes}
+                        compact
+                      />
+                    </div>
+                  )}
                 </div>
               </div>
             </>
@@ -274,7 +317,14 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
             disabled={loading || !proposal}
             onClick={handleConfirm}
           >
-            Apply Selected Changes
+            {loading ? (
+              <>
+                <Loader2 size={13} className="ai-spin" />
+                Analyzing…
+              </>
+            ) : (
+              'Apply Selected Changes'
+            )}
           </button>
         </div>
       </div>

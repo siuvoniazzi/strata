@@ -39,6 +39,40 @@ export function normalizeLabel(raw: string): string {
 }
 
 /**
+ * Strips Markdown formatting and Strata inline syntax into clean readable plain text for list previews.
+ */
+export function stripMarkdownFormatting(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/!\[([^\]]*)\]\([^)\n]+\)/g, (_, alt: string) => {
+      const cleanAlt = (alt || '').split('|')[0].trim();
+      return cleanAlt && cleanAlt.toLowerCase() !== 'pasted image'
+        ? `[Image: ${cleanAlt}]`
+        : '[Image]';
+    })
+    .replace(/^\s*(?:---+|\*\*\*+|___+)\s*$/gm, '')
+    .replace(/^\s*#{1,6}\s+/gm, '')
+    .replace(/^\s*[-*+•]\s*\[(?:[ /?xX]|D(?::[a-z]+)?)\]\s*/gim, '')
+    .replace(/^\s*>\s*(?:Rationale:\s*)?/gim, '')
+    .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, '')
+    .replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (_, target: string, alias?: string) =>
+      (alias || target).trim()
+    )
+    .replace(/@\[([^\]]+)\]/g, '@$1')
+    .replace(/\[([^\]]+)\]\((?:https?:\/\/|mailto:)[^)\s]+\)/g, '$1')
+    .replace(/`([^`\n]+)`/g, '$1')
+    .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+    .replace(/\*\*(.+?)\*\*/g, '$1')
+    .replace(/(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)/g, '$1')
+    .replace(/~~(.+?)~~/g, '$1')
+    .replace(/\s*\n+\s*/g, ' · ')
+    .replace(/(?:\s*·\s*){2,}/g, ' · ')
+    .replace(/^\s*·\s*|\s*·\s*$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
  * Extracts inline #labels from markdown text while ignoring headings (# Heading) and URLs.
  */
 export function extractInlineLabels(text: string): string[] {

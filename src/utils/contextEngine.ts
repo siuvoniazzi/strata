@@ -25,13 +25,15 @@ export function tokenizeUnicode(text: string): string[] {
 function buildSnippetAroundTerms(body: string, queryTerms: string[]): string {
   const cleanLines = body
     .split('\n')
+    .filter((l) => !/^\s*(?:---+|\*\*\*+|___+)\s*$/.test(l))
     .map((l) =>
       l
         .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt: string) => {
           const cleanAlt = (alt || '').split('|')[0].trim();
           return cleanAlt ? `[Image: ${cleanAlt}]` : '[Image]';
         })
-        .replace(/^\s*[-*#>\s]+/, '')
+        .replace(/^\s*[-*+•]\s*\[(?:[ /?xX]|D(?::[a-z]+)?)\]\s*/i, '')
+        .replace(/^\s*(?:[-*+•#>]+|\d+[.)])\s*/, '')
         .trim()
     )
     .filter((l) => l.length > 6);

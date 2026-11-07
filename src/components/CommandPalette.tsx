@@ -7,6 +7,8 @@ import {
   FolderSync,
   Gavel,
   Hash,
+  Maximize2,
+  Minimize2,
   Moon,
   Search,
   Sparkles,
@@ -22,8 +24,10 @@ interface CommandPaletteProps {
   directory: WorkspaceDirectory;
   allLabels: string[];
   theme: 'light' | 'dark';
+  isFocusMode?: boolean;
   onClose: () => void;
   onNewNote: () => void;
+  onToggleFocusMode?: () => void;
   onDeleteCurrentNote: () => void;
   onSelectNote: (noteId: string) => void;
   onOpenReportForLabel: (label: string) => void;
@@ -39,8 +43,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   directory,
   allLabels,
   theme,
+  isFocusMode = false,
   onClose,
   onNewNote,
+  onToggleFocusMode,
   onDeleteCurrentNote,
   onSelectNote,
   onOpenReportForLabel,
@@ -68,6 +74,19 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         icon: <FilePlus2 size={14} />,
         action: onNewNote,
       },
+      ...(onToggleFocusMode
+        ? [
+            {
+              id: 'act-focus-mode',
+              title: isFocusMode
+                ? 'Exit Focus Mode (Restore Side Panels) — Alt+Z'
+                : 'Focus Mode — Hide All Side Panels & Center Note (Alt+Z)',
+              category: 'Quick Action',
+              icon: isFocusMode ? <Minimize2 size={14} /> : <Maximize2 size={14} />,
+              action: onToggleFocusMode,
+            },
+          ]
+        : []),
       {
         id: 'act-delete-note',
         title: 'Delete Current Note',
@@ -167,7 +186,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     allLabels,
     directory.people,
     theme,
+    isFocusMode,
     onNewNote,
+    onToggleFocusMode,
     onDeleteCurrentNote,
     onTriggerAiStructure,
     onSwitchMainView,

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   BarChart3,
   CheckSquare,
@@ -12,6 +12,9 @@ import {
   Inbox,
   KeyRound,
   Layers,
+  Loader2,
+  Maximize2,
+  Minimize2,
   Moon,
   PanelLeft,
   Plus,
@@ -47,7 +50,11 @@ import type {
   TaskStatus,
   WorkspaceDirectory,
 } from './types';
-import { loadAiConfig } from './utils/aiProvider';
+import {
+  getAiActivitySnapshot,
+  loadAiConfig,
+  subscribeAiActivity,
+} from './utils/aiProvider';
 import { hydrateImagesFromIdb } from './utils/imageStore';
 import {
   computeNoteFilePath,
@@ -59,6 +66,7 @@ import {
   parseNoteItems,
   removeLabelFromNote,
   slugify,
+  stripMarkdownFormatting,
   updateDecisionInBody,
   updateTaskInBody,
 } from './utils/markdown';
@@ -135,6 +143,7 @@ export function App() {
   );
   const [mobileNotesPane, setMobileNotesPane] = useState<'list' | 'editor'>('editor');
   const [radarRequestedTab, setRadarRequestedTab] = useState<'context' | 'ask' | 'outline' | null>(null);
+  const prevPanelsRef = useRef<{ sidebar: boolean; noteList: boolean; radar: boolean } | null>(null);
 
   // Sidebar inline quick-add state
   const [sidebarAddingClient, setSidebarAddingClient] = useState(false);
@@ -166,6 +175,11 @@ export function App() {
   });
 
   const [aiConfig, setAiConfig] = useState<AiConfig>(() => loadAiConfig());
+  const aiActivity = useSyncExternalStore(
+    subscribeAiActivity,
+    getAiActivitySnapshot,
+    getAiActivitySnapshot
+  );
   const [showAiStructure, setShowAiStructure] = useState(false);
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [showCommandPalette, setShowCommandPalette] = useState(false);
@@ -414,23 +428,91 @@ export function App() {
     }, 30);
   }, [noteFilter]);
 
+  const isFocusMode =
+    mainView === 'notes' &&
+    (isMobile
+      ? mobileNotesPane === 'editor' && !sidebarOpen && !radarOpen
+      : !sidebarOpen && !noteListOpen && !radarOpen);
+
+  const handleToggleFocusMode = useCallback(() => {
+    const currentlyFocused =
+      mainView === 'notes' &&
+      (isMobile
+        ? mobileNotesPane === 'editor' && !sidebarOpen && !radarOpen
+        : !sidebarOpen && !noteListOpen && !radarOpen);
+
+    if (currentlyFocused) {
+      const saved = prevPanelsRef.current;
+      if (isMobile) {
+        setMobileNotesPane('list');
+      } else if (saved && (saved.sidebar || saved.noteList || saved.radar)) {
+        setSidebarOpen(saved.sidebar);
+        setNoteListOpen(saved.noteList);
+        setRadarOpen(saved.radar);
+      } else {
+        setSidebarOpen(true);
+        setNoteListOpen(true);
+        setRadarOpen(typeof window !== 'undefined' ? window.innerWidth > 1180 : true);
+      }
+      prevPanelsRef.current = null;
+    } else {
+      prevPanelsRef.current = {
+        sidebar: sidebarOpen,
+        noteList: noteListOpen,
+        radar: radarOpen,
+      };
+      setMainView('notes');
+      setMobileNotesPane('editor');
+      setSidebarOpen(false);
+      setNoteListOpen(false);
+      setRadarOpen(false);
+    }
+  }, [isMobile, mainView, mobileNotesPane, sidebarOpen, noteListOpen, radarOpen]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setShowCommandPalette((v) => !v);
-      } else if (e.altKey && e.key.toLowerCase() === 'n') {
+      } else if (e.altKey && !e.ctrlKey && !e.metaKey && e.key.toLowerCase() === 'n') {
         e.preventDefault();
         handleSpinUpNote();
+      } else if (
+        (e.altKey && !e.ctrlKey && !e.metaKey && (e.key.toLowerCase() === 'z' || e.key === 'Ω')) ||
+        ((e.metaKey || e.ctrlKey) && !e.altKey && e.key === '\\')
+      ) {
+        e.preventDefault();
+        handleToggleFocusMode();
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleSpinUpNote]);
+  }, [handleSpinUpNote, handleToggleFocusMode]);
 
   const activeNote = useMemo(() => {
     return notes.find((n) => n.id === activeNoteId) || notes[0] || makeFreshNote();
   }, [notes, activeNoteId]);
+
+  const handleOpenOrCreateNoteByTitle = useCallback(
+    (targetTitle: string) => {
+      const found = notes.find(
+        (x) => x.title.toLowerCase() === targetTitle.toLowerCase()
+      );
+      if (found) {
+        openNoteEditor(found.id);
+      } else {
+        const created = makeFreshNote({
+          title: targetTitle,
+          scope: activeNote.scope,
+          clientId: activeNote.clientId,
+          projectId: activeNote.projectId,
+        });
+        setNotes((prev) => [created, ...prev]);
+        openNoteEditor(created.id);
+      }
+    },
+    [notes, activeNote.scope, activeNote.clientId, activeNote.projectId, openNoteEditor]
+  );
 
   const allWorkspaceLabels = useMemo(() => {
     const set = new Set<string>(directory.customLabels);
@@ -885,6 +967,7 @@ export function App() {
     'app-shell',
     !sidebarOpen ? 'sidebar-collapsed' : '',
     mainView !== 'notes' || !radarOpen ? 'radar-collapsed' : '',
+    isFocusMode ? 'focus-mode' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -914,6 +997,13 @@ export function App() {
 
   return (
     <div className={shellClass}>
+      {aiActivity.isBusy && (
+        <div
+          className="ai-global-progress no-print"
+          role="progressbar"
+          aria-label={aiActivity.label || 'AI request in progress'}
+        />
+      )}
       {/* Mobile Slide-Over Drawer Backdrop */}
       {isMobile && (sidebarOpen || (mainView === 'notes' && radarOpen)) && (
         <div
@@ -1588,12 +1678,12 @@ export function App() {
 
                 <button
                   type="button"
-                  className="btn btn-icon btn-ghost"
+                  className={`btn btn-icon ${aiActivity.isBusy ? 'ai-pill-busy' : 'btn-ghost'}`}
                   onClick={() => setShowAiSettings(true)}
-                  title="Configure AI Engine"
-                  aria-label="Configure AI Engine"
+                  title={aiActivity.isBusy ? `${aiActivity.label} (${aiActivity.providerLabel})` : 'Configure AI Engine'}
+                  aria-label={aiActivity.isBusy ? aiActivity.label || 'AI request in progress' : 'Configure AI Engine'}
                 >
-                  <KeyRound size={15} />
+                  {aiActivity.isBusy ? <Loader2 size={15} className="ai-spin" /> : <KeyRound size={15} />}
                 </button>
 
                 <button
@@ -1651,12 +1741,25 @@ export function App() {
 
                 <button
                   type="button"
-                  className="btn btn-xs btn-ghost"
+                  className={`btn btn-xs ${aiActivity.isBusy ? 'ai-pill-busy' : 'btn-ghost'}`}
                   onClick={() => setShowAiSettings(true)}
-                  title="Configure AI Provider (Local Smart Engine, Azure OpenAI, Gemini, OpenAI, Anthropic)"
+                  title={
+                    aiActivity.isBusy
+                      ? `${aiActivity.label} (${aiActivity.providerLabel})`
+                      : 'Configure AI Provider (Local Smart Engine, Azure OpenAI, Gemini, OpenAI, Anthropic)'
+                  }
                 >
-                  <KeyRound size={13} />
-                  {aiConfig.provider === 'local' ? 'AI: Local' : `AI: ${aiConfig.provider.toUpperCase()}`}
+                  {aiActivity.isBusy ? (
+                    <>
+                      <Loader2 size={13} className="ai-spin" />
+                      {aiActivity.label || 'AI working…'}
+                    </>
+                  ) : (
+                    <>
+                      <KeyRound size={13} />
+                      {aiConfig.provider === 'local' ? 'AI: Local' : `AI: ${aiConfig.provider.toUpperCase()}`}
+                    </>
+                  )}
                 </button>
 
                 <button
@@ -1669,14 +1772,33 @@ export function App() {
                 </button>
 
                 {mainView === 'notes' && (
-                  <button
-                    type="button"
-                    className={`btn btn-xs ${radarOpen ? 'btn-soft' : ''}`}
-                    onClick={() => setRadarOpen((v) => !v)}
-                    title="Toggle Context Radar Sidebar"
-                  >
-                    <Compass size={13} /> Context Radar
-                  </button>
+                  <>
+                    <button
+                      id="btn-focus-mode"
+                      type="button"
+                      className={`btn btn-xs ${isFocusMode ? 'btn-soft' : 'btn-ghost'}`}
+                      onClick={handleToggleFocusMode}
+                      aria-pressed={isFocusMode}
+                      title={
+                        isFocusMode
+                          ? 'Exit Focus Mode and restore side panels (Alt+Z or Ctrl+\\)'
+                          : 'Focus Mode — hide all side panels and center note (Alt+Z or Ctrl+\\)'
+                      }
+                    >
+                      {isFocusMode ? <Minimize2 size={13} /> : <Maximize2 size={13} />}
+                      {isFocusMode ? 'Exit Focus' : 'Focus'}
+                      <span className="kbd">Alt+Z</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      className={`btn btn-xs ${radarOpen ? 'btn-soft' : ''}`}
+                      onClick={() => setRadarOpen((v) => !v)}
+                      title="Toggle Context Radar Sidebar"
+                    >
+                      <Compass size={13} /> Context Radar
+                    </button>
+                  </>
                 )}
               </div>
             </>
@@ -1769,16 +1891,7 @@ export function App() {
                       const client = n.clientId
                         ? directory.clients.find((c) => c.id === n.clientId)
                         : null;
-                      const preview = n.body
-                        .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt: string) => {
-                          const cleanAlt = (alt || '').split('|')[0].trim();
-                          return cleanAlt && cleanAlt.toLowerCase() !== 'pasted image'
-                            ? `[Image: ${cleanAlt}]`
-                            : '[Image]';
-                        })
-                        .replace(/^#+\s+/gm, '')
-                        .replace(/[-*]\s*\[[ /?xXD:a-z]+\]\s*/gi, '')
-                        .trim();
+                      const preview = stripMarkdownFormatting(n.body);
                       return (
                         <div key={n.id} className="note-card-wrap">
                           <button
@@ -1834,23 +1947,7 @@ export function App() {
                 switchPrimaryView('reports');
               }}
               onNavigatePerson={(pName) => applyNotesFilter({ kind: 'person', personName: pName })}
-              onNavigateOrCreateNoteByTitle={(targetTitle) => {
-                const found = notes.find(
-                  (x) => x.title.toLowerCase() === targetTitle.toLowerCase()
-                );
-                if (found) {
-                  openNoteEditor(found.id);
-                } else {
-                  const created = makeFreshNote({
-                    title: targetTitle,
-                    scope: activeNote.scope,
-                    clientId: activeNote.clientId,
-                    projectId: activeNote.projectId,
-                  });
-                  setNotes((prev) => [created, ...prev]);
-                  openNoteEditor(created.id);
-                }
-              }}
+              onNavigateOrCreateNoteByTitle={handleOpenOrCreateNoteByTitle}
               onOpenAiStructure={() => setShowAiStructure(true)}
               onOpenQuickAsk={() => {
                 setSidebarOpen(false);
@@ -1875,6 +1972,7 @@ export function App() {
             initialClientFilter={reportInitialFilter.clientId}
             initialPersonFilter={reportInitialFilter.person}
             onOpenNote={openNoteEditor}
+            onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
             onDeleteTask={handleDeleteRemoteTask}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
@@ -1899,6 +1997,8 @@ export function App() {
             notes={notes}
             directory={directory}
             onOpenNote={openNoteEditor}
+            onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
+            onSelectLabel={(lbl) => applyNotesFilter({ kind: 'label', label: lbl })}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
             onDeleteTask={handleDeleteRemoteTask}
           />
@@ -1909,6 +2009,9 @@ export function App() {
             notes={notes}
             directory={directory}
             onOpenNote={openNoteEditor}
+            onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
+            onSelectPerson={(pName) => applyNotesFilter({ kind: 'person', personName: pName })}
+            onSelectLabel={(lbl) => applyNotesFilter({ kind: 'label', label: lbl })}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
             onDeleteDecision={handleDeleteRemoteDecision}
           />
@@ -2059,6 +2162,9 @@ export function App() {
             if (isMobile) setRadarOpen(false);
           }}
           onOpenNote={openNoteEditor}
+          onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
+          onSelectPerson={(pName) => applyNotesFilter({ kind: 'person', personName: pName })}
+          onSelectLabel={(lbl) => applyNotesFilter({ kind: 'label', label: lbl })}
           onToggleRemoteTaskStatus={handleUpdateRemoteTaskStatus}
           onCollapse={() => setRadarOpen(false)}
         />
@@ -2087,6 +2193,7 @@ export function App() {
       {showAiStructure && (
         <AiStructureModal
           note={activeNote}
+          allNotes={notes}
           directory={directory}
           aiConfig={aiConfig}
           onClose={() => setShowAiStructure(false)}
@@ -2118,8 +2225,10 @@ export function App() {
           directory={directory}
           allLabels={allWorkspaceLabels}
           theme={theme}
+          isFocusMode={isFocusMode}
           onClose={() => setShowCommandPalette(false)}
           onNewNote={handleSpinUpNote}
+          onToggleFocusMode={handleToggleFocusMode}
           onDeleteCurrentNote={() => handleDeleteNote(activeNote.id)}
           onSelectNote={openNoteEditor}
           onOpenReportForLabel={(lbl) => {

@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Compass,
   Gavel,
+  Loader2,
   MessageSquare,
   PanelRightClose,
   Send,
@@ -16,9 +17,16 @@ import type {
   TaskStatus,
   WorkspaceDirectory,
 } from '../types';
-import { askWorkspaceWithAiOrFallback } from '../utils/aiProvider';
+import { askWorkspaceWithAiOrFallback, formatAiEngineLabel } from '../utils/aiProvider';
 import { computeContextRadar } from '../utils/contextEngine';
-import { formatPersonMention, parseNoteItems } from '../utils/markdown';
+import {
+  extractInlineMentions,
+  formatPersonMention,
+  parseNoteItems,
+} from '../utils/markdown';
+import { AiLoadingState } from './AiLoadingState';
+import { RichInlineText } from './RichInlineText';
+import { RichMarkdown } from './RichMarkdown';
 
 interface ContextRadarProps {
   activeNote: Note;
@@ -29,6 +37,9 @@ interface ContextRadarProps {
   onClearRequestedTab?: () => void;
   onInsertIntoActiveNote: (markdownSnippet: string) => void;
   onOpenNote: (noteId: string) => void;
+  onOpenNoteByTitle?: (noteTitle: string) => void;
+  onSelectPerson?: (personName: string) => void;
+  onSelectLabel?: (label: string) => void;
   onToggleRemoteTaskStatus: (task: ParsedTask, nextStatus: TaskStatus) => void;
   onCollapse: () => void;
 }
@@ -42,6 +53,9 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
   onClearRequestedTab,
   onInsertIntoActiveNote,
   onOpenNote,
+  onOpenNoteByTitle,
+  onSelectPerson,
+  onSelectLabel,
   onToggleRemoteTaskStatus,
   onCollapse,
 }) => {
@@ -71,6 +85,27 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
     [activeNote, directory.people]
   );
 
+  const handleOpenNoteLink = (targetTitle: string) => {
+    if (onOpenNoteByTitle) {
+      onOpenNoteByTitle(targetTitle);
+      return;
+    }
+    const found = allNotes.find((n) => n.title.toLowerCase() === targetTitle.toLowerCase());
+    if (found) onOpenNote(found.id);
+  };
+
+  const renderInline = (text: string) => (
+    <RichInlineText
+      text={text}
+      people={directory.people}
+      clients={directory.clients}
+      notes={allNotes}
+      onClickPerson={onSelectPerson}
+      onClickLabel={onSelectLabel}
+      onClickNoteLink={handleOpenNoteLink}
+    />
+  );
+
   const handlePullPrepBrief = () => {
     const lines: string[] = ['## Carry-Forward Context & Prep'];
     if (radar.priorDecisions.length > 0) {
@@ -90,16 +125,21 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
     onInsertIntoActiveNote(lines.join('\n'));
   };
 
-  const handleRunAsk = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    if (!askQuery.trim()) return;
+  const executeAsk = async (rawQuery: string) => {
+    const trimmed = rawQuery.trim();
+    if (!trimmed) return;
     setAskLoading(true);
     try {
-      const res = await askWorkspaceWithAiOrFallback(askQuery.trim(), allNotes, directory, aiConfig);
+      const res = await askWorkspaceWithAiOrFallback(trimmed, allNotes, directory, aiConfig);
       setAskResult(res);
     } finally {
       setAskLoading(false);
     }
+  };
+
+  const handleRunAsk = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    await executeAsk(askQuery);
   };
 
   return (
@@ -172,62 +212,73 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {radar.carryForwardTasks.slice(0, 6).map((t) => (
-                    <div key={t.id} className="radar-card">
-                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'flex-start' }}>
-                        <span style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.4 }}>{t.text}</span>
-                        <span className={`status-badge status-${t.status}`}>{t.status}</span>
-                      </div>
-                      <div
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          fontSize: 11,
-                          color: 'var(--text-muted)',
-                          flexWrap: 'wrap',
-                          gap: 4,
-                        }}
-                      >
-                        <span>
-                          {t.owner ? `@${t.owner} · ` : ''}
-                          {t.dueDate ? `due ${t.dueDate} · ` : ''}
-                          <button
-                            type="button"
-                            className="btn-ghost"
-                            style={{ padding: 0, border: 'none', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}
-                            onClick={() => onOpenNote(t.noteId)}
-                          >
-                            {t.noteTitle}
-                          </button>
-                        </span>
-                        <div style={{ display: 'flex', gap: 4 }}>
-                          <button
-                            type="button"
-                            className="btn btn-xs"
-                            title="Mark Done directly in source note"
-                            onClick={() => onToggleRemoteTaskStatus(t, 'done')}
-                          >
-                            <CheckCircle2 size={11} /> Done
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-xs"
-                            title="Carry task into current note"
-                            onClick={() =>
-                              onInsertIntoActiveNote(
-                                `- [ ] ${t.text}${t.owner ? ` ${formatPersonMention(t.owner)}` : ''}${
-                                  t.dueDate ? ` due:${t.dueDate}` : ''
-                                } (from [[${t.noteTitle}]])`
-                              )
-                            }
-                          >
-                            <ArrowDownLeft size={11} /> Pull
-                          </button>
+                  {radar.carryForwardTasks.slice(0, 6).map((t) => {
+                    const inlineMentions = extractInlineMentions(t.text, directory.people);
+                    const ownerAlreadyInline = Boolean(
+                      t.owner &&
+                        inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase())
+                    );
+                    return (
+                      <div key={t.id} className="radar-card">
+                        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'flex-start' }}>
+                          <span style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.45 }}>
+                            {renderInline(t.text)}
+                          </span>
+                          <span className={`status-badge status-${t.status}`}>{t.status}</span>
+                        </div>
+                        <div
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            fontSize: 11,
+                            color: 'var(--text-muted)',
+                            flexWrap: 'wrap',
+                            gap: 4,
+                          }}
+                        >
+                          <span>
+                            {t.owner && !ownerAlreadyInline ? `@${t.owner} · ` : ''}
+                            {t.dueDate ? `due ${t.dueDate} · ` : ''}
+                            <button
+                              type="button"
+                              className="btn-ghost"
+                              style={{ padding: 0, border: 'none', cursor: 'pointer', textDecoration: 'underline', fontSize: 11 }}
+                              onClick={() => onOpenNote(t.noteId)}
+                            >
+                              {t.noteTitle}
+                            </button>
+                          </span>
+                          <div style={{ display: 'flex', gap: 4 }}>
+                            <button
+                              type="button"
+                              className="btn btn-xs"
+                              title="Mark Done directly in source note"
+                              onClick={() => onToggleRemoteTaskStatus(t, 'done')}
+                            >
+                              <CheckCircle2 size={11} /> Done
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-xs"
+                              title="Carry task into current note"
+                              onClick={() =>
+                                onInsertIntoActiveNote(
+                                  `- [ ] ${t.text}${
+                                    t.owner && !ownerAlreadyInline
+                                      ? ` ${formatPersonMention(t.owner)}`
+                                      : ''
+                                  }${t.dueDate ? ` due:${t.dueDate}` : ''} (from [[${t.noteTitle}]])`
+                                )
+                              }
+                            >
+                              <ArrowDownLeft size={11} /> Pull
+                            </button>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -247,10 +298,12 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                         </span>
                         <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{d.noteDate}</span>
                       </div>
-                      <div style={{ fontSize: 12.5, fontWeight: 500 }}>{d.text}</div>
+                      <div style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.45 }}>
+                        {renderInline(d.text)}
+                      </div>
                       {d.rationale && (
-                        <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
-                          Rationale: {d.rationale}
+                        <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
+                          Rationale: {renderInline(d.rationale)}
                         </div>
                       )}
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -315,7 +368,7 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                         </span>
                       </div>
                       <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
-                        {snippet}
+                        {renderInline(snippet)}
                       </div>
                       <div
                         style={{
@@ -358,7 +411,11 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
 
         {tab === 'ask' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <form onSubmit={handleRunAsk} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <form
+              onSubmit={handleRunAsk}
+              aria-busy={askLoading}
+              style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+            >
               <label style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>
                 <MessageSquare size={13} style={{ verticalAlign: '-2px', marginRight: 5 }} />
                 Ask across all notes &amp; pull into active note
@@ -373,34 +430,55 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                   value={askQuery}
                   onChange={(e) => setAskQuery(e.target.value)}
                 />
-                <button type="submit" className="btn btn-primary" disabled={askLoading || !askQuery.trim()}>
-                  <Send size={13} />
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={askLoading || !askQuery.trim()}
+                  title={askLoading ? 'AI request in progress…' : 'Ask workspace'}
+                  aria-label={askLoading ? 'AI request in progress' : 'Ask workspace'}
+                >
+                  {askLoading ? <Loader2 size={13} className="ai-spin" /> : <Send size={13} />}
                 </button>
               </div>
               <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                {['Recent decisions', 'Open high priority tasks', 'Unresolved blockers'].map((preset) => (
-                  <button
-                    key={preset}
-                    type="button"
-                    className="btn btn-xs btn-ghost"
-                    onClick={() => {
-                      setAskQuery(preset);
-                      askWorkspaceWithAiOrFallback(preset, allNotes, directory, aiConfig).then(setAskResult);
-                    }}
-                  >
-                    {preset}
-                  </button>
-                ))}
+                {['Recent decisions', 'Open high priority tasks', 'Unresolved blockers'].map((preset) => {
+                  const isRunningPreset = askLoading && askQuery === preset;
+                  return (
+                    <button
+                      key={preset}
+                      type="button"
+                      className={`btn btn-xs ${isRunningPreset ? 'btn-soft' : 'btn-ghost'}`}
+                      disabled={askLoading}
+                      onClick={() => {
+                        setAskQuery(preset);
+                        executeAsk(preset);
+                      }}
+                    >
+                      {isRunningPreset && <Loader2 size={11} className="ai-spin" />}
+                      {preset}
+                    </button>
+                  );
+                })}
               </div>
             </form>
 
-            {askResult && (
+            {askLoading && (
+              <AiLoadingState
+                compact
+                title="Synthesizing answer across workspace notes…"
+                subtitle="Scanning matching notes, tasks, and decisions"
+                providerLabel={formatAiEngineLabel(aiConfig)}
+              />
+            )}
+
+            {!askLoading && askResult && (
               <div className="radar-card" style={{ gap: 10 }}>
                 <div
                   style={{
                     display: 'flex',
                     justifyContent: 'space-between',
                     alignItems: 'center',
+                    gap: 6,
                     fontSize: 11,
                     color: 'var(--text-muted)',
                   }}
@@ -417,28 +495,33 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                     <ArrowDownLeft size={11} /> Insert into Note
                   </button>
                 </div>
-                <div
-                  style={{
-                    fontSize: 12.5,
-                    lineHeight: 1.55,
-                    whiteSpace: 'pre-wrap',
-                    color: 'var(--text-primary)',
-                  }}
-                >
-                  {askResult.answerMarkdown}
-                </div>
+
+                <RichMarkdown
+                  markdown={askResult.answerMarkdown}
+                  people={directory.people}
+                  clients={directory.clients}
+                  notes={allNotes}
+                  compact
+                  onClickPerson={onSelectPerson}
+                  onClickLabel={onSelectLabel}
+                  onClickNoteLink={handleOpenNoteLink}
+                />
+
                 {askResult.citedNotes.length > 0 && (
-                  <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                    {askResult.citedNotes.map((cn) => (
-                      <button
-                        key={cn.id}
-                        type="button"
-                        className="pill pill-link"
-                        onClick={() => onOpenNote(cn.id)}
-                      >
-                        ↗ {cn.title}
-                      </button>
-                    ))}
+                  <div className="radar-cited-sources">
+                    <span className="radar-cited-label">Sources</span>
+                    <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                      {askResult.citedNotes.map((cn) => (
+                        <button
+                          key={cn.id}
+                          type="button"
+                          className="pill pill-link"
+                          onClick={() => onOpenNote(cn.id)}
+                        >
+                          ↗ {cn.title}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
@@ -461,7 +544,14 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                     <span className={`status-badge decision-badge-${d.status}`} style={{ alignSelf: 'flex-start' }}>
                       {d.status}
                     </span>
-                    <span style={{ fontSize: 12.5, fontWeight: 500 }}>{d.text}</span>
+                    <span style={{ fontSize: 12.5, fontWeight: 500, lineHeight: 1.45 }}>
+                      {renderInline(d.text)}
+                    </span>
+                    {d.rationale && (
+                      <span style={{ fontSize: 11.5, color: 'var(--text-secondary)', lineHeight: 1.45 }}>
+                        Rationale: {renderInline(d.rationale)}
+                      </span>
+                    )}
                   </div>
                 ))
               )}
@@ -474,19 +564,32 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                   No tasks recorded yet. Type <span className="kbd">/task</span> or <span className="kbd">- [ ]</span>.
                 </div>
               ) : (
-                currentItems.tasks.map((t) => (
-                  <div key={t.id} className="radar-card" style={{ marginBottom: 6 }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
-                      <span style={{ fontSize: 12.5 }}>{t.text}</span>
-                      <span className={`status-badge status-${t.status}`}>{t.status}</span>
+                currentItems.tasks.map((t) => {
+                  const inlineMentions = extractInlineMentions(t.text, directory.people);
+                  const ownerAlreadyInline = Boolean(
+                    t.owner &&
+                      inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase())
+                  );
+                  const showMetaRow = Boolean((t.owner && !ownerAlreadyInline) || t.dueDate);
+                  return (
+                    <div key={t.id} className="radar-card" style={{ marginBottom: 6 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6, alignItems: 'flex-start' }}>
+                        <span style={{ fontSize: 12.5, lineHeight: 1.45 }}>{renderInline(t.text)}</span>
+                        <span className={`status-badge status-${t.status}`}>{t.status}</span>
+                      </div>
+                      {showMetaRow && (
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                          {[
+                            t.owner && !ownerAlreadyInline ? `@${t.owner}` : null,
+                            t.dueDate ? `due ${t.dueDate}` : null,
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </span>
+                      )}
                     </div>
-                    {(t.owner || t.dueDate) && (
-                      <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                        {t.owner ? `@${t.owner}` : ''} {t.dueDate ? `· due ${t.dueDate}` : ''}
-                      </span>
-                    )}
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>

@@ -4,6 +4,7 @@ import {
   Copy,
   FilePlus2,
   Gavel,
+  Loader2,
   Printer,
   Sparkles,
   Trash2,
@@ -17,8 +18,12 @@ import type {
   TaskStatus,
   WorkspaceDirectory,
 } from '../types';
-import { generateExecutiveBriefWithAiOrFallback } from '../utils/aiProvider';
+import { formatAiEngineLabel, generateExecutiveBriefWithAiOrFallback } from '../utils/aiProvider';
+import { buildDeterministicExecutiveBrief } from '../utils/contextEngine';
 import { extractInlineMentions, getAllNoteLabels, parseNoteItems } from '../utils/markdown';
+import { AiLoadingState } from './AiLoadingState';
+import { RichInlineText } from './RichInlineText';
+import { RichMarkdown } from './RichMarkdown';
 
 interface ReportsViewProps {
   notes: Note[];
@@ -29,6 +34,7 @@ interface ReportsViewProps {
   initialClientFilter?: string;
   initialPersonFilter?: string;
   onOpenNote: (noteId: string) => void;
+  onOpenNoteByTitle?: (noteTitle: string) => void;
   onUpdateTaskStatus: (task: ParsedTask, status: TaskStatus) => void;
   onDeleteTask: (task: ParsedTask) => void;
   onUpdateDecisionStatus: (decision: ParsedDecision, status: DecisionStatus) => void;
@@ -48,6 +54,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   initialClientFilter = '',
   initialPersonFilter = '',
   onOpenNote,
+  onOpenNoteByTitle,
   onUpdateTaskStatus,
   onDeleteTask,
   onUpdateDecisionStatus,
@@ -160,15 +167,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const handleCopyForEmailTeams = async () => {
     const textSource =
       briefMarkdown ||
-      (
-        await generateExecutiveBriefWithAiOrFallback({
-          heading: reportHeading,
-          notes: filteredData.matchingNotes,
-          tasks: filteredData.matchingTasks,
-          decisions: filteredData.matchingDecisions,
-          config: { ...aiConfig, provider: 'local' },
-        })
-      ).markdown;
+      buildDeterministicExecutiveBrief({
+        heading: reportHeading,
+        notes: filteredData.matchingNotes,
+        tasks: filteredData.matchingTasks,
+        decisions: filteredData.matchingDecisions,
+      });
 
     // Clean [[Note]] wiki brackets into crisp readable citations for Outlook / Teams
     const formattedForTeams = textSource.replace(/\[\[([^\]]+)\]\]/g, '"$1"');
@@ -180,15 +184,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const handleCopyMarkdown = async () => {
     const textSource =
       briefMarkdown ||
-      (
-        await generateExecutiveBriefWithAiOrFallback({
-          heading: reportHeading,
-          notes: filteredData.matchingNotes,
-          tasks: filteredData.matchingTasks,
-          decisions: filteredData.matchingDecisions,
-          config: { ...aiConfig, provider: 'local' },
-        })
-      ).markdown;
+      buildDeterministicExecutiveBrief({
+        heading: reportHeading,
+        notes: filteredData.matchingNotes,
+        tasks: filteredData.matchingTasks,
+        decisions: filteredData.matchingDecisions,
+      });
     await navigator.clipboard.writeText(textSource);
     setCopied('md');
     setTimeout(() => setCopied(null), 1800);
@@ -196,6 +197,27 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   const openTasks = filteredData.matchingTasks.filter((t) => t.status !== 'done');
   const doneTasks = filteredData.matchingTasks.filter((t) => t.status === 'done');
+
+  const handleOpenNoteLink = (targetTitle: string) => {
+    if (onOpenNoteByTitle) {
+      onOpenNoteByTitle(targetTitle);
+      return;
+    }
+    const found = notes.find((n) => n.title.toLowerCase() === targetTitle.toLowerCase());
+    if (found) onOpenNote(found.id);
+  };
+
+  const renderInline = (text: string) => (
+    <RichInlineText
+      text={text}
+      people={directory.people}
+      clients={directory.clients}
+      notes={notes}
+      onClickPerson={(pName) => setPersonFilter(pName)}
+      onClickLabel={(lbl) => setLabelFilter(lbl)}
+      onClickNoteLink={handleOpenNoteLink}
+    />
+  );
 
   return (
     <div className="page-scroll">
@@ -215,8 +237,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               onClick={handleGenerateBrief}
               disabled={generatingBrief}
             >
-              <Sparkles size={14} />
-              {generatingBrief ? 'Synthesizing…' : 'Generate Narrative Brief'}
+              {generatingBrief ? <Loader2 size={14} className="ai-spin" /> : <Sparkles size={14} />}
+              {generatingBrief ? 'Synthesizing Brief…' : 'Generate Narrative Brief'}
             </button>
             <button type="button" className="btn" onClick={handleCopyForEmailTeams}>
               {copied === 'teams' ? <Check size={14} /> : <Copy size={14} />}
@@ -356,37 +378,67 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         </div>
 
         {/* Generated Narrative Brief Panel */}
-        {briefMarkdown && (
+        {(generatingBrief || briefMarkdown) && (
           <div className="surface-panel">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-              <strong style={{ fontSize: 14 }}>
-                Synthesized Executive Brief ({briefProvider})
-              </strong>
-              <div className="no-print" style={{ display: 'flex', gap: 6 }}>
-                <button
-                  type="button"
-                  className="btn btn-xs btn-soft"
-                  onClick={() =>
-                    onSaveBriefAsNote(
-                      `${reportHeading} (${new Date().toISOString().slice(0, 10)})`,
-                      briefMarkdown,
-                      clientId || null,
-                      projectId || null
-                    )
-                  }
-                >
-                  <FilePlus2 size={12} /> Save Report as Note
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-xs btn-ghost"
-                  onClick={() => setBriefMarkdown(null)}
-                >
-                  Dismiss
-                </button>
-              </div>
-            </div>
-            <div className="narrative-brief">{briefMarkdown}</div>
+            {generatingBrief ? (
+              <AiLoadingState
+                title="Synthesizing Executive Narrative Brief…"
+                subtitle={`Summarizing ${filteredData.matchingNotes.length} note(s), ${filteredData.matchingDecisions.length} decision(s), and ${openTasks.length} open action item(s)`}
+                providerLabel={formatAiEngineLabel(aiConfig)}
+              />
+            ) : (
+              briefMarkdown && (
+                <>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      flexWrap: 'wrap',
+                      gap: 8,
+                    }}
+                  >
+                    <strong style={{ fontSize: 14 }}>
+                      Synthesized Executive Brief ({briefProvider})
+                    </strong>
+                    <div className="no-print" style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        className="btn btn-xs btn-soft"
+                        onClick={() =>
+                          onSaveBriefAsNote(
+                            `${reportHeading} (${new Date().toISOString().slice(0, 10)})`,
+                            briefMarkdown,
+                            clientId || null,
+                            projectId || null
+                          )
+                        }
+                      >
+                        <FilePlus2 size={12} /> Save Report as Note
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-xs btn-ghost"
+                        onClick={() => setBriefMarkdown(null)}
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                  <div className="narrative-brief">
+                    <RichMarkdown
+                      markdown={briefMarkdown}
+                      people={directory.people}
+                      clients={directory.clients}
+                      notes={notes}
+                      onClickPerson={(pName) => setPersonFilter(pName)}
+                      onClickLabel={(lbl) => setLabelFilter(lbl)}
+                      onClickNoteLink={handleOpenNoteLink}
+                    />
+                  </div>
+                </>
+              )
+            )}
           </div>
         )}
 
@@ -415,7 +467,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         >
                           <Gavel size={11} /> {d.status}
                         </button>
-                        <span style={{ fontWeight: 550 }}>{d.text}</span>
+                        <span style={{ fontWeight: 550 }}>{renderInline(d.text)}</span>
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <button
@@ -435,7 +487,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         </button>
                       </div>
                     </div>
-                    {d.rationale && <div className="decision-rationale">Rationale: {d.rationale}</div>}
+                    {d.rationale && (
+                      <div className="decision-rationale">Rationale: {renderInline(d.rationale)}</div>
+                    )}
                   </div>
                 );
               })}
@@ -456,6 +510,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {filteredData.matchingTasks.map((t) => {
                 const nextStatus = TASK_CYCLE[(TASK_CYCLE.indexOf(t.status) + 1) % TASK_CYCLE.length];
+                const inlineMentions = extractInlineMentions(t.text, directory.people);
+                const ownerAlreadyInline = Boolean(
+                  t.owner &&
+                    inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase())
+                );
                 return (
                   <div
                     key={t.id}
@@ -470,8 +529,16 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       >
                         {t.status}
                       </button>
-                      <span className="task-text">{t.text}</span>
-                      {t.owner && <span className="pill pill-person">@{t.owner}</span>}
+                      <span className="task-text">{renderInline(t.text)}</span>
+                      {t.owner && !ownerAlreadyInline && (
+                        <button
+                          type="button"
+                          className="pill pill-person"
+                          onClick={() => setPersonFilter(t.owner!)}
+                        >
+                          @{t.owner}
+                        </button>
+                      )}
                     </div>
                     <div className="task-right">
                       {t.priority === 'high' && <span className="priority-high">!HIGH</span>}
