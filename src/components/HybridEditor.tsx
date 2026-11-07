@@ -10,6 +10,7 @@ import {
   FolderKanban,
   Gavel,
   Hash,
+  Image as ImageIcon,
   Italic,
   Link2,
   List,
@@ -44,11 +45,14 @@ import {
   slugify,
 } from '../utils/markdown';
 import {
+  createImageBlockElement,
   domToMarkdown,
   markdownToHtml,
   sanitizePastedHtml,
 } from '../utils/docSerializer';
+import { resolveImageSrc, saveBlobAsImageAsset } from '../utils/imageStore';
 import { NOTE_TEMPLATES } from '../utils/seedData';
+import { ImageLightboxModal, type LightboxImageItem } from './ImageLightboxModal';
 
 interface HybridEditorProps {
   note: Note;
@@ -124,6 +128,95 @@ function isCaretAtStartOfBlock(block: HTMLElement, range: Range): boolean {
   return probe.toString().length === 0;
 }
 
+function isCaretAtEndOfBlock(block: HTMLElement, range: Range): boolean {
+  if (!range.collapsed) return false;
+  const probe = document.createRange();
+  probe.selectNodeContents(block);
+  probe.setStart(range.endContainer, range.endOffset);
+  return probe.toString().length === 0;
+}
+
+function isGenericClipboardImageName(name: string): boolean {
+  const trimmed = (name || '').trim();
+  return !trimmed || /^(?:image|blob|clipboard|pasted[-_ ]?image)(?:\.[a-z0-9]+)?$/i.test(trimmed);
+}
+
+function extractImageFilesFromDataTransfer(
+  dt: DataTransfer | null,
+  options?: { fromClipboard?: boolean }
+): File[] {
+  if (!dt) return [];
+  const files: File[] = [];
+  const seen = new Set<string>();
+
+  // 1. Read dt.files first; do NOT also iterate dt.items when dt.files already yielded images,
+  // because Chromium synthesizes a new File with a fresh lastModified timestamp on each call.
+  if (dt.files && dt.files.length > 0) {
+    for (let i = 0; i < dt.files.length; i++) {
+      const f = dt.files[i];
+      if (f.type.startsWith('image/')) {
+        const sig = `${f.name}:${f.size}:${f.type}`;
+        if (!seen.has(sig)) {
+          seen.add(sig);
+          files.push(f);
+        }
+      }
+    }
+  }
+
+  // 2. Fallback to dt.items ONLY if dt.files yielded zero image files
+  if (files.length === 0 && dt.items && dt.items.length > 0) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const item = dt.items[i];
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) {
+          const sig = `${f.name}:${f.size}:${f.type}`;
+          if (!seen.has(sig)) {
+            seen.add(sig);
+            files.push(f);
+          }
+        }
+      }
+    }
+  }
+
+  // 3. On clipboard paste, OS clipboards often expose multiple MIME representations (e.g. PNG + BMP/JPEG,
+  // or a real file alongside a synthesized "image.png" bitmap) for a single copied image.
+  if (options?.fromClipboard && files.length > 1) {
+    const namedFiles = files.filter((f) => !isGenericClipboardImageName(f.name));
+    if (namedFiles.length > 0) {
+      return namedFiles;
+    }
+    const preferred =
+      files.find((f) => f.type === 'image/png') ||
+      files.find((f) => f.type === 'image/webp') ||
+      files[0];
+    return [preferred];
+  }
+
+  return files;
+}
+
+function htmlContainsOnlyImageOrEmpty(rawHtml: string): boolean {
+  if (!rawHtml.trim()) return true;
+  try {
+    const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+    doc.querySelectorAll('style, script, meta, title').forEach((n) => n.remove());
+    return !(doc.body.textContent || '').trim();
+  } catch {
+    return false;
+  }
+}
+
+function cleanImageLabelFromFile(file: File): string {
+  const raw = (file.name || '').replace(/\.[^.]+$/, '').trim();
+  if (!raw || /^image$/i.test(raw) || /^blob$/i.test(raw)) {
+    return 'Pasted image';
+  }
+  return raw.replace(/[[\]|]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 function replaceBlockElement(target: HTMLElement, replacement: HTMLElement): HTMLElement {
   const parent = target.parentElement;
   if (!parent) return replacement;
@@ -169,6 +262,9 @@ function findEditableBlock(node: Node | null, root: HTMLElement): HTMLElement | 
   while (curr && curr !== root) {
     if (curr.nodeType === Node.ELEMENT_NODE) {
       const el = curr as HTMLElement;
+      if (el.classList.contains('doc-image-block')) {
+        return null;
+      }
       const tag = el.tagName.toUpperCase();
       if (
         tag === 'P' ||
@@ -202,6 +298,9 @@ function getSelectedEditableBlocks(root: HTMLElement): HTMLElement[] {
   Array.from(root.children).forEach((child) => {
     const el = child as HTMLElement;
     const tag = el.tagName.toUpperCase();
+    if (tag === 'FIGURE' || tag === 'HR' || el.classList.contains('doc-image-block')) {
+      return;
+    }
     if (tag === 'UL' || tag === 'OL') {
       Array.from(el.children).forEach((li) => {
         if (range.intersectsNode(li)) candidates.push(li as HTMLElement);
@@ -240,6 +339,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const [newProjectName, setNewProjectName] = useState('');
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
   const [showInsertMenu, setShowInsertMenu] = useState(false);
+  const [lightbox, setLightbox] = useState<{ images: LightboxImageItem[]; index: number } | null>(
+    null
+  );
+  const [isDragOverPage, setIsDragOverPage] = useState(false);
 
   const [autocomplete, setAutocomplete] = useState<AutocompleteTrigger | null>(null);
   const [acIndex, setAcIndex] = useState(0);
@@ -254,6 +357,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const docRef = useRef<HTMLDivElement | null>(null);
   const rawTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const savedInsertRangeRef = useRef<Range | null>(null);
+  const suppressImageClickUntilRef = useRef<number>(0);
   const lastSyncedNoteIdRef = useRef<string>('');
   const lastEmittedMarkdownRef = useRef<string>(note.body);
   const isComposingRef = useRef<boolean>(false);
@@ -301,8 +407,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const syncEmptyAttr = useCallback(() => {
     const el = docRef.current;
     if (!el) return;
+    const hasImage = Boolean(el.querySelector('figure.doc-image-block, img'));
     const singleChild = el.children.length <= 1 ? (el.firstElementChild as HTMLElement | null) : null;
     const isPlainEmpty =
+      !hasImage &&
       !el.textContent?.trim() &&
       (!singleChild ||
         (singleChild.tagName === 'P' &&
@@ -527,6 +635,279 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
     patchNote({ body: updatedBody });
   };
+
+  const captureCurrentDocRange = useCallback((): Range | null => {
+    const root = docRef.current;
+    const sel = window.getSelection();
+    if (!root || !sel || sel.rangeCount === 0) return null;
+    const range = sel.getRangeAt(0);
+    return root.contains(range.commonAncestorContainer) ? range.cloneRange() : null;
+  }, []);
+
+  const insertImageBlocksAtRange = useCallback(
+    (figures: HTMLElement[], explicitRange?: Range | null) => {
+      const root = docRef.current;
+      if (!root || figures.length === 0) return;
+
+      const frag = document.createDocumentFragment();
+      figures.forEach((fig) => frag.appendChild(fig));
+      const lastFigure = figures[figures.length - 1];
+
+      const ensureTrailingParagraph = (afterEl: HTMLElement): HTMLElement => {
+        const next = afterEl.nextElementSibling as HTMLElement | null;
+        if (
+          next &&
+          !next.classList.contains('doc-image-block') &&
+          next.tagName.toUpperCase() !== 'HR'
+        ) {
+          if (next.tagName.toUpperCase() === 'UL' || next.tagName.toUpperCase() === 'OL') {
+            const firstLi = next.querySelector('li') as HTMLElement | null;
+            if (firstLi) return firstLi;
+          } else {
+            return next;
+          }
+        }
+        const p = document.createElement('p');
+        p.innerHTML = '<br>';
+        afterEl.after(p);
+        return p;
+      };
+
+      let activeRange: Range | null = null;
+      if (explicitRange && root.contains(explicitRange.commonAncestorContainer)) {
+        activeRange = explicitRange.cloneRange();
+      } else {
+        activeRange = captureCurrentDocRange();
+      }
+
+      if (!activeRange) {
+        const onlyChild =
+          root.children.length === 1 ? (root.firstElementChild as HTMLElement | null) : null;
+        const isOnlyEmptyPara =
+          onlyChild &&
+          onlyChild.tagName.toUpperCase() === 'P' &&
+          !onlyChild.classList.contains('doc-task') &&
+          !onlyChild.classList.contains('doc-decision') &&
+          !onlyChild.querySelector('img') &&
+          !(onlyChild.textContent || '').trim();
+
+        if (isOnlyEmptyPara && onlyChild) {
+          root.insertBefore(frag, onlyChild);
+          root.focus();
+          placeCaretAtStart(onlyChild);
+        } else {
+          root.appendChild(frag);
+          const p = ensureTrailingParagraph(lastFigure);
+          root.focus();
+          placeCaretAtStart(p);
+        }
+        emitMarkdownFromDom();
+        refreshSelectionToolbarState();
+        return;
+      }
+
+      if (!activeRange.collapsed) {
+        activeRange.deleteContents();
+      }
+
+      let blk = findEditableBlock(activeRange.startContainer, root);
+
+      // If inside an <li>, unwrap/split the list at a temporary paragraph first so <figure> stays top-level
+      if (
+        blk &&
+        blk.tagName.toUpperCase() === 'LI' &&
+        blk.parentElement &&
+        (blk.parentElement.tagName.toUpperCase() === 'UL' ||
+          blk.parentElement.tagName.toUpperCase() === 'OL')
+      ) {
+        const isEmptyLi = !(blk.textContent || '').trim() && !blk.querySelector('img');
+        if (isEmptyLi) {
+          const tempP = document.createElement('p');
+          tempP.innerHTML = '<br>';
+          blk = replaceBlockElement(blk, tempP);
+        } else {
+          const listEl = blk.parentElement;
+          const afterItems: Element[] = [];
+          let passedCurrent = false;
+          Array.from(listEl.children).forEach((child) => {
+            if (child === blk) {
+              passedCurrent = true;
+            } else if (passedCurrent) {
+              afterItems.push(child);
+            }
+          });
+          listEl.after(frag);
+          if (afterItems.length > 0) {
+            const afterList = document.createElement(listEl.tagName.toLowerCase());
+            afterItems.forEach((li) => afterList.appendChild(li));
+            lastFigure.after(afterList);
+            const firstAfterLi = afterList.firstElementChild as HTMLElement | null;
+            root.focus();
+            if (firstAfterLi) placeCaretAtStart(firstAfterLi);
+          } else {
+            const p = ensureTrailingParagraph(lastFigure);
+            root.focus();
+            placeCaretAtStart(p);
+          }
+          emitMarkdownFromDom();
+          refreshSelectionToolbarState();
+          return;
+        }
+      }
+
+      if (!blk) {
+        if (activeRange.startContainer === root) {
+          const refNode = root.childNodes[activeRange.startOffset] || null;
+          root.insertBefore(frag, refNode);
+        } else {
+          let topChild: Node | null = activeRange.startContainer;
+          while (topChild && topChild.parentNode !== root) {
+            topChild = topChild.parentNode;
+          }
+          if (topChild && topChild.parentNode === root) {
+            (topChild as Element).after(frag);
+          } else {
+            root.appendChild(frag);
+          }
+        }
+        const targetCaretEl = ensureTrailingParagraph(lastFigure);
+        root.focus();
+        placeCaretAtStart(targetCaretEl);
+        emitMarkdownFromDom();
+        refreshSelectionToolbarState();
+        return;
+      }
+
+      const isPlainEmptyBlock =
+        (blk.tagName.toUpperCase() === 'P' || blk.tagName.toUpperCase() === 'DIV') &&
+        !blk.classList.contains('doc-task') &&
+        !blk.classList.contains('doc-decision') &&
+        !blk.querySelector('img') &&
+        !(blk.textContent || '').trim();
+
+      if (isPlainEmptyBlock || isCaretAtStartOfBlock(blk, activeRange)) {
+        blk.before(frag);
+        root.focus();
+        placeCaretAtStart(blk);
+      } else if (isCaretAtEndOfBlock(blk, activeRange)) {
+        blk.after(frag);
+        const targetCaretEl = ensureTrailingParagraph(lastFigure);
+        root.focus();
+        placeCaretAtStart(targetCaretEl);
+      } else {
+        const tailRange = document.createRange();
+        tailRange.selectNodeContents(blk);
+        tailRange.setStart(activeRange.startContainer, activeRange.startOffset);
+        const tailFrag = tailRange.extractContents();
+        if (!blk.innerHTML.trim()) {
+          blk.innerHTML = '<br>';
+        }
+        const nextBlock = document.createElement('p');
+        if (blk.classList.contains('doc-task')) {
+          nextBlock.className = 'doc-task';
+          nextBlock.setAttribute('data-status', 'todo');
+        }
+        nextBlock.appendChild(tailFrag);
+        if (!nextBlock.innerHTML.trim()) {
+          nextBlock.innerHTML = '<br>';
+        }
+        blk.after(frag, nextBlock);
+        root.focus();
+        placeCaretAtStart(nextBlock);
+      }
+
+      emitMarkdownFromDom();
+      refreshSelectionToolbarState();
+    },
+    [captureCurrentDocRange, emitMarkdownFromDom, refreshSelectionToolbarState]
+  );
+
+  const insertImageFiles = useCallback(
+    async (files: File[], explicitRange?: Range | null) => {
+      if (files.length === 0) return;
+      const uploaded = await Promise.all(
+        files.map(async (file) => {
+          const { assetPath } = await saveBlobAsImageAsset(file);
+          const alt = cleanImageLabelFromFile(file);
+          return { assetPath, alt };
+        })
+      );
+
+      if (rawMode) {
+        const mdSnippet = uploaded.map((u) => `![${u.alt}](${u.assetPath})`).join('\n\n');
+        const ta = rawTextareaRef.current;
+        const currentBody = noteRef.current.body;
+        if (ta) {
+          const start = ta.selectionStart ?? currentBody.length;
+          const end = ta.selectionEnd ?? start;
+          const before = currentBody.slice(0, start);
+          const after = currentBody.slice(end);
+          const prefix = before.length > 0 && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
+          const suffix = after.length > 0 && !after.startsWith('\n') ? '\n\n' : '\n';
+          const updated = `${before}${prefix}${mdSnippet}${suffix}${after}`;
+          lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+          patchNote({ body: updated });
+        } else {
+          const updated = currentBody.trim() ? `${currentBody.trim()}\n\n${mdSnippet}\n` : `${mdSnippet}\n`;
+          lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+          patchNote({ body: updated });
+        }
+        return;
+      }
+
+      const figures = uploaded.map((u) =>
+        createImageBlockElement({
+          src: u.assetPath,
+          alt: u.alt,
+        })
+      );
+      insertImageBlocksAtRange(figures, explicitRange);
+    },
+    [insertImageBlocksAtRange, patchNote, rawMode]
+  );
+
+  const handleTriggerImageUpload = () => {
+    savedInsertRangeRef.current = captureCurrentDocRange();
+    setShowInsertMenu(false);
+    imageInputRef.current?.click();
+  };
+
+  const openLightboxForElement = useCallback((targetEl: HTMLElement) => {
+    const root = docRef.current;
+    if (!root) return;
+
+    const allImgs = Array.from(root.querySelectorAll('img')) as HTMLImageElement[];
+    if (allImgs.length === 0) return;
+
+    const targetImg =
+      targetEl.tagName.toUpperCase() === 'IMG'
+        ? (targetEl as HTMLImageElement)
+        : (targetEl.querySelector('img') as HTMLImageElement | null);
+
+    let activeIdx = 0;
+    const items: LightboxImageItem[] = [];
+
+    allImgs.forEach((imgEl) => {
+      const fig = imgEl.closest('figure.doc-image-block') as HTMLElement | null;
+      const rawSrc =
+        fig?.getAttribute('data-src') ||
+        imgEl.getAttribute('data-src') ||
+        imgEl.getAttribute('src') ||
+        '';
+      const resolvedSrc = resolveImageSrc(rawSrc) || imgEl.currentSrc || imgEl.src;
+      if (!resolvedSrc) return;
+      const alt =
+        fig?.getAttribute('data-alt') || imgEl.getAttribute('alt') || 'Pasted image';
+      if (targetImg && imgEl === targetImg) {
+        activeIdx = items.length;
+      }
+      items.push({ src: resolvedSrc, alt });
+    });
+
+    if (items.length > 0) {
+      setLightbox({ images: items, index: activeIdx });
+    }
+  }, []);
 
   // Detect @, #, [[, or / autocomplete triggers at exact caret location in contentEditable or raw textarea
   const detectDocAutocomplete = useCallback(() => {
@@ -779,6 +1160,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     if (autocomplete.kind === 'slash') {
       const dueStr = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
       const commands = [
+        { id: 'image', label: '/image — Upload or insert image', sub: 'Resizable image', replacement: '__INSERT_IMAGE__', tokenValue: '' },
         { id: 'task', label: '/task — Action item checkbox', sub: 'Checklist task', replacement: '__BLOCK_TASK__', tokenValue: '' },
         { id: 'decision', label: '/decision — Agreed decision', sub: 'Decision record', replacement: '__BLOCK_DECISION__', tokenValue: '' },
         { id: 'proposed', label: '/proposed — Proposed decision', sub: 'Proposed status', replacement: '__BLOCK_PROPOSED__', tokenValue: '' },
@@ -896,6 +1278,26 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       }
       setAutocomplete(null);
       onOpenQuickAsk();
+      return;
+    }
+
+    if (item.replacement === '__INSERT_IMAGE__') {
+      if (autocomplete.textNode && docRef.current?.contains(autocomplete.textNode)) {
+        const r = document.createRange();
+        r.setStart(autocomplete.textNode, autocomplete.tokenStart);
+        r.setEnd(autocomplete.textNode, autocomplete.cursorPos);
+        r.deleteContents();
+        const blk = findEditableBlock(r.startContainer, docRef.current);
+        if (blk && !blk.textContent?.trim()) {
+          blk.innerHTML = '<br>';
+          r.setStart(blk, 0);
+          r.collapse(true);
+        }
+        savedInsertRangeRef.current = r.cloneRange();
+        emitMarkdownFromDom();
+      }
+      setAutocomplete(null);
+      imageInputRef.current?.click();
       return;
     }
 
@@ -1592,7 +1994,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       }
     }
 
-    // Smooth Backspace at start of Task, Decision, Heading, or Quote converts to normal Paragraph
+    // Smooth Backspace at start of Task, Decision, Heading, or Quote converts to normal Paragraph;
+    // or removes an immediately preceding image block
     if (e.key === 'Backspace' && range.collapsed && blk && isCaretAtStartOfBlock(blk, range)) {
       const tag = blk.tagName.toUpperCase();
       const isTask = blk.classList.contains('doc-task');
@@ -1608,13 +2011,104 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         placeCaretAtStart(p);
         emitMarkdownFromDom();
         refreshSelectionToolbarState();
+        return;
+      }
+
+      const prevEl = blk.previousElementSibling as HTMLElement | null;
+      if (prevEl && prevEl.classList.contains('doc-image-block')) {
+        e.preventDefault();
+        prevEl.remove();
+        emitMarkdownFromDom();
+        return;
       }
     }
+
+    // Delete at end of block removes an immediately following image block
+    if (e.key === 'Delete' && range.collapsed && blk && isCaretAtEndOfBlock(blk, range)) {
+      const nextEl = blk.nextElementSibling as HTMLElement | null;
+      if (nextEl && nextEl.classList.contains('doc-image-block')) {
+        e.preventDefault();
+        nextEl.remove();
+        emitMarkdownFromDom();
+        return;
+      }
+    }
+  };
+
+  // Drag-to-resize handles on note images (left edge, right edge, bottom-right corner)
+  const handleDocPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    const handleEl = target.closest('[data-resize-dir]') as HTMLElement | null;
+    if (!handleEl) return;
+
+    const figureEl = handleEl.closest('figure.doc-image-block') as HTMLElement | null;
+    const root = docRef.current;
+    if (!figureEl || !root) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const dir = handleEl.getAttribute('data-resize-dir') || 'se';
+    const imgEl = figureEl.querySelector('img');
+    const startRect = (imgEl || figureEl).getBoundingClientRect();
+    const startWidth = Math.max(80, startRect.width);
+    const startX = e.clientX;
+    const maxAllowedWidth = Math.max(160, root.clientWidth);
+    const minAllowedWidth = Math.min(120, maxAllowedWidth);
+    let latestPx = Math.round(startWidth);
+
+    figureEl.classList.add('is-resizing');
+
+    const onPointerMove = (ev: PointerEvent) => {
+      const deltaX = dir === 'w' ? startX - ev.clientX : ev.clientX - startX;
+      const clamped = Math.round(
+        Math.max(minAllowedWidth, Math.min(maxAllowedWidth, startWidth + deltaX))
+      );
+      latestPx = clamped;
+      figureEl.style.width = `${clamped}px`;
+      figureEl.setAttribute('data-width', String(clamped));
+
+      const pct = Math.round((clamped / maxAllowedWidth) * 100);
+      const pill = figureEl.querySelector('.doc-image-size-pill');
+      if (pill) {
+        pill.textContent = `${clamped}px · ${pct}%`;
+      }
+      figureEl
+        .querySelectorAll('.doc-image-preset[data-preset]')
+        .forEach((btn) => btn.classList.remove('active'));
+    };
+
+    const onPointerUp = () => {
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('pointercancel', onPointerUp);
+      figureEl.classList.remove('is-resizing');
+      const pill = figureEl.querySelector('.doc-image-size-pill');
+      if (pill) {
+        pill.textContent = `${latestPx}px`;
+      }
+      suppressImageClickUntilRef.current = performance.now() + 260;
+      emitMarkdownFromDom();
+    };
+
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('pointercancel', onPointerUp);
   };
 
   // Interactive left-gutter click on Task Checkbox or Decision Status Badge + Ctrl/Cmd+Click on links
   const handleDocMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
+
+    if (
+      target.closest('[data-img-action]') ||
+      target.closest('[data-resize-dir]') ||
+      target.closest('figure.doc-image-block')
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
 
     // Ctrl/Cmd + Click on @person, #label, or [[note]] navigates immediately (just like Microsoft Word!)
     const tokenEl = target.closest('.doc-token') as HTMLElement | null;
@@ -1656,6 +2150,70 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     }
   };
 
+  const handleDocClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+
+    const actionBtn = target.closest('[data-img-action]') as HTMLElement | null;
+    if (actionBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const figureEl = actionBtn.closest('figure.doc-image-block') as HTMLElement | null;
+      if (!figureEl) return;
+
+      const action = actionBtn.getAttribute('data-img-action');
+      if (action === 'preset') {
+        const preset = actionBtn.getAttribute('data-preset') || '100%';
+        figureEl.style.width = preset;
+        figureEl.setAttribute('data-width', preset);
+        figureEl.querySelectorAll('.doc-image-preset[data-preset]').forEach((btn) => {
+          btn.classList.toggle('active', btn.getAttribute('data-preset') === preset);
+        });
+        const pill = figureEl.querySelector('.doc-image-size-pill');
+        if (pill) {
+          pill.textContent = preset;
+        }
+        emitMarkdownFromDom();
+        return;
+      }
+
+      if (action === 'zoom') {
+        openLightboxForElement(figureEl);
+        return;
+      }
+
+      if (action === 'delete') {
+        const root = docRef.current;
+        const nextSib = figureEl.nextElementSibling as HTMLElement | null;
+        const prevSib = figureEl.previousElementSibling as HTMLElement | null;
+        figureEl.remove();
+        if (root && root.children.length === 0) {
+          const p = document.createElement('p');
+          p.innerHTML = '<br>';
+          root.appendChild(p);
+          placeCaretAtStart(p);
+        } else if (nextSib && !nextSib.classList.contains('doc-image-block')) {
+          placeCaretAtStart(nextSib);
+        } else if (prevSib && !prevSib.classList.contains('doc-image-block')) {
+          placeCaretAtEnd(prevSib);
+        }
+        emitMarkdownFromDom();
+        return;
+      }
+    }
+
+    if (target.closest('[data-resize-dir]')) {
+      return;
+    }
+
+    const clickedImg = target.closest('img') as HTMLImageElement | null;
+    if (clickedImg && docRef.current?.contains(clickedImg)) {
+      if (performance.now() < suppressImageClickUntilRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openLightboxForElement(clickedImg);
+    }
+  };
+
   const handleDocMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     const root = docRef.current;
     if (!root) return;
@@ -1678,14 +2236,25 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const handleDocPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     const root = docRef.current;
     if (!root) return;
-    e.preventDefault();
 
     const htmlData = e.clipboardData.getData('text/html');
     const plainData = e.clipboardData.getData('text/plain');
+    const imageFiles = extractImageFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
+
+    // Direct clipboard image paste (screenshots, copied browser images, or copied image files)
+    if (imageFiles.length > 0 && (!htmlData || htmlContainsOnlyImageOrEmpty(htmlData))) {
+      e.preventDefault();
+      const capturedRange = captureCurrentDocRange();
+      void insertImageFiles(imageFiles, capturedRange);
+      return;
+    }
+
+    e.preventDefault();
 
     const looksLikeMarkdown =
-      /(?:^|\n)\s*(?:#{1,3}\s|[-*]\s*\[(?:[ /?xX]|D)|[-*]\s+|\d+\.\s+|>\s)/i.test(plainData) ||
-      /@\[[^\]]+\]|\[\[[^\]]+\]\]/.test(plainData);
+      /(?:^|\n)\s*(?:#{1,3}\s|[-*]\s*\[(?:[ /?xX]|D)|[-*]\s+|\d+\.\s+|>\s|!\[[^\]]*\]\([^)]+\))/i.test(
+        plainData
+      ) || /@\[[^\]]+\]|\[\[[^\]]+\]\]/.test(plainData);
 
     let cleanHtml = '';
     if (htmlData && !looksLikeMarkdown) {
@@ -1699,6 +2268,58 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     document.execCommand('insertHTML', false, cleanHtml);
     emitMarkdownFromDom();
     refreshSelectionToolbarState();
+  };
+
+  const handleRawPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFiles = extractImageFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
+    const htmlData = e.clipboardData.getData('text/html');
+    const plainData = e.clipboardData.getData('text/plain');
+
+    if (
+      imageFiles.length > 0 &&
+      !plainData.trim() &&
+      (!htmlData || htmlContainsOnlyImageOrEmpty(htmlData))
+    ) {
+      e.preventDefault();
+      void insertImageFiles(imageFiles, null);
+    }
+  };
+
+  const handleSheetDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    if (Array.from(e.dataTransfer.types).includes('Files')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      if (!isDragOverPage) setIsDragOverPage(true);
+    }
+  };
+
+  const handleSheetDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+      setIsDragOverPage(false);
+    }
+  };
+
+  const handleSheetDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    setIsDragOverPage(false);
+    const imageFiles = extractImageFilesFromDataTransfer(e.dataTransfer);
+    if (imageFiles.length === 0) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    let dropRange: Range | null = null;
+    if (
+      !rawMode &&
+      docRef.current &&
+      'caretRangeFromPoint' in document &&
+      typeof document.caretRangeFromPoint === 'function'
+    ) {
+      const candidate = document.caretRangeFromPoint(e.clientX, e.clientY);
+      if (candidate && docRef.current.contains(candidate.commonAncestorContainer)) {
+        dropRange = candidate;
+      }
+    }
+    void insertImageFiles(imageFiles, dropRange ?? captureCurrentDocRange());
   };
 
   const scopeSelectValue =
@@ -1848,6 +2469,19 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 <Gavel size={13} />
                 <span>Decision</span>
               </button>
+              <button
+                id="btn-insert-image"
+                type="button"
+                className="doc-fmt-btn doc-fmt-chip"
+                title="Insert or upload image (or paste from clipboard with Ctrl+V)"
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  handleTriggerImageUpload();
+                }}
+              >
+                <ImageIcon size={13} />
+                <span>Image</span>
+              </button>
             </>
           )}
         </div>
@@ -1858,12 +2492,21 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
               type="button"
               className="btn btn-xs btn-ghost"
               onClick={() => setShowInsertMenu((v) => !v)}
-              title="Templates, Meeting Invite Parser & Context Ask"
+              title="Insert Image, Templates, Meeting Invite Parser & Context Ask"
             >
               <Plus size={13} /> Insert ▾
             </button>
             {showInsertMenu && (
               <div className="doc-insert-popover">
+                <button
+                  type="button"
+                  className="doc-insert-item"
+                  onClick={handleTriggerImageUpload}
+                >
+                  <ImageIcon size={13} />
+                  <span>Upload Image… (or Paste)</span>
+                </button>
+                <div className="doc-insert-divider" />
                 <div className="doc-insert-section-title">Page Templates</div>
                 {NOTE_TEMPLATES.filter((t) => t.id !== 'blank').map((tpl) => (
                   <button
@@ -1941,7 +2584,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
       {/* Continuous Word-Like Document Sheet */}
       <div
-        className="word-page-sheet"
+        className={`word-page-sheet ${isDragOverPage ? 'drag-over-image' : ''}`}
+        onDragOver={handleSheetDragOver}
+        onDragLeave={handleSheetDragLeave}
+        onDrop={handleSheetDrop}
         onClick={(e) => {
           if (e.target === e.currentTarget && docRef.current && !rawMode) {
             docRef.current.focus();
@@ -2259,6 +2905,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
               patchNote({ body: e.target.value });
               detectRawAutocomplete(e.target.value, e.target.selectionStart ?? 0, e.target);
             }}
+            onPaste={handleRawPaste}
           />
         ) : (
           <div
@@ -2267,7 +2914,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             contentEditable
             suppressContentEditableWarning
             spellCheck
-            data-placeholder="Start typing anywhere on the page… Use @person, #label, [[note]], or / for tasks & decisions"
+            data-placeholder="Start typing anywhere on the page… Paste images from clipboard, or use @person, #label, [[note]], or /"
             onFocus={() => {
               try {
                 document.execCommand('defaultParagraphSeparator', false, 'p');
@@ -2286,8 +2933,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             onBeforeInput={handleDocBeforeInput}
             onInput={handleDocInput}
             onKeyDown={handleDocKeyDown}
+            onPointerDown={handleDocPointerDown}
             onMouseDown={handleDocMouseDown}
             onMouseMove={handleDocMouseMove}
+            onClick={handleDocClick}
             onPaste={handleDocPaste}
           />
         )}
@@ -2304,6 +2953,24 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           </span>
         </div>
       </div>
+
+      {/* Hidden File Input for Image Insertion (/image, Ribbon Button, Insert Menu) */}
+      <input
+        ref={imageInputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const files = Array.from(e.target.files || []).filter((f) => f.type.startsWith('image/'));
+          e.target.value = '';
+          if (files.length > 0) {
+            const savedRange = savedInsertRangeRef.current;
+            savedInsertRangeRef.current = null;
+            void insertImageFiles(files, savedRange);
+          }
+        }}
+      />
 
       {/* Subtle Word-Style Floating Link Chip when Caret is Inside @Person, #Label, or [[Note]] */}
       {activeToken && !autocomplete && (
@@ -2398,6 +3065,16 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Full-Screen Large View Image Modal with Zoom & Pan */}
+      {lightbox && (
+        <ImageLightboxModal
+          key={`${lightbox.index}-${lightbox.images[lightbox.index]?.src}`}
+          images={lightbox.images}
+          initialIndex={lightbox.index}
+          onClose={() => setLightbox(null)}
+        />
       )}
     </div>
   );

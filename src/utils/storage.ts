@@ -1,5 +1,12 @@
 import JSZip from 'jszip';
 import type { Note, WorkspaceDirectory } from '../types';
+import {
+  dataUrlToBlob,
+  extractReferencedAssetPaths,
+  getCachedAssetDataUrl,
+  mimeFromFilename,
+  saveBlobAsImageAsset,
+} from './imageStore';
 import { computeNoteFilePath, parseMarkdownToNote, serializeNoteToMarkdown } from './markdown';
 
 const DB_NAME = 'strata-workspace-db';
@@ -160,6 +167,22 @@ export async function writeNoteToFolder(
   const writable = await fileHandle.createWritable();
   await writable.write(serializeNoteToMarkdown(note, directory));
   await writable.close();
+
+  // Persist any referenced pasted images into root/assets/...
+  const referencedAssets = extractReferencedAssetPaths(note.body);
+  for (const assetPath of referencedAssets) {
+    const dataUrl = getCachedAssetDataUrl(assetPath);
+    if (!dataUrl) continue;
+    try {
+      const assetHandle = await ensureNestedFile(root, assetPath);
+      const assetWritable = await assetHandle.createWritable();
+      await assetWritable.write(dataUrlToBlob(dataUrl));
+      await assetWritable.close();
+    } catch {
+      // Ignore individual asset sync error
+    }
+  }
+
   return nextPath;
 }
 
@@ -179,7 +202,7 @@ async function walkMarkdownFiles(
 ): Promise<Array<{ path: string; text: string }>> {
   const results: Array<{ path: string; text: string }> = [];
   for await (const [name, entry] of dir.entries()) {
-    if (name.startsWith('.') || name === '_strata' || name === 'node_modules') continue;
+    if (name.startsWith('.') || name === '_strata' || name === 'assets' || name === 'node_modules') continue;
     const relPath = prefix ? `${prefix}/${name}` : name;
     if (entry.kind === 'directory') {
       const sub = await walkMarkdownFiles(entry, relPath);
@@ -196,8 +219,9 @@ async function walkMarkdownFiles(
 /**
  * Performs a two-way sync between in-memory workspace and a connected local/OneDrive folder:
  * - Reads _strata/directory.json if present and merges directory entities
+ * - Hydrates any image files inside assets/
  * - Reads any .md files created or updated on disk
- * - Writes all workspace notes to disk in Inbox/ | Internal/ | Clients/
+ * - Writes all workspace notes & assets to disk in Inbox/ | Internal/ | Clients/ | assets/
  */
 export async function syncWorkspaceWithFolder(
   root: FsDirectoryHandle,
@@ -242,6 +266,19 @@ export async function syncWorkspaceWithFolder(
     // First time initializing folder
   }
 
+  // 1b. Read any image files from root/assets/ into memory & IndexedDB cache
+  try {
+    const assetsDir = await root.getDirectoryHandle('assets', { create: false });
+    for await (const [name, entry] of assetsDir.entries()) {
+      if (entry.kind === 'file' && /\.(png|jpe?g|webp|gif|svg|bmp|avif)$/i.test(name)) {
+        const file = await entry.getFile();
+        await saveBlobAsImageAsset(file, `assets/${name}`);
+      }
+    }
+  } catch {
+    // No assets folder on disk yet
+  }
+
   // 2. Read all .md files on disk
   const diskFiles = await walkMarkdownFiles(root);
   const byId = new Map<string, Note>();
@@ -277,15 +314,27 @@ export async function syncWorkspaceWithFolder(
 }
 
 /**
- * Exports the entire workspace as a clean .zip mirroring the OneDrive folder layout.
+ * Exports the entire workspace (including pasted note images) as a clean .zip mirroring the OneDrive folder layout.
  */
 export async function exportWorkspaceZip(notes: Note[], directory: WorkspaceDirectory): Promise<void> {
   const zip = new JSZip();
   zip.file('_strata/directory.json', JSON.stringify(directory, null, 2));
+  const bundledAssets = new Set<string>();
+
   for (const note of notes) {
     const path = computeNoteFilePath(note, directory);
     zip.file(path, serializeNoteToMarkdown(note, directory));
+
+    for (const assetPath of extractReferencedAssetPaths(note.body)) {
+      if (bundledAssets.has(assetPath)) continue;
+      const dataUrl = getCachedAssetDataUrl(assetPath);
+      if (dataUrl) {
+        zip.file(assetPath, dataUrlToBlob(dataUrl));
+        bundledAssets.add(assetPath);
+      }
+    }
   }
+
   const blob = await zip.generateAsync({ type: 'blob' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -296,7 +345,7 @@ export async function exportWorkspaceZip(notes: Note[], directory: WorkspaceDire
 }
 
 /**
- * Imports either .md files or a .zip workspace archive.
+ * Imports either .md files or a .zip workspace archive (including assets/ images).
  */
 export async function importFilesIntoWorkspace(
   files: FileList,
@@ -311,6 +360,13 @@ export async function importFilesIntoWorkspace(
   };
   const byId = new Map(currentNotes.map((n) => [n.id, n]));
   let importedCount = 0;
+
+  // First register any loose image assets if selected alongside .md files
+  for (const file of Array.from(files)) {
+    if (file.type.startsWith('image/') && /^img-/i.test(file.name)) {
+      await saveBlobAsImageAsset(file, `assets/${file.name}`);
+    }
+  }
 
   for (const file of Array.from(files)) {
     if (file.name.toLowerCase().endsWith('.zip')) {
@@ -336,6 +392,17 @@ export async function importFilesIntoWorkspace(
           }
         } catch {
           // Ignore malformed metadata
+        }
+      }
+
+      // Hydrate image assets from zip BEFORE parsing markdown notes
+      for (const [relPath, entry] of Object.entries(zip.files)) {
+        if (entry.dir) continue;
+        const assetMatch = relPath.match(/(?:^|\/)(assets\/[^/]+\.(?:png|jpe?g|webp|gif|svg|bmp|avif))$/i);
+        if (assetMatch) {
+          const rawBlob = await entry.async('blob');
+          const typedBlob = new Blob([rawBlob], { type: mimeFromFilename(assetMatch[1]) });
+          await saveBlobAsImageAsset(typedBlob, assetMatch[1]);
         }
       }
 

@@ -16,6 +16,7 @@ const STOP_WORDS = new Set([
 
 export function tokenizeUnicode(text: string): string[] {
   return text
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt: string) => alt.split('|')[0] || ' ')
     .toLowerCase()
     .split(/[^\p{L}\p{N}_-]+/u)
     .filter((tok) => tok.length >= 3 && !STOP_WORDS.has(tok));
@@ -24,8 +25,16 @@ export function tokenizeUnicode(text: string): string[] {
 function buildSnippetAroundTerms(body: string, queryTerms: string[]): string {
   const cleanLines = body
     .split('\n')
-    .map((l) => l.replace(/^\s*[-*#>\s]+/, '').trim())
-    .filter((l) => l.length > 10);
+    .map((l) =>
+      l
+        .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt: string) => {
+          const cleanAlt = (alt || '').split('|')[0].trim();
+          return cleanAlt ? `[Image: ${cleanAlt}]` : '[Image]';
+        })
+        .replace(/^\s*[-*#>\s]+/, '')
+        .trim()
+    )
+    .filter((l) => l.length > 6);
 
   if (cleanLines.length === 0) return 'No body content yet.';
 

@@ -244,6 +244,12 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
       continue;
     }
 
+    // Preserve standalone Markdown image blocks untouched
+    if (/^!\[[^\]]*\]\([^)]+\)$/.test(trimmed)) {
+      discussionLines.push(trimmed);
+      continue;
+    }
+
     const strippedBullet = trimmed.replace(/^[-*•]\s*/, '');
 
     // Implicit Decision patterns
@@ -273,7 +279,7 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
     }
 
     // Implicit Task patterns
-    const taskPrefix = /^(?:todo|action|action item|next step|follow[- ]?up)\s*[:\-—]\s*(.+)$/i;
+    const taskPrefix = /^(?:todo|action|action item|next step|follow[- ]?up)\s*[:\-—]?\s*(.+)$/i;
     const personWillPattern = directory.people.find((p) => {
       const first = p.name.split(/\s+/)[0];
       return new RegExp(`\\b(?:${p.name}|${first})\\s+(?:will|to|needs to|going to)\\s+`, 'i').test(strippedBullet);
@@ -317,12 +323,13 @@ export function buildLocalStructureProposal(note: Note, directory: WorkspaceDire
   if (!suggestedTitle || /^untitled/i.test(suggestedTitle)) {
     const clientName = directory.clients.find((c) => c.id === suggestedClientId)?.name;
     const projName = directory.projects.find((p) => p.id === suggestedProjectId)?.name;
+    const firstTextLine = discussionLines.find((l) => !/^!\[[^\]]*\]\([^)]+\)$/.test(l.trim()));
     if (clientName && projName) {
       suggestedTitle = `${clientName} — ${projName} Sync`;
     } else if (clientName) {
       suggestedTitle = `${clientName} — Working Session`;
-    } else if (discussionLines.length > 0) {
-      suggestedTitle = discussionLines[0].replace(/^[-*#\s]+/, '').slice(0, 56);
+    } else if (firstTextLine) {
+      suggestedTitle = firstTextLine.replace(/^[-*#\s]+/, '').slice(0, 56);
     } else {
       suggestedTitle = `Working Note (${note.date})`;
     }

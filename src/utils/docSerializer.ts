@@ -1,4 +1,5 @@
 import type { DecisionStatus, Person, TaskStatus } from '../types';
+import { registerDataUrlAssetSync, resolveImageSrc } from './imageStore';
 import { formatPersonMention, resolveKnownPersonName } from './markdown';
 
 const STATUS_CHAR_TO_TASK: Record<string, TaskStatus> = {
@@ -27,6 +28,86 @@ function escAttr(str: string): string {
   return escHtml(str).replace(/"/g, '&quot;');
 }
 
+export function normalizeImageWidth(raw?: string | null): string {
+  if (!raw) return '';
+  const trimmed = raw.trim().toLowerCase();
+  const pctMatch = trimmed.match(/^(\d{1,3})%$/);
+  if (pctMatch) {
+    const val = Math.max(10, Math.min(100, Number(pctMatch[1])));
+    return `${val}%`;
+  }
+  const pxMatch = trimmed.match(/^(\d{2,4})(?:px)?$/);
+  if (pxMatch) {
+    const val = Math.max(80, Math.min(2400, Number(pxMatch[1])));
+    return String(val);
+  }
+  return '';
+}
+
+export function parseAltAndWidth(rawAlt: string): { alt: string; width: string } {
+  const pipeMatch = rawAlt.match(/^(.*?)\|(\d{1,4}(?:px|%)?)$/i);
+  if (pipeMatch) {
+    return {
+      alt: pipeMatch[1].trim(),
+      width: normalizeImageWidth(pipeMatch[2]),
+    };
+  }
+  return { alt: rawAlt.trim(), width: '' };
+}
+
+export function buildImageBlockHtml(params: {
+  src: string;
+  alt?: string;
+  width?: string | null;
+}): string {
+  const cleanSrc = params.src.startsWith('data:image/')
+    ? registerDataUrlAssetSync(params.src)
+    : params.src.trim();
+  const resolvedSrc = resolveImageSrc(cleanSrc);
+  const alt = (params.alt ?? 'Pasted image').replace(/[[\]|]/g, '').trim();
+  const width = normalizeImageWidth(params.width);
+  const cssWidth = width ? (width.endsWith('%') ? width : `${width}px`) : '';
+  const badgeLabel = width ? (width.endsWith('%') ? width : `${width}px`) : 'Auto';
+  const presets = ['25%', '50%', '75%', '100%'];
+
+  const presetBtns = presets
+    .map(
+      (p) =>
+        `<button type="button" class="doc-image-preset${width === p ? ' active' : ''}" data-img-action="preset" data-preset="${p}" title="Resize to ${p} width">${p}</button>`
+    )
+    .join('');
+
+  return (
+    `<figure class="doc-image-block" contenteditable="false" data-src="${escAttr(cleanSrc)}" data-alt="${escAttr(alt)}"` +
+    `${width ? ` data-width="${escAttr(width)}"` : ''}` +
+    `${cssWidth ? ` style="width: ${escAttr(cssWidth)};"` : ''}>` +
+    `<div class="doc-image-frame">` +
+    `<img src="${escAttr(resolvedSrc)}" alt="${escAttr(alt || 'Pasted image')}" draggable="false" />` +
+    `<span class="doc-image-handle doc-image-handle-w" data-resize-dir="w" title="Drag edge to resize"></span>` +
+    `<span class="doc-image-handle doc-image-handle-e" data-resize-dir="e" title="Drag edge to resize"></span>` +
+    `<span class="doc-image-handle doc-image-handle-se" data-resize-dir="se" title="Drag corner to resize"></span>` +
+    `<div class="doc-image-toolbar no-print">` +
+    presetBtns +
+    `<span class="doc-image-toolbar-sep"></span>` +
+    `<button type="button" class="doc-image-preset" data-img-action="zoom" title="Open large view (Click image)">⤢</button>` +
+    `<button type="button" class="doc-image-preset danger" data-img-action="delete" title="Remove image">✕</button>` +
+    `</div>` +
+    `<span class="doc-image-size-pill no-print">${escHtml(badgeLabel)}</span>` +
+    `</div>` +
+    `</figure>`
+  );
+}
+
+export function createImageBlockElement(params: {
+  src: string;
+  alt?: string;
+  width?: string | null;
+}): HTMLElement {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = buildImageBlockHtml(params);
+  return tpl.content.firstElementChild as HTMLElement;
+}
+
 /**
  * Converts inline Markdown (bold, italic, strike, code, @[Person], #label, [[Note]], due:, !prio)
  * into clean semantic HTML spans for the continuous Word-like document surface.
@@ -44,13 +125,14 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
     .join('|');
 
   const patternParts = [
-    '`([^`]+)`', // 1: inline code
-    '\\[\\[([^\\]]+)\\]\\]', // 2: [[Note Link]]
-    '@\\[([^\\]]+)\\]', // 3: @[Full Name]
+    '`([^`]+)`', // inline code
+    '!\\[([^\\]]*)\\]\\(([^)\\n]+)\\)', // inline image ![alt|width](src)
+    '\\[\\[([^\\]]+)\\]\\]', // [[Note Link]]
+    '@\\[([^\\]]+)\\]', // @[Full Name]
     ...(multiWordPersonAlternation
-      ? [`(?<=^|[\\s(])@(${multiWordPersonAlternation})(?=$|[\\s,.;:!?)])`] // 4: @Known Multiword
+      ? [`(?<=^|[\\s(])@(${multiWordPersonAlternation})(?=$|[\\s,.;:!?)])`] // @Known Multiword
       : []),
-    '(?<=^|[\\s(])@([\\p{L}][\\p{L}\\p{N}._-]{0,30})', // 4 or 5: @SingleWord
+    '(?<=^|[\\s(])@([\\p{L}][\\p{L}\\p{N}._-]{0,30})', // @SingleWord
     '(?<=^|[\\s(])#([\\p{L}][\\p{L}\\p{N}_-]{1,38})', // #label
     '\\bdue:(\\d{4}-\\d{2}-\\d{2})\\b', // due:YYYY-MM-DD
     '(?<=^|\\s)!(high|medium|med|low)\\b', // !priority
@@ -74,6 +156,23 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
 
     if (raw.startsWith('`') && raw.endsWith('`')) {
       out.push(`<code>${escHtml(raw.slice(1, -1))}</code>`);
+    } else if (raw.startsWith('![') && raw.endsWith(')')) {
+      const imgMatch = raw.match(/^!\[([^\]]*)\]\(([^)\n]+)\)$/);
+      if (imgMatch) {
+        const { alt, width } = parseAltAndWidth(imgMatch[1]);
+        const cleanSrc = imgMatch[2].trim().startsWith('data:image/')
+          ? registerDataUrlAssetSync(imgMatch[2].trim())
+          : imgMatch[2].trim();
+        const resolved = resolveImageSrc(cleanSrc);
+        const cssWidth = width ? (width.endsWith('%') ? width : `${width}px`) : '';
+        out.push(
+          `<img class="doc-inline-image" src="${escAttr(resolved)}" data-src="${escAttr(cleanSrc)}" alt="${escAttr(alt || 'Image')}"` +
+            `${width ? ` data-width="${escAttr(width)}"` : ''}` +
+            `${cssWidth ? ` style="width: ${escAttr(cssWidth)};"` : ''} />`
+        );
+      } else {
+        out.push(escHtml(raw));
+      }
     } else if (raw.startsWith('[[') && raw.endsWith(']]')) {
       const title = raw.slice(2, -2).trim();
       out.push(
@@ -145,6 +244,21 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
 
   while (i < lines.length) {
     const line = lines[i];
+
+    // 0. Standalone Resizable Image Block: ![alt|width](src)
+    const imgBlockMatch = line.match(/^\s*!\[([^\]]*)\]\(([^)\n]+)\)\s*$/);
+    if (imgBlockMatch) {
+      const { alt, width } = parseAltAndWidth(imgBlockMatch[1]);
+      htmlBlocks.push(
+        buildImageBlockHtml({
+          src: imgBlockMatch[2].trim(),
+          alt,
+          width,
+        })
+      );
+      i++;
+      continue;
+    }
 
     // 1. Decision block (+ optional indented Rationale sub-line)
     const decMatch = line.match(/^\s*[-*]\s*\[D(?::(agreed|proposed|superseded))?\](?:\s+(.*))?$/i);
@@ -281,6 +395,15 @@ function serializeInlineNode(node: Node): string {
     return el.nextSibling ? '\n' : '';
   }
 
+  if (tag === 'IMG') {
+    const rawSrc = el.getAttribute('data-src') || el.getAttribute('src') || '';
+    if (!rawSrc) return '';
+    const src = rawSrc.startsWith('data:image/') ? registerDataUrlAssetSync(rawSrc) : rawSrc;
+    const alt = (el.getAttribute('alt') || 'Image').replace(/[[\]|]/g, '').trim();
+    const width = normalizeImageWidth(el.getAttribute('data-width') || el.getAttribute('width') || '');
+    return `![${alt}${width ? `|${width}` : ''}](${src})`;
+  }
+
   if (tag === 'SPAN') {
     if (el.classList.contains('doc-person')) {
       const rawTxt = (el.textContent || '').replace(/\u00A0/g, ' ');
@@ -350,6 +473,7 @@ export function serializeInlineChildren(container: Node): string {
 const BLOCK_TAGS = new Set([
   'P',
   'DIV',
+  'FIGURE',
   'H1',
   'H2',
   'H3',
@@ -405,6 +529,19 @@ export function domToMarkdown(root: HTMLElement): string {
       }
 
       flushInlineBuffer();
+
+      if (tag === 'FIGURE' && el.classList.contains('doc-image-block')) {
+        const rawSrc = el.getAttribute('data-src') || el.querySelector('img')?.getAttribute('src') || '';
+        if (rawSrc) {
+          const src = rawSrc.startsWith('data:image/') ? registerDataUrlAssetSync(rawSrc) : rawSrc;
+          const alt = (el.getAttribute('data-alt') ?? el.querySelector('img')?.getAttribute('alt') ?? 'Pasted image')
+            .replace(/[[\]|]/g, '')
+            .trim();
+          const width = normalizeImageWidth(el.getAttribute('data-width') || '');
+          lines.push(`![${alt}${width ? `|${width}` : ''}](${src})`);
+        }
+        return;
+      }
 
       if (tag === 'UL') {
         Array.from(el.children).forEach((child) => {
@@ -488,6 +625,21 @@ export function domToMarkdown(root: HTMLElement): string {
   return lines.join('\n');
 }
 
+function isSafePastedImageSrc(src: string): boolean {
+  const s = src.trim().toLowerCase();
+  if (!s) return false;
+  if (s.startsWith('file:') || s.startsWith('webkit-fake-url:') || s.startsWith('javascript:')) {
+    return false;
+  }
+  return (
+    s.startsWith('data:image/') ||
+    s.startsWith('https://') ||
+    s.startsWith('http://') ||
+    s.startsWith('blob:') ||
+    s.startsWith('assets/')
+  );
+}
+
 /**
  * Sanitizes pasted rich HTML (e.g., from Word, Outlook, Teams, or Docs) into clean Strata HTML
  * without inline font/background styles.
@@ -506,6 +658,7 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
 
     if (tag === 'STYLE' || tag === 'SCRIPT' || tag === 'META') return '';
     if (tag === 'BR') return '<br>';
+    if (tag === 'IMG') return '';
 
     if (el.classList.contains('doc-token')) {
       return el.outerHTML;
@@ -525,6 +678,14 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
 
   const outBlocks: string[] = [];
 
+  const emitImgElement = (imgEl: Element) => {
+    const rawSrc = imgEl.getAttribute('data-src') || imgEl.getAttribute('src') || '';
+    if (!isSafePastedImageSrc(rawSrc)) return;
+    const alt = imgEl.getAttribute('alt') || 'Pasted image';
+    const width = imgEl.getAttribute('data-width') || imgEl.getAttribute('width') || '';
+    outBlocks.push(buildImageBlockHtml({ src: rawSrc, alt, width }));
+  };
+
   const cleanBlocks = (container: Node) => {
     container.childNodes.forEach((node) => {
       if (node.nodeType === Node.TEXT_NODE) {
@@ -537,6 +698,32 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
       const tag = el.tagName.toUpperCase();
 
       if (tag === 'STYLE' || tag === 'SCRIPT' || tag === 'META') return;
+
+      if (tag === 'IMG') {
+        emitImgElement(el);
+        return;
+      }
+
+      if (tag === 'FIGURE') {
+        if (el.classList.contains('doc-image-block')) {
+          const src = el.getAttribute('data-src') || el.querySelector('img')?.getAttribute('src') || '';
+          if (isSafePastedImageSrc(src)) {
+            outBlocks.push(
+              buildImageBlockHtml({
+                src,
+                alt: el.getAttribute('data-alt') || 'Pasted image',
+                width: el.getAttribute('data-width') || '',
+              })
+            );
+          }
+          return;
+        }
+        const figImg = el.querySelector('img');
+        if (figImg) {
+          emitImgElement(figImg);
+          return;
+        }
+      }
 
       if (tag === 'UL' || tag === 'OL') {
         const listTag = tag.toLowerCase();
@@ -579,15 +766,17 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
           cleanBlocks(el);
         } else {
           const inner = cleanInline(el);
-          if (inner || tag === 'P') {
+          if (inner || (tag === 'P' && !el.querySelector('img'))) {
             outBlocks.push(`<p>${inner || '<br>'}</p>`);
           }
+          el.querySelectorAll('img').forEach(emitImgElement);
         }
         return;
       }
 
       const fallback = cleanInline(el);
       if (fallback) outBlocks.push(`<p>${fallback}</p>`);
+      el.querySelectorAll('img').forEach(emitImgElement);
     });
   };
 

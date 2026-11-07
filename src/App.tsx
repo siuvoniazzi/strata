@@ -48,6 +48,7 @@ import type {
   WorkspaceDirectory,
 } from './types';
 import { loadAiConfig } from './utils/aiProvider';
+import { hydrateImagesFromIdb } from './utils/imageStore';
 import {
   computeNoteFilePath,
   deleteDecisionFromBody,
@@ -204,6 +205,34 @@ export function App() {
     return () => mq.removeEventListener('change', onChange);
   }, []);
 
+  // Guard against duplicate paste events forwarded by webview / preview iframe hosts
+  useEffect(() => {
+    let lastTime = 0;
+    let lastSig = '';
+
+    const onPasteCapture = (e: ClipboardEvent) => {
+      const dt = e.clipboardData;
+      if (!dt) return;
+      const now = performance.now();
+      const plain = dt.getData('text/plain');
+      const htmlLen = dt.getData('text/html').length;
+      const firstFile = dt.files && dt.files[0] ? `${dt.files[0].type}:${dt.files[0].size}` : '';
+      const types = Array.from(dt.types || []).join(',');
+      const sig = `${plain.length}:${plain.slice(0, 80)}|${htmlLen}|${dt.files?.length || 0}:${firstFile}|${types}`;
+
+      if (now - lastTime < 120 && sig === lastSig) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return;
+      }
+      lastTime = now;
+      lastSig = sig;
+    };
+
+    window.addEventListener('paste', onPasteCapture, true);
+    return () => window.removeEventListener('paste', onPasteCapture, true);
+  }, []);
+
   // Hydrate workspace from IndexedDB + one-time purge of v1 demo records
   useEffect(() => {
     let mounted = true;
@@ -214,6 +243,7 @@ export function App() {
           idbGet<WorkspaceDirectory>('directory'),
           idbGet<boolean>('demoPurgedV2'),
           loadPersistedDirHandle(),
+          hydrateImagesFromIdb(),
         ]);
 
         if (!mounted) return;
@@ -1740,6 +1770,12 @@ export function App() {
                         ? directory.clients.find((c) => c.id === n.clientId)
                         : null;
                       const preview = n.body
+                        .replace(/!\[([^\]]*)\]\([^)]+\)/g, (_, alt: string) => {
+                          const cleanAlt = (alt || '').split('|')[0].trim();
+                          return cleanAlt && cleanAlt.toLowerCase() !== 'pasted image'
+                            ? `[Image: ${cleanAlt}]`
+                            : '[Image]';
+                        })
                         .replace(/^#+\s+/gm, '')
                         .replace(/[-*]\s*\[[ /?xXD:a-z]+\]\s*/gi, '')
                         .trim();
