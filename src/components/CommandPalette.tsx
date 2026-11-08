@@ -209,8 +209,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       },
       {
         id: 'act-folder-sync',
-        title: 'Connect / Sync Local or OneDrive Folder (.md)',
-        category: 'Storage',
+        title: 'Multi-Device & Google Drive / Local Folder Sync (.md)',
+        category: 'Storage & Cloud Sync',
         icon: <FolderSync size={14} />,
         action: onConnectFolder,
       },

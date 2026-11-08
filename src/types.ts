@@ -144,3 +144,24 @@ export interface NoteFilter {
   label?: string;
   personName?: string;
 }
+
+export interface SyncTombstones {
+  notes: Record<string, string>; // noteId -> ISO deletedAt
+  clients: Record<string, string>; // clientId -> ISO deletedAt
+  projects: Record<string, string>; // projectId -> ISO deletedAt
+  people: Record<string, string>; // lowerCasePersonName -> ISO deletedAt
+}
+
+export type SyncProviderMode = 'none' | 'folder' | 'gdrive';
+
+export interface GoogleDriveConfig {
+  enabled: boolean;
+  clientId: string;
+  accessToken: string;
+  tokenExpiresAt: number; // epoch ms
+  folderId: string;
+  folderName: string;
+  userEmail?: string;
+  autoSync: boolean;
+}
+

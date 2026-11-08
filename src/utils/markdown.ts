@@ -661,13 +661,21 @@ function unquoteYaml(val: string): string {
   return trimmed;
 }
 
+function stripCloudConflictSuffix(segment: string): string {
+  return segment
+    .replace(/\s*\(\d+\)$/, '')
+    .replace(/\s*\((?:conflicted copy|conflict)[^)]*\)$/i, '')
+    .trim();
+}
+
 /**
  * Parses a Markdown file with YAML frontmatter back into a Note and reconciles Client/Project entities.
  */
 export function parseMarkdownToNote(
   rawMarkdown: string,
   fallbackPath: string,
-  directory: WorkspaceDirectory
+  directory: WorkspaceDirectory,
+  fileLastModified?: number
 ): { note: Note; newClients: Client[]; newProjects: Project[]; newPeople: Person[] } {
   const newClients: Client[] = [];
   const newProjects: Project[] = [];
@@ -712,30 +720,69 @@ export function parseMarkdownToNote(
     }
   }
 
-  const fileBase = fallbackPath.split('/').pop()?.replace(/\.md$/i, '') || 'Untitled';
-  const title = (typeof meta.title === 'string' && meta.title) || fileBase.replace(/^\d{4}-\d{2}-\d{2}-/, '');
+  const pathParts = fallbackPath.split('/').filter(Boolean).map(stripCloudConflictSuffix);
+  const rawFileBase = fallbackPath.split('/').pop()?.replace(/\.md$/i, '') || 'Untitled';
+  const fileBase = stripCloudConflictSuffix(rawFileBase);
+  const title =
+    (typeof meta.title === 'string' && meta.title) ||
+    fileBase.replace(/^\d{4}-\d{2}-\d{2}-/, '').replace(/-/g, ' ');
   const dateMatch = fileBase.match(/^(\d{4}-\d{2}-\d{2})/);
   const date =
     (typeof meta.date === 'string' && meta.date) ||
     (dateMatch ? dateMatch[1] : new Date().toISOString().slice(0, 10));
 
+  const topFolder = (pathParts[0] || '').toLowerCase();
   let scope: NoteScope = 'inbox';
   if (meta.scope === 'client' || meta.scope === 'internal' || meta.scope === 'inbox') {
     scope = meta.scope;
-  } else if (fallbackPath.startsWith('Clients/')) {
+  } else if (topFolder === 'clients') {
     scope = 'client';
-  } else if (fallbackPath.startsWith('Internal/')) {
+  } else if (topFolder === 'internal') {
     scope = 'internal';
   }
 
-  const clientName = typeof meta.client === 'string' ? meta.client : '';
-  const projectName = typeof meta.project === 'string' ? meta.project : '';
+  let clientName = typeof meta.client === 'string' ? meta.client.trim() : '';
+  let projectName = typeof meta.project === 'string' ? meta.project.trim() : '';
+
+  if (!clientName && topFolder === 'clients' && pathParts.length >= 3) {
+    const folderClient = pathParts[1];
+    if (folderClient && folderClient.toLowerCase() !== 'unassigned-client') {
+      const matched = directory.clients.find(
+        (c) =>
+          folderSegment(c.name).toLowerCase() === folderClient.toLowerCase() ||
+          c.name.toLowerCase() === folderClient.replace(/-/g, ' ').toLowerCase()
+      );
+      clientName = matched ? matched.name : folderClient.replace(/-/g, ' ');
+    }
+  }
+
+  if (!projectName) {
+    if (topFolder === 'clients' && pathParts.length >= 4) {
+      const folderProj = pathParts[2];
+      if (folderProj && folderProj.toLowerCase() !== 'general') {
+        projectName = folderProj.replace(/-/g, ' ');
+      }
+    } else if (topFolder === 'internal' && pathParts.length >= 3) {
+      const folderProj = pathParts[1];
+      if (folderProj && folderProj.toLowerCase() !== 'general') {
+        projectName = folderProj.replace(/-/g, ' ');
+      }
+    }
+  }
 
   let clientId: string | null = null;
   if (clientName) {
     const existing =
-      directory.clients.find((c) => c.name.toLowerCase() === clientName.toLowerCase()) ||
-      newClients.find((c) => c.name.toLowerCase() === clientName.toLowerCase());
+      directory.clients.find(
+        (c) =>
+          c.name.toLowerCase() === clientName.toLowerCase() ||
+          folderSegment(c.name).toLowerCase() === folderSegment(clientName).toLowerCase()
+      ) ||
+      newClients.find(
+        (c) =>
+          c.name.toLowerCase() === clientName.toLowerCase() ||
+          folderSegment(c.name).toLowerCase() === folderSegment(clientName).toLowerCase()
+      );
     if (existing) {
       clientId = existing.id;
     } else {
@@ -754,14 +801,22 @@ export function parseMarkdownToNote(
   if (projectName) {
     const existing =
       directory.projects.find(
-        (p) => p.name.toLowerCase() === projectName.toLowerCase() && p.clientId === clientId
+        (p) =>
+          (p.name.toLowerCase() === projectName.toLowerCase() ||
+            folderSegment(p.name).toLowerCase() === folderSegment(projectName).toLowerCase()) &&
+          p.clientId === clientId
       ) ||
-      newProjects.find((p) => p.name.toLowerCase() === projectName.toLowerCase() && p.clientId === clientId);
+      newProjects.find(
+        (p) =>
+          (p.name.toLowerCase() === projectName.toLowerCase() ||
+            folderSegment(p.name).toLowerCase() === folderSegment(projectName).toLowerCase()) &&
+          p.clientId === clientId
+      );
     if (existing) {
       projectId = existing.id;
     } else {
       const created: Project = {
-        id: `proj-${slugify(projectName)}-${Date.now().toString(36).slice(-4)}`,
+        id: `proj-${clientId ? `${slugify(clientName)}-` : ''}${slugify(projectName)}`,
         name: projectName,
         scope: clientId ? 'client' : 'internal',
         clientId,
@@ -789,8 +844,20 @@ export function parseMarkdownToNote(
   const labels = Array.isArray(meta.labels) ? meta.labels.map(normalizeLabel).filter(Boolean) : [];
   const nowIso = new Date().toISOString();
 
+  let resolvedUpdatedAt =
+    (typeof meta.updatedAt === 'string' && meta.updatedAt) ||
+    (fileLastModified ? new Date(fileLastModified).toISOString() : nowIso);
+
+  if (fileLastModified && typeof meta.updatedAt === 'string') {
+    const metaMs = new Date(meta.updatedAt).getTime();
+    if (!Number.isNaN(metaMs) && fileLastModified > metaMs + 2500) {
+      resolvedUpdatedAt = new Date(fileLastModified).toISOString();
+    }
+  }
+
+  const cleanFallbackKey = pathParts.join('/');
   const note: Note = {
-    id: (typeof meta.id === 'string' && meta.id) || `note-${slugify(fallbackPath)}-${Date.now().toString(36)}`,
+    id: (typeof meta.id === 'string' && meta.id) || `note-${slugify(cleanFallbackKey)}`,
     title,
     date,
     scope,
@@ -799,8 +866,8 @@ export function parseMarkdownToNote(
     participants,
     labels,
     body,
-    createdAt: (typeof meta.createdAt === 'string' && meta.createdAt) || nowIso,
-    updatedAt: (typeof meta.updatedAt === 'string' && meta.updatedAt) || nowIso,
+    createdAt: (typeof meta.createdAt === 'string' && meta.createdAt) || resolvedUpdatedAt,
+    updatedAt: resolvedUpdatedAt,
     filePath: fallbackPath,
   };
 

@@ -4,6 +4,7 @@ import {
   CheckSquare,
   ChevronLeft,
   ChevronRight,
+  Cloud,
   Compass,
   Download,
   FilePlus2,
@@ -18,6 +19,7 @@ import {
   Moon,
   PanelLeft,
   Plus,
+  RefreshCw,
   RotateCcw,
   Search,
   Settings,
@@ -37,6 +39,7 @@ import {
 } from './components/DirectoryViews';
 import { HybridEditor } from './components/HybridEditor';
 import { ReportsView } from './components/ReportsView';
+import { SyncModal } from './components/SyncModal';
 import {
   WorkspaceOverlay,
   isSameOverlayEntry,
@@ -47,12 +50,14 @@ import type {
   AiConfig,
   Client,
   DecisionStatus,
+  GoogleDriveConfig,
   Note,
   NoteFilter,
   ParsedDecision,
   ParsedTask,
   Person,
   Project,
+  SyncTombstones,
   TaskStatus,
   WorkspaceDirectory,
   WorkspacePreferences,
@@ -62,6 +67,14 @@ import {
   loadAiConfig,
   subscribeAiActivity,
 } from './utils/aiProvider';
+import {
+  consumeUrlGoogleDriveParams,
+  GoogleDriveDirectoryHandle,
+  isGoogleDriveTokenValid,
+  loadGoogleDriveConfig,
+  resolveOrCreateDriveWorkspaceFolder,
+  saveGoogleDriveConfig,
+} from './utils/googleDriveSync';
 import { hydrateImagesFromIdb } from './utils/imageStore';
 import { loadWorkspacePreferences } from './utils/preferences';
 import {
@@ -80,16 +93,19 @@ import {
 } from './utils/markdown';
 import { createSeedWorkspace, purgeLegacyDemoData } from './utils/seedData';
 import {
+  createEmptyTombstones,
+  enqueueStorageTask,
   exportWorkspaceZip,
   type FsDirectoryHandle,
   idbGet,
   idbSet,
   importFilesIntoWorkspace,
-  isFolderSyncSupported,
   loadPersistedDirHandle,
+  loadSyncTombstones,
   pickSyncDirectory,
   removeNestedFileIfExists,
   requestHandlePermission,
+  saveSyncTombstones,
   syncWorkspaceWithFolder,
   writeDirectoryMetadata,
   writeNoteToFolder,
@@ -245,14 +261,65 @@ export function App() {
   const [showAiStructure, setShowAiStructure] = useState(false);
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [showCommandPalette, setShowCommandPalette] = useState(false);
+  const [showSyncModal, setShowSyncModal] = useState(false);
 
-  // Local / OneDrive Folder Sync State
+  // Local / OneDrive / Google Drive Folder Sync State
   const [dirHandle, setDirHandle] = useState<FsDirectoryHandle | null>(null);
   const [dirPermission, setDirPermission] = useState<'granted' | 'prompt' | 'denied'>('denied');
+  const [gdriveConfig, setGdriveConfig] = useState<GoogleDriveConfig>(() => loadGoogleDriveConfig());
+  const gdriveConfigRef = useRef<GoogleDriveConfig>(gdriveConfig);
+
+  const [tombstones, setTombstones] = useState<SyncTombstones>(() => createEmptyTombstones());
+  const tombstonesRef = useRef<SyncTombstones>(tombstones);
+
   const [syncStatus, setSyncStatus] = useState<string>('IndexedDB Local');
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [hydrated, setHydrated] = useState(false);
+  const initialSyncDoneRef = useRef<boolean>(false);
+  const lastSyncTimestampMsRef = useRef<number>(0);
+
+  const notesRef = useRef<Note[]>(notes);
+  const directoryRef = useRef<WorkspaceDirectory>(directory);
+  const dirHandleRef = useRef<FsDirectoryHandle | null>(dirHandle);
+  const dirPermissionRef = useRef<'granted' | 'prompt' | 'denied'>(dirPermission);
+
+  useEffect(() => {
+    gdriveConfigRef.current = gdriveConfig;
+    tombstonesRef.current = tombstones;
+    notesRef.current = notes;
+    directoryRef.current = directory;
+    dirHandleRef.current = dirHandle;
+    dirPermissionRef.current = dirPermission;
+  }, [gdriveConfig, tombstones, notes, directory, dirHandle, dirPermission]);
+
+  // Debounced single-note write queue so rapid typing never creates duplicate slug files
+  const pendingNoteWritesRef = useRef<
+    Map<string, { note: Note; originalPath?: string; customDir?: WorkspaceDirectory }>
+  >(new Map());
+  const noteWriteTimerRef = useRef<number | null>(null);
 
   const fileImportRef = useRef<HTMLInputElement | null>(null);
+
+  const recordTombstone = useCallback(
+    (kind: keyof SyncTombstones, idOrKey: string) => {
+      if (!idOrKey) return;
+      const nowIso = new Date().toISOString();
+      setTombstones((prev) => {
+        const next: SyncTombstones = {
+          ...prev,
+          [kind]: {
+            ...prev[kind],
+            [idOrKey]: nowIso,
+          },
+        };
+        tombstonesRef.current = next;
+        void saveSyncTombstones(next);
+        return next;
+      });
+    },
+    []
+  );
 
   // Apply Light/Dark theme attribute
   useEffect(() => {
@@ -316,25 +383,44 @@ export function App() {
     return () => window.clearTimeout(t);
   }, []);
 
-  // Hydrate workspace from IndexedDB + one-time purge of v1 demo records
+  // Hydrate workspace from IndexedDB + run initial multi-device sync before any local overwrites
   useEffect(() => {
     let mounted = true;
     (async () => {
       try {
-        const [savedNotes, savedDir, demoPurgedV2, persistedHandle] = await Promise.all([
-          idbGet<Note[]>('notes'),
-          idbGet<WorkspaceDirectory>('directory'),
-          idbGet<boolean>('demoPurgedV2'),
-          loadPersistedDirHandle(),
-          hydrateImagesFromIdb(),
-        ]);
+        const urlParams = consumeUrlGoogleDriveParams();
+        if (urlParams.updatedConfig) {
+          setGdriveConfig(urlParams.updatedConfig);
+          gdriveConfigRef.current = urlParams.updatedConfig;
+          if (urlParams.didPair && !isGoogleDriveTokenValid(urlParams.updatedConfig)) {
+            setShowSyncModal(true);
+          }
+        }
+
+        const [savedNotes, savedDir, demoPurgedV2, persistedHandle, savedTombstones] =
+          await Promise.all([
+            idbGet<Note[]>('notes'),
+            idbGet<WorkspaceDirectory>('directory'),
+            idbGet<boolean>('demoPurgedV2'),
+            loadPersistedDirHandle(),
+            loadSyncTombstones(),
+            hydrateImagesFromIdb(),
+          ]);
 
         if (!mounted) return;
+
+        setTombstones(savedTombstones);
+        tombstonesRef.current = savedTombstones;
+
+        let workingNotes: Note[] = seed.notes;
+        let workingDir: WorkspaceDirectory = seed.directory;
 
         if (savedNotes && savedDir) {
           if (!demoPurgedV2) {
             const purged = purgeLegacyDemoData(savedNotes, savedDir);
             const cleanedNotes = purged.notes.filter((n) => !isUntouchedBlankNote(n));
+            workingNotes = cleanedNotes;
+            workingDir = purged.directory;
             setNotes((prev) => {
               if (prev.length === 0) return cleanedNotes;
               const hydratedIds = new Set(cleanedNotes.map((n) => n.id));
@@ -345,22 +431,10 @@ export function App() {
             await idbSet('notes', cleanedNotes);
             await idbSet('directory', purged.directory);
             await idbSet('demoPurgedV2', true);
-
-            if (
-              (purged.didPurge || cleanedNotes.length !== purged.notes.length) &&
-              persistedHandle.handle &&
-              persistedHandle.permission === 'granted'
-            ) {
-              const keptIds = new Set(cleanedNotes.map((n) => n.id));
-              for (const oldNote of savedNotes) {
-                if (!keptIds.has(oldNote.id) && oldNote.filePath) {
-                  removeNestedFileIfExists(persistedHandle.handle, oldNote.filePath).catch(() => {});
-                }
-              }
-              writeDirectoryMetadata(persistedHandle.handle, purged.directory).catch(() => {});
-            }
           } else {
             const cleanedNotes = savedNotes.filter((n) => !isUntouchedBlankNote(n));
+            workingNotes = cleanedNotes;
+            workingDir = savedDir;
             setNotes((prev) => {
               if (prev.length === 0) return cleanedNotes;
               const hydratedIds = new Set(cleanedNotes.map((n) => n.id));
@@ -368,17 +442,8 @@ export function App() {
               return [...newlyEdited, ...cleanedNotes];
             });
             setDirectory(savedDir);
-
             if (cleanedNotes.length !== savedNotes.length) {
               await idbSet('notes', cleanedNotes);
-              if (persistedHandle.handle && persistedHandle.permission === 'granted') {
-                const keptIds = new Set(cleanedNotes.map((n) => n.id));
-                for (const oldNote of savedNotes) {
-                  if (!keptIds.has(oldNote.id) && oldNote.filePath) {
-                    removeNestedFileIfExists(persistedHandle.handle, oldNote.filePath).catch(() => {});
-                  }
-                }
-              }
             }
           }
         } else {
@@ -386,14 +451,112 @@ export function App() {
           await idbSet('demoPurgedV2', true);
         }
 
-        if (persistedHandle.handle) {
+        const activeGdrive = urlParams.updatedConfig || gdriveConfigRef.current;
+
+        // Priority 1: Direct Google Drive Cloud Sync if enabled & token valid
+        if (activeGdrive.enabled && isGoogleDriveTokenValid(activeGdrive)) {
+          try {
+            setIsSyncing(true);
+            setSyncStatus(`Syncing Google Drive (${activeGdrive.folderName || 'Strata'})…`);
+            const resolved = await resolveOrCreateDriveWorkspaceFolder(
+              activeGdrive.accessToken,
+              activeGdrive.folderName || 'Strata',
+              activeGdrive.folderId || undefined
+            );
+            const updatedCfg: GoogleDriveConfig = {
+              ...activeGdrive,
+              folderId: resolved.id,
+              folderName: resolved.name,
+            };
+            saveGoogleDriveConfig(updatedCfg);
+            if (mounted) {
+              setGdriveConfig(updatedCfg);
+              gdriveConfigRef.current = updatedCfg;
+            }
+            const gdriveHandle = new GoogleDriveDirectoryHandle({
+              name: resolved.name,
+              primaryFolderId: resolved.id,
+              duplicateFolderIds: resolved.duplicateIds,
+              accessTokenGetter: () => gdriveConfigRef.current.accessToken,
+            });
+            if (mounted) {
+              setDirHandle(gdriveHandle);
+              dirHandleRef.current = gdriveHandle;
+              setDirPermission('granted');
+              dirPermissionRef.current = 'granted';
+            }
+            const synced = await syncWorkspaceWithFolder(
+              gdriveHandle,
+              workingNotes,
+              workingDir,
+              savedTombstones
+            );
+            if (mounted) {
+              setNotes(synced.notes);
+              setDirectory(synced.directory);
+              setTombstones(synced.tombstones);
+              tombstonesRef.current = synced.tombstones;
+              setLastSyncedAt(new Date().toISOString());
+              lastSyncTimestampMsRef.current = Date.now();
+              setSyncStatus(`Google Drive: ${resolved.name}`);
+            }
+          } catch {
+            if (mounted) {
+              setSyncStatus(`Reconnect Drive: ${activeGdrive.folderName || 'Strata'}`);
+            }
+          } finally {
+            if (mounted) {
+              setIsSyncing(false);
+              initialSyncDoneRef.current = true;
+            }
+          }
+        } else if (activeGdrive.enabled && !isGoogleDriveTokenValid(activeGdrive)) {
+          setSyncStatus(`Reconnect Drive: ${activeGdrive.folderName || 'Strata'}`);
+          initialSyncDoneRef.current = true;
+        } else if (persistedHandle.handle) {
+          // Priority 2: Connected Local / Mounted Cloud Folder
           setDirHandle(persistedHandle.handle);
+          dirHandleRef.current = persistedHandle.handle;
           setDirPermission(persistedHandle.permission);
+          dirPermissionRef.current = persistedHandle.permission;
+
           if (persistedHandle.permission === 'granted') {
-            setSyncStatus(`Synced: ${persistedHandle.handle.name}`);
+            try {
+              setIsSyncing(true);
+              setSyncStatus(`Syncing ${persistedHandle.handle.name}…`);
+              const synced = await syncWorkspaceWithFolder(
+                persistedHandle.handle,
+                workingNotes,
+                workingDir,
+                savedTombstones
+              );
+              if (mounted) {
+                setDirHandle(synced.effectiveRoot);
+                dirHandleRef.current = synced.effectiveRoot;
+                setNotes(synced.notes);
+                setDirectory(synced.directory);
+                setTombstones(synced.tombstones);
+                tombstonesRef.current = synced.tombstones;
+                setLastSyncedAt(new Date().toISOString());
+                lastSyncTimestampMsRef.current = Date.now();
+                setSyncStatus(`Synced: ${synced.effectiveRoot.name}`);
+              }
+            } catch {
+              if (mounted) {
+                setSyncStatus(`Sync warning: ${persistedHandle.handle.name}`);
+              }
+            } finally {
+              if (mounted) {
+                setIsSyncing(false);
+                initialSyncDoneRef.current = true;
+              }
+            }
           } else {
             setSyncStatus(`Reconnect: ${persistedHandle.handle.name}`);
+            initialSyncDoneRef.current = true;
           }
+        } else {
+          initialSyncDoneRef.current = true;
         }
       } finally {
         if (mounted) setHydrated(true);
@@ -413,8 +576,13 @@ export function App() {
   useEffect(() => {
     if (!hydrated) return;
     idbSet('directory', directory);
-    if (dirHandle && dirPermission === 'granted') {
-      writeDirectoryMetadata(dirHandle, directory).catch(() => {});
+    if (dirHandle && dirPermission === 'granted' && initialSyncDoneRef.current) {
+      enqueueStorageTask(() =>
+        writeDirectoryMetadata(dirHandle, directory, {
+          tombstones: tombstonesRef.current,
+          syncedNoteIds: notesRef.current.map((n) => n.id),
+        })
+      ).catch(() => {});
     }
   }, [directory, hydrated, dirHandle, dirPermission]);
 
@@ -446,55 +614,102 @@ export function App() {
     []
   );
 
-  const syncSingleNoteToDisk = useCallback(
-    async (updatedNote: Note, previousPath?: string, customDir?: WorkspaceDirectory) => {
-      if (!dirHandle || dirPermission !== 'granted') return;
+  const flushPendingNoteWrites = useCallback(async () => {
+    if (noteWriteTimerRef.current !== null) {
+      window.clearTimeout(noteWriteTimerRef.current);
+      noteWriteTimerRef.current = null;
+    }
+    const handle = dirHandleRef.current;
+    if (!handle || dirPermissionRef.current !== 'granted') {
+      pendingNoteWritesRef.current.clear();
+      return;
+    }
+    const entries = Array.from(pendingNoteWritesRef.current.values());
+    pendingNoteWritesRef.current.clear();
+    if (entries.length === 0) return;
+
+    await enqueueStorageTask(async () => {
       try {
-        const nextPath = await writeNoteToFolder(
-          dirHandle,
-          updatedNote,
-          customDir || directory,
-          previousPath
-        );
-        if (nextPath !== updatedNote.filePath) {
-          setNotes((prev) =>
-            prev.map((n) => (n.id === updatedNote.id ? { ...n, filePath: nextPath } : n))
+        for (const item of entries) {
+          const nextPath = await writeNoteToFolder(
+            handle,
+            item.note,
+            item.customDir || directoryRef.current,
+            item.originalPath
           );
+          if (nextPath !== item.note.filePath) {
+            setNotes((prev) =>
+              prev.map((n) => (n.id === item.note.id ? { ...n, filePath: nextPath } : n))
+            );
+          }
         }
+        setLastSyncedAt(new Date().toISOString());
+        lastSyncTimestampMsRef.current = Date.now();
       } catch {
         setSyncStatus('Sync warning — check folder access');
       }
+    });
+  }, []);
+
+  const syncSingleNoteToDisk = useCallback(
+    (updatedNote: Note, previousPath?: string, customDir?: WorkspaceDirectory) => {
+      if (!dirHandleRef.current || dirPermissionRef.current !== 'granted') return;
+
+      const existingPending = pendingNoteWritesRef.current.get(updatedNote.id);
+      pendingNoteWritesRef.current.set(updatedNote.id, {
+        note: updatedNote,
+        // Preserve the earliest path before typing began so we delete the old file once
+        originalPath: existingPending ? existingPending.originalPath : previousPath,
+        customDir: customDir || existingPending?.customDir,
+      });
+
+      if (noteWriteTimerRef.current !== null) {
+        window.clearTimeout(noteWriteTimerRef.current);
+      }
+
+      const delayMs = dirHandleRef.current.providerKind === 'gdrive' ? 850 : 500;
+      noteWriteTimerRef.current = window.setTimeout(() => {
+        void flushPendingNoteWrites();
+      }, delayMs);
     },
-    [dirHandle, dirPermission, directory]
+    [flushPendingNoteWrites]
   );
 
   const syncWorkspaceDiffToDisk = useCallback(
     async (prevNotes: Note[], targetNotes: Note[], targetDir: WorkspaceDirectory) => {
       if (!dirHandle || dirPermission !== 'granted') return;
-      try {
-        const targetIds = new Set(targetNotes.map((n) => n.id));
-        for (const oldNote of prevNotes) {
-          if (!targetIds.has(oldNote.id) && oldNote.filePath) {
-            await removeNestedFileIfExists(dirHandle, oldNote.filePath);
+      await flushPendingNoteWrites();
+      await enqueueStorageTask(async () => {
+        try {
+          const targetIds = new Set(targetNotes.map((n) => n.id));
+          for (const oldNote of prevNotes) {
+            if (!targetIds.has(oldNote.id) && oldNote.filePath) {
+              await removeNestedFileIfExists(dirHandle, oldNote.filePath);
+            }
           }
-        }
-        const prevById = new Map(prevNotes.map((n) => [n.id, n]));
-        for (const nextNote of targetNotes) {
-          const prevNote = prevById.get(nextNote.id);
-          if (
-            !prevNote ||
-            !areNotesContentEqual(prevNote, nextNote) ||
-            prevNote.filePath !== nextNote.filePath
-          ) {
-            await writeNoteToFolder(dirHandle, nextNote, targetDir, prevNote?.filePath);
+          const prevById = new Map(prevNotes.map((n) => [n.id, n]));
+          for (const nextNote of targetNotes) {
+            const prevNote = prevById.get(nextNote.id);
+            if (
+              !prevNote ||
+              !areNotesContentEqual(prevNote, nextNote) ||
+              prevNote.filePath !== nextNote.filePath
+            ) {
+              await writeNoteToFolder(dirHandle, nextNote, targetDir, prevNote?.filePath);
+            }
           }
+          await writeDirectoryMetadata(dirHandle, targetDir, {
+            tombstones: tombstonesRef.current,
+            syncedNoteIds: targetNotes.map((n) => n.id),
+          });
+          setLastSyncedAt(new Date().toISOString());
+          lastSyncTimestampMsRef.current = Date.now();
+        } catch {
+          setSyncStatus('Sync warning — check folder access');
         }
-        await writeDirectoryMetadata(dirHandle, targetDir);
-      } catch {
-        setSyncStatus('Sync warning — check folder access');
-      }
+      });
     },
-    [dirHandle, dirPermission]
+    [dirHandle, dirPermission, flushPendingNoteWrites]
   );
 
   const captureWorkspaceSnapshot = useCallback(
@@ -1120,6 +1335,9 @@ export function App() {
       const target = notes.find((n) => n.id === noteId);
       if (!target) return;
       pushWorkspaceHistory(`Deleted note "${target.title || 'Untitled Note'}"`, { showToast: true });
+      recordTombstone('notes', noteId);
+      pendingNoteWritesRef.current.delete(noteId);
+
       const remaining = notes.filter((n) => n.id !== noteId);
       if (remaining.length === 0) {
         const fresh = makeFreshNote();
@@ -1139,11 +1357,22 @@ export function App() {
           setMobileNotesPane('list');
         }
       }
-      if (target.filePath && dirHandle && dirPermission === 'granted') {
-        removeNestedFileIfExists(dirHandle, target.filePath);
+      if (dirHandle && dirPermission === 'granted') {
+        const activeHandle = dirHandle;
+        const targetPath = target.filePath;
+        const nextIds = remaining.map((n) => n.id);
+        enqueueStorageTask(async () => {
+          if (targetPath) {
+            await removeNestedFileIfExists(activeHandle, targetPath);
+          }
+          await writeDirectoryMetadata(activeHandle, directoryRef.current, {
+            tombstones: tombstonesRef.current,
+            syncedNoteIds: nextIds,
+          });
+        }).catch(() => {});
       }
     },
-    [draftNote, notes, activeNoteId, dirHandle, dirPermission, pushWorkspaceHistory]
+    [draftNote, notes, activeNoteId, dirHandle, dirPermission, pushWorkspaceHistory, recordTombstone]
   );
 
   const handleEnsurePerson = useCallback(
@@ -1210,6 +1439,7 @@ export function App() {
       const target = directory.people.find((p) => p.id === personId);
       if (!target) return;
       pushWorkspaceHistory(`Deleted person "${target.name}"`, { showToast: true });
+      recordTombstone('people', target.name.trim().toLowerCase());
       setDirectory((prev) => ({
         ...prev,
         people: prev.people.filter((p) => p.id !== personId),
@@ -1234,7 +1464,7 @@ export function App() {
         setNoteFilter({ kind: 'all' });
       }
     },
-    [directory.people, noteFilter, pushWorkspaceHistory]
+    [directory.people, noteFilter, pushWorkspaceHistory, recordTombstone]
   );
 
   const handleAddClient = useCallback(
@@ -1244,7 +1474,7 @@ export function App() {
       if (options?.recordHistory !== false) {
         pushWorkspaceHistory(`Added client "${name}"`);
       }
-      const id = `client-${slugify(name)}-${Date.now().toString(36).slice(-3)}`;
+      const id = `client-${slugify(name)}`;
       const created: Client = {
         id,
         name,
@@ -1275,10 +1505,14 @@ export function App() {
       const target = directory.clients.find((c) => c.id === clientId);
       if (!target) return;
       pushWorkspaceHistory(`Deleted client "${target.name}"`, { showToast: true });
+      recordTombstone('clients', clientId);
 
       const removedProjectIds = new Set(
         directory.projects.filter((p) => p.clientId === clientId).map((p) => p.id)
       );
+      for (const pid of removedProjectIds) {
+        recordTombstone('projects', pid);
+      }
 
       const nextDir: WorkspaceDirectory = {
         ...directory,
@@ -1317,7 +1551,7 @@ export function App() {
         setNoteFilter({ kind: 'all' });
       }
     },
-    [directory, noteFilter, pushWorkspaceHistory, syncSingleNoteToDisk]
+    [directory, noteFilter, pushWorkspaceHistory, recordTombstone, syncSingleNoteToDisk]
   );
 
   const handleAddProject = useCallback(
@@ -1327,10 +1561,15 @@ export function App() {
       clientId: string | null,
       options?: { recordHistory?: boolean }
     ): string => {
+      const existing = directory.projects.find(
+        (p) => p.name.toLowerCase() === name.toLowerCase() && p.clientId === clientId
+      );
+      if (existing) return existing.id;
       if (options?.recordHistory !== false) {
         pushWorkspaceHistory(`Added project "${name}"`);
       }
-      const id = `proj-${slugify(name)}-${Date.now().toString(36).slice(-3)}`;
+      const clientObj = clientId ? directory.clients.find((c) => c.id === clientId) : null;
+      const id = `proj-${clientObj ? `${slugify(clientObj.name)}-` : ''}${slugify(name)}`;
       const created: Project = {
         id,
         name,
@@ -1341,7 +1580,7 @@ export function App() {
       setDirectory((prev) => ({ ...prev, projects: [...prev.projects, created] }));
       return id;
     },
-    [pushWorkspaceHistory]
+    [directory.clients, directory.projects, pushWorkspaceHistory]
   );
 
   const handleUpdateProject = useCallback(
@@ -1362,6 +1601,7 @@ export function App() {
       const target = directory.projects.find((p) => p.id === projectId);
       if (!target) return;
       pushWorkspaceHistory(`Deleted project "${target.name}"`, { showToast: true });
+      recordTombstone('projects', projectId);
 
       const nextDir: WorkspaceDirectory = {
         ...directory,
@@ -1391,7 +1631,7 @@ export function App() {
         );
       }
     },
-    [directory, noteFilter, pushWorkspaceHistory, syncSingleNoteToDisk]
+    [directory, noteFilter, pushWorkspaceHistory, recordTombstone, syncSingleNoteToDisk]
   );
 
   const handleAddLabel = useCallback(
@@ -1480,48 +1720,182 @@ export function App() {
     [notes, commitNoteToStateAndDisk, pushWorkspaceHistory]
   );
 
-  const handleConnectOrSyncFolder = async () => {
-    try {
-      if (dirHandle && dirPermission === 'prompt') {
-        const granted = await requestHandlePermission(dirHandle);
-        if (granted) {
-          setDirPermission('granted');
-          setSyncStatus(`Syncing ${dirHandle.name}…`);
-          const synced = await syncWorkspaceWithFolder(dirHandle, notes, directory);
-          setNotes(synced.notes);
-          setDirectory(synced.directory);
-          setSyncStatus(`Synced: ${dirHandle.name}`);
-          return;
-        }
-      }
+  const runFullWorkspaceSync = useCallback(
+    async (targetHandle?: FsDirectoryHandle, options?: { silent?: boolean }) => {
+      const handle = targetHandle || dirHandleRef.current;
+      if (!handle) return;
 
-      if (!isFolderSyncSupported()) {
-        alert(
-          'Live folder sync requires opening Strata in Chrome or Microsoft Edge over HTTPS or localhost. Use ZIP Export/Import in the meantime.'
+      await flushPendingNoteWrites();
+      const isGdrive = handle.providerKind === 'gdrive';
+
+      try {
+        setIsSyncing(true);
+        if (!options?.silent) {
+          setSyncStatus(
+            isGdrive ? `Syncing Google Drive (${handle.name})…` : `Syncing ${handle.name}…`
+          );
+        }
+        const synced = await syncWorkspaceWithFolder(
+          handle,
+          notesRef.current,
+          directoryRef.current,
+          tombstonesRef.current
         );
+        if (!isGdrive && synced.effectiveRoot !== handle) {
+          setDirHandle(synced.effectiveRoot);
+          dirHandleRef.current = synced.effectiveRoot;
+        }
+        setNotes(synced.notes);
+        setDirectory(synced.directory);
+        setTombstones(synced.tombstones);
+        tombstonesRef.current = synced.tombstones;
+        setLastSyncedAt(new Date().toISOString());
+        lastSyncTimestampMsRef.current = Date.now();
+
+        const isEditingDraft = draftBaselineRef.current?.id === activeNoteId;
+        if (
+          !isEditingDraft &&
+          synced.notes.length > 0 &&
+          !synced.notes.some((n) => n.id === activeNoteId)
+        ) {
+          setActiveNoteId(synced.notes[0].id);
+        }
+
+        setSyncStatus(
+          isGdrive ? `Google Drive: ${handle.name}` : `Synced: ${synced.effectiveRoot.name}`
+        );
+      } catch {
+        setSyncStatus(
+          isGdrive ? `Reconnect Drive: ${handle.name}` : 'Sync warning — check folder access'
+        );
+      } finally {
+        setIsSyncing(false);
+      }
+    },
+    [activeNoteId, flushPendingNoteWrites]
+  );
+
+  // Auto-sync when returning to the browser tab / unlocking phone or periodically while open
+  useEffect(() => {
+    const checkAutoSync = () => {
+      if (document.visibilityState && document.visibilityState !== 'visible') return;
+      const handle = dirHandleRef.current;
+      if (!handle || dirPermissionRef.current !== 'granted') return;
+      if (handle.providerKind === 'gdrive' && !isGoogleDriveTokenValid(gdriveConfigRef.current)) {
         return;
       }
+      if (Date.now() - lastSyncTimestampMsRef.current < 8000) return;
+      void runFullWorkspaceSync(handle, { silent: true });
+    };
 
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        void flushPendingNoteWrites();
+      } else if (document.visibilityState === 'visible') {
+        checkAutoSync();
+      }
+    };
+
+    window.addEventListener('focus', checkAutoSync);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const interval = window.setInterval(checkAutoSync, 45_000);
+
+    return () => {
+      window.removeEventListener('focus', checkAutoSync);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.clearInterval(interval);
+    };
+  }, [flushPendingNoteWrites, runFullWorkspaceSync]);
+
+  const handleTriggerSyncNow = useCallback(async () => {
+    if (dirHandleRef.current && dirPermissionRef.current === 'prompt') {
+      const granted = await requestHandlePermission(dirHandleRef.current);
+      if (granted) {
+        setDirPermission('granted');
+        dirPermissionRef.current = 'granted';
+        await runFullWorkspaceSync(dirHandleRef.current);
+        return;
+      }
+    }
+    if (dirHandleRef.current && dirPermissionRef.current === 'granted') {
+      await runFullWorkspaceSync(dirHandleRef.current);
+      return;
+    }
+    setShowSyncModal(true);
+  }, [runFullWorkspaceSync]);
+
+  const handlePickLocalFolder = useCallback(async () => {
+    try {
       const picked = await pickSyncDirectory();
       if (!picked) return;
-      setDirHandle(picked);
-      setDirPermission('granted');
-      setSyncStatus(`Syncing ${picked.name}…`);
-      const synced = await syncWorkspaceWithFolder(picked, notes, directory);
-      setNotes(synced.notes);
-      setDirectory(synced.directory);
-      const isEditingDraft = draftBaselineRef.current?.id === activeNoteId;
-      if (
-        !isEditingDraft &&
-        synced.notes.length > 0 &&
-        !synced.notes.some((n) => n.id === activeNoteId)
-      ) {
-        setActiveNoteId(synced.notes[0].id);
+      // Disable Google Drive mode if switching to a local folder
+      if (gdriveConfigRef.current.enabled) {
+        const disabledGdrive = { ...gdriveConfigRef.current, enabled: false };
+        saveGoogleDriveConfig(disabledGdrive);
+        setGdriveConfig(disabledGdrive);
+        gdriveConfigRef.current = disabledGdrive;
       }
-      setSyncStatus(`Synced: ${picked.name}`);
+      setDirHandle(picked);
+      dirHandleRef.current = picked;
+      setDirPermission('granted');
+      dirPermissionRef.current = 'granted';
+      await runFullWorkspaceSync(picked);
     } catch {
       // User cancelled picker
     }
+  }, [runFullWorkspaceSync]);
+
+  const handleDisconnectLocalFolder = useCallback(async () => {
+    await idbSet('syncDirHandle', null);
+    setDirHandle(null);
+    dirHandleRef.current = null;
+    setDirPermission('denied');
+    dirPermissionRef.current = 'denied';
+    setSyncStatus('IndexedDB Local');
+  }, []);
+
+  const handleConnectGoogleDrive = useCallback(
+    async (nextConfig: GoogleDriveConfig, duplicateFolderIds?: string[]) => {
+      setGdriveConfig(nextConfig);
+      gdriveConfigRef.current = nextConfig;
+      const gdriveHandle = new GoogleDriveDirectoryHandle({
+        name: nextConfig.folderName || 'Strata',
+        primaryFolderId: nextConfig.folderId,
+        duplicateFolderIds,
+        accessTokenGetter: () => gdriveConfigRef.current.accessToken,
+      });
+      setDirHandle(gdriveHandle);
+      dirHandleRef.current = gdriveHandle;
+      setDirPermission('granted');
+      dirPermissionRef.current = 'granted';
+      await runFullWorkspaceSync(gdriveHandle);
+    },
+    [runFullWorkspaceSync]
+  );
+
+  const handleDisconnectGoogleDrive = useCallback(() => {
+    const nextConfig: GoogleDriveConfig = {
+      ...gdriveConfigRef.current,
+      enabled: false,
+      accessToken: '',
+      tokenExpiresAt: 0,
+    };
+    saveGoogleDriveConfig(nextConfig);
+    setGdriveConfig(nextConfig);
+    gdriveConfigRef.current = nextConfig;
+    setDirHandle(null);
+    dirHandleRef.current = null;
+    setDirPermission('denied');
+    dirPermissionRef.current = 'denied';
+    setSyncStatus('IndexedDB Local');
+  }, []);
+
+  const handleConnectOrSyncFolder = async () => {
+    if (dirHandle && dirPermission === 'prompt') {
+      await handleTriggerSyncNow();
+      return;
+    }
+    setShowSyncModal(true);
   };
 
   const handleResetCleanWorkspace = () => {
@@ -2134,21 +2508,74 @@ export function App() {
             </div>
           </div>
 
-          {/* Storage & OneDrive Folder Sync Footer */}
+          {/* Storage, Google Drive & Folder Sync Footer */}
           <div className="sidebar-footer">
             <div className="sync-banner">
-              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                {syncStatus}
-              </span>
               <button
                 type="button"
-                className="btn btn-xs btn-soft"
-                onClick={handleConnectOrSyncFolder}
-                title="Connect or sync a local / OneDrive folder of plain Markdown (.md) notes"
+                onClick={() => setShowSyncModal(true)}
+                title="Open Multi-Device & Google Drive Sync settings"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  minWidth: 0,
+                  flex: 1,
+                  border: 'none',
+                  background: 'transparent',
+                  padding: 0,
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                  color: 'inherit',
+                }}
               >
-                <FolderSync size={12} />
-                {dirHandle && dirPermission === 'granted' ? 'Sync' : 'Folder'}
+                <span
+                  style={{
+                    width: 7,
+                    height: 7,
+                    borderRadius: '50%',
+                    flexShrink: 0,
+                    background:
+                      dirHandle && dirPermission === 'granted'
+                        ? 'hsl(154, 72%, 40%)'
+                        : 'var(--text-muted)',
+                  }}
+                />
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {syncStatus}
+                </span>
               </button>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+                {dirHandle && (
+                  <button
+                    type="button"
+                    className="btn btn-xs btn-ghost"
+                    disabled={isSyncing}
+                    onClick={() => void handleTriggerSyncNow()}
+                    title="Sync Now with connected folder / Google Drive"
+                    aria-label="Sync Now"
+                  >
+                    <RefreshCw size={12} className={isSyncing ? 'ai-spin' : ''} />
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-xs btn-soft"
+                  onClick={() => {
+                    if (isMobile) setSidebarOpen(false);
+                    setShowSyncModal(true);
+                  }}
+                  title="Configure Multi-Device & Google Drive Sync"
+                >
+                  {dirHandle?.providerKind === 'gdrive' ? (
+                    <Cloud size={12} />
+                  ) : (
+                    <FolderSync size={12} />
+                  )}
+                  {dirHandle && dirPermission === 'granted' ? 'Sync' : 'Connect'}
+                </button>
+              </div>
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 4 }}>
@@ -2246,6 +2673,24 @@ export function App() {
                     <FilePlus2 size={16} />
                   </button>
                 )}
+
+                <button
+                  type="button"
+                  className={`btn btn-icon ${
+                    dirHandle && dirPermission === 'granted' ? 'btn-soft' : 'btn-ghost'
+                  }`}
+                  onClick={() => setShowSyncModal(true)}
+                  title={syncStatus}
+                  aria-label="Multi-Device & Google Drive Sync"
+                >
+                  {isSyncing ? (
+                    <RefreshCw size={15} className="ai-spin" />
+                  ) : dirHandle?.providerKind === 'gdrive' ? (
+                    <Cloud size={16} />
+                  ) : (
+                    <FolderSync size={16} />
+                  )}
+                </button>
 
                 <button
                   type="button"
@@ -2378,6 +2823,26 @@ export function App() {
                       {aiConfig.provider === 'local' ? 'AI: Local' : `AI: ${aiConfig.provider.toUpperCase()}`}
                     </>
                   )}
+                </button>
+
+                <button
+                  type="button"
+                  className={`btn btn-xs ${
+                    dirHandle && dirPermission === 'granted' ? 'btn-soft' : 'btn-ghost'
+                  }`}
+                  onClick={() => setShowSyncModal(true)}
+                  title={`${syncStatus} — Click for Multi-Device & Google Drive Sync`}
+                >
+                  {isSyncing ? (
+                    <RefreshCw size={12} className="ai-spin" />
+                  ) : dirHandle?.providerKind === 'gdrive' ? (
+                    <Cloud size={13} />
+                  ) : (
+                    <FolderSync size={13} />
+                  )}
+                  <span>
+                    {dirHandle && dirPermission === 'granted' ? dirHandle.name : 'Sync'}
+                  </span>
                 </button>
 
                 <button
@@ -2817,7 +3282,7 @@ export function App() {
           directory={directory}
           allLabels={allWorkspaceLabels}
           aiConfig={aiConfig}
-          suspendEscape={showCommandPalette || showAiStructure || showAiSettings}
+          suspendEscape={showCommandPalette || showAiStructure || showAiSettings || showSyncModal}
           onBack={popOverlay}
           onClose={closeOverlay}
           onPushEntry={pushOverlay}
@@ -2890,6 +3355,24 @@ export function App() {
       )}
 
       {/* Modals */}
+      {showSyncModal && (
+        <SyncModal
+          dirHandle={dirHandle}
+          dirPermission={dirPermission}
+          gdriveConfig={gdriveConfig}
+          syncStatus={syncStatus}
+          isSyncing={isSyncing}
+          lastSyncedAt={lastSyncedAt}
+          noteCount={notes.length}
+          onClose={() => setShowSyncModal(false)}
+          onTriggerSyncNow={handleTriggerSyncNow}
+          onPickLocalFolder={handlePickLocalFolder}
+          onDisconnectLocalFolder={handleDisconnectLocalFolder}
+          onConnectGoogleDrive={handleConnectGoogleDrive}
+          onDisconnectGoogleDrive={handleDisconnectGoogleDrive}
+        />
+      )}
+
       {showAiStructure && (
         <AiStructureModal
           note={activeNote}
