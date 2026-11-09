@@ -223,6 +223,14 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
   return out.join('');
 }
 
+const MAX_LIST_INDENT = 6;
+
+function getIndentLevelFromWhitespace(rawIndent?: string | null): number {
+  if (!rawIndent) return 0;
+  const spaces = rawIndent.replace(/\t/g, '  ').length;
+  return Math.min(MAX_LIST_INDENT, Math.ceil(spaces / 2));
+}
+
 function renderBlockInlineHtml(text: string, knownPeople: Person[]): string {
   const html = inlineMarkdownToHtml(text, knownPeople);
   if (!html) return '';
@@ -241,13 +249,17 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
   const htmlBlocks: string[] = [];
   let i = 0;
 
+  const isHorizontalRule = (line: string) =>
+    /^\s*(?:---+|\*\*\*+|___+)\s*$/.test(line);
+
   const isBulletLine = (line: string) =>
-    /^\s*[-*+•]\s+(.*)$/.test(line) &&
+    !isHorizontalRule(line) &&
+    /^[ \t]*[-*+•](?:\s+(.*)|\s*)$/.test(line) &&
     !matchDecisionLine(line) &&
     !matchTaskLine(line);
 
   const isOrderedLine = (line: string) =>
-    /^\s*\d+[.)]\s+(.*)$/.test(line) &&
+    /^[ \t]*\d+[.)](?:\s+(.*)|\s*)$/.test(line) &&
     !matchDecisionLine(line) &&
     !matchTaskLine(line);
 
@@ -273,8 +285,12 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     const decMatch = matchDecisionLine(line);
     if (decMatch) {
       const status = decMatch.status;
+      const indent = getIndentLevelFromWhitespace(decMatch.indent);
+      const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
       const inner = renderBlockInlineHtml(decMatch.text || '', knownPeople);
-      htmlBlocks.push(`<p class="doc-decision" data-status="${status}">${inner || '<br>'}</p>`);
+      htmlBlocks.push(
+        `<p class="doc-decision" data-status="${status}"${indentAttr}>${inner || '<br>'}</p>`
+      );
 
       if (i + 1 < lines.length) {
         const ratText = matchRationaleLine(lines[i + 1]);
@@ -293,8 +309,12 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     const taskMatch = matchTaskLine(line);
     if (taskMatch) {
       const status = taskMatch.status;
+      const indent = getIndentLevelFromWhitespace(taskMatch.indent);
+      const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
       const inner = renderBlockInlineHtml(taskMatch.text || '', knownPeople);
-      htmlBlocks.push(`<p class="doc-task" data-status="${status}">${inner || '<br>'}</p>`);
+      htmlBlocks.push(
+        `<p class="doc-task" data-status="${status}"${indentAttr}>${inner || '<br>'}</p>`
+      );
       i++;
       continue;
     }
@@ -303,9 +323,11 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     if (isBulletLine(line)) {
       const items: string[] = [];
       while (i < lines.length && isBulletLine(lines[i])) {
-        const m = lines[i].match(/^\s*[-*+•]\s+(.*)$/);
-        const itemHtml = renderBlockInlineHtml(m ? m[1] : '', knownPeople);
-        items.push(`<li>${itemHtml || '<br>'}</li>`);
+        const m = lines[i].match(/^([ \t]*)[-*+•](?:\s+(.*)|\s*)$/);
+        const indent = m ? getIndentLevelFromWhitespace(m[1]) : 0;
+        const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
+        const itemHtml = renderBlockInlineHtml(m && m[2] ? m[2] : '', knownPeople);
+        items.push(`<li${indentAttr}>${itemHtml || '<br>'}</li>`);
         i++;
       }
       htmlBlocks.push(`<ul>${items.join('')}</ul>`);
@@ -316,9 +338,11 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     if (isOrderedLine(line)) {
       const items: string[] = [];
       while (i < lines.length && isOrderedLine(lines[i])) {
-        const m = lines[i].match(/^\s*\d+[.)]\s+(.*)$/);
-        const itemHtml = renderBlockInlineHtml(m ? m[1] : '', knownPeople);
-        items.push(`<li>${itemHtml || '<br>'}</li>`);
+        const m = lines[i].match(/^([ \t]*)\d+[.)](?:\s+(.*)|\s*)$/);
+        const indent = m ? getIndentLevelFromWhitespace(m[1]) : 0;
+        const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
+        const itemHtml = renderBlockInlineHtml(m && m[2] ? m[2] : '', knownPeople);
+        items.push(`<li${indentAttr}>${itemHtml || '<br>'}</li>`);
         i++;
       }
       htmlBlocks.push(`<ol>${items.join('')}</ol>`);
@@ -512,16 +536,75 @@ function hasNestedBlockElements(el: HTMLElement): boolean {
 export function domToMarkdown(root: HTMLElement): string {
   const lines: string[] = [];
 
-  const serializeListItemOrParagraph = (raw: string, listPrefix?: string): string => {
+  const serializeListItemOrParagraph = (
+    raw: string,
+    listPrefix?: string,
+    indentPrefix = ''
+  ): string => {
     const dec = matchDecisionLine(raw);
     if (dec && dec.text) {
-      return `- [D:${dec.status}] ${dec.text}`;
+      return `${indentPrefix || dec.indent}- [D:${dec.status}] ${dec.text}`;
     }
     const task = matchTaskLine(raw);
     if (task && task.text) {
-      return `- [${task.statusChar}] ${task.text}`;
+      return `${indentPrefix || task.indent}- [${task.statusChar}] ${task.text}`;
     }
-    return listPrefix ? `${listPrefix}${raw}` : raw;
+    return listPrefix ? `${listPrefix}${raw}` : `${indentPrefix}${raw}`;
+  };
+
+  const serializeListElement = (listEl: HTMLElement, baseDepth: number) => {
+    const isOrdered = listEl.tagName.toUpperCase() === 'OL';
+    const numByDepth: Record<number, number> = {};
+
+    Array.from(listEl.children).forEach((child) => {
+      const childEl = child as HTMLElement;
+      const childTag = childEl.tagName.toUpperCase();
+      if (childTag === 'UL' || childTag === 'OL') {
+        serializeListElement(childEl, baseDepth + 1);
+        return;
+      }
+      if (childTag !== 'LI') return;
+
+      const attrIndent = parseInt(childEl.getAttribute('data-indent') || '0', 10);
+      const depth = Math.min(
+        MAX_LIST_INDENT,
+        baseDepth + (Number.isFinite(attrIndent) && attrIndent > 0 ? attrIndent : 0)
+      );
+      const indentPrefix = '  '.repeat(depth);
+
+      const nestedLists: HTMLElement[] = [];
+      let inlineText = '';
+      childEl.childNodes.forEach((n) => {
+        if (n.nodeType === Node.ELEMENT_NODE) {
+          const t = (n as HTMLElement).tagName.toUpperCase();
+          if (t === 'UL' || t === 'OL') {
+            nestedLists.push(n as HTMLElement);
+            return;
+          }
+        }
+        inlineText += serializeInlineNode(n);
+      });
+
+      if (inlineText || nestedLists.length === 0) {
+        if (isOrdered) {
+          numByDepth[depth] = (numByDepth[depth] || 0) + 1;
+          Object.keys(numByDepth).forEach((k) => {
+            if (Number(k) > depth) delete numByDepth[Number(k)];
+          });
+          lines.push(
+            serializeListItemOrParagraph(
+              inlineText,
+              `${indentPrefix}${numByDepth[depth]}. `,
+              indentPrefix
+            )
+          );
+        } else {
+          lines.push(serializeListItemOrParagraph(inlineText, `${indentPrefix}- `, indentPrefix));
+        }
+      }
+
+      nestedLists.forEach((nl) => serializeListElement(nl, depth + 1));
+    });
   };
 
   const walkContainer = (container: HTMLElement) => {
@@ -564,22 +647,8 @@ export function domToMarkdown(root: HTMLElement): string {
         return;
       }
 
-      if (tag === 'UL') {
-        Array.from(el.children).forEach((child) => {
-          if (child.tagName.toUpperCase() === 'LI') {
-            lines.push(serializeListItemOrParagraph(serializeInlineChildren(child), '- '));
-          }
-        });
-        return;
-      }
-
-      if (tag === 'OL') {
-        let num = 1;
-        Array.from(el.children).forEach((child) => {
-          if (child.tagName.toUpperCase() === 'LI') {
-            lines.push(serializeListItemOrParagraph(serializeInlineChildren(child), `${num++}. `));
-          }
-        });
+      if (tag === 'UL' || tag === 'OL') {
+        serializeListElement(el, 0);
         return;
       }
 
@@ -617,17 +686,31 @@ export function domToMarkdown(root: HTMLElement): string {
       if (el.classList.contains('doc-task')) {
         const status = el.getAttribute('data-status') || 'todo';
         const char = TASK_TO_STATUS_CHAR[status] || ' ';
+        const attrIndent = parseInt(el.getAttribute('data-indent') || '0', 10);
+        const indentPrefix =
+          Number.isFinite(attrIndent) && attrIndent > 0
+            ? '  '.repeat(Math.min(MAX_LIST_INDENT, attrIndent))
+            : '';
         const inner = serializeInlineChildren(el);
         const stripped = matchTaskLine(inner);
-        lines.push(`- [${char}] ${stripped && stripped.text ? stripped.text : inner}`);
+        lines.push(
+          `${indentPrefix}- [${char}] ${stripped && stripped.text ? stripped.text : inner}`
+        );
         return;
       }
 
       if (el.classList.contains('doc-decision')) {
         const status = normalizeDecisionStatus(el.getAttribute('data-status'));
+        const attrIndent = parseInt(el.getAttribute('data-indent') || '0', 10);
+        const indentPrefix =
+          Number.isFinite(attrIndent) && attrIndent > 0
+            ? '  '.repeat(Math.min(MAX_LIST_INDENT, attrIndent))
+            : '';
         const inner = serializeInlineChildren(el);
         const stripped = matchDecisionLine(inner);
-        lines.push(`- [D:${status}] ${stripped && stripped.text ? stripped.text : inner}`);
+        lines.push(
+          `${indentPrefix}- [D:${status}] ${stripped && stripped.text ? stripped.text : inner}`
+        );
         return;
       }
 
@@ -748,15 +831,21 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
     outBlocks.push(buildImageBlockHtml({ src: rawSrc, alt, width }));
   };
 
-  const tryBuildSpecialBlockFromElement = (el: HTMLElement): string | null => {
+  const tryBuildSpecialBlockFromElement = (el: HTMLElement, extraIndent = 0): string | null => {
     const rawText = (el.textContent || '').replace(/\u00A0/g, ' ').trim();
     const checkbox = el.querySelector('input[type="checkbox"]') as HTMLInputElement | null;
+    const attrIndent = parseInt(el.getAttribute('data-indent') || '0', 10);
+    const totalIndent = Math.min(
+      MAX_LIST_INDENT,
+      extraIndent + (Number.isFinite(attrIndent) && attrIndent > 0 ? attrIndent : 0)
+    );
+    const indentAttr = totalIndent > 0 ? ` data-indent="${totalIndent}"` : '';
 
     const decMatch = matchDecisionLine(rawText);
     if (decMatch) {
       const strippedClone = stripLeadingMarkerFromClone(el, 'decision');
       const inner = cleanInline(strippedClone).trim();
-      return `<p class="doc-decision" data-status="${escAttr(decMatch.status)}">${inner || '<br>'}</p>`;
+      return `<p class="doc-decision" data-status="${escAttr(decMatch.status)}"${indentAttr}>${inner || '<br>'}</p>`;
     }
 
     const taskMatch = matchTaskLine(rawText);
@@ -768,7 +857,7 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
         : 'todo';
       const strippedClone = stripLeadingMarkerFromClone(el, 'task');
       const inner = cleanInline(strippedClone).trim();
-      return `<p class="doc-task" data-status="${escAttr(status)}">${inner || '<br>'}</p>`;
+      return `<p class="doc-task" data-status="${escAttr(status)}"${indentAttr}>${inner || '<br>'}</p>`;
     }
 
     const prevBlock = outBlocks[outBlocks.length - 1] || '';
@@ -784,7 +873,7 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
     return null;
   };
 
-  const cleanBlocks = (container: Node) => {
+  const cleanBlocks = (container: Node, listDepth = 0) => {
     container.childNodes.forEach((node) => {
       if (node.nodeType === Node.TEXT_NODE) {
         const txt = (node.nodeValue || '').trim();
@@ -852,39 +941,51 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
           }
         };
 
-        Array.from(el.children).forEach((child) => {
-          if (child.tagName.toUpperCase() !== 'LI') return;
-          const li = child as HTMLElement;
-
-          // Extract any nested <ul>/<ol> inside <li> so we can process the <li>'s own line and nested lists cleanly
-          const nestedLists = Array.from(li.children).filter((c) => {
-            const t = c.tagName.toUpperCase();
-            return t === 'UL' || t === 'OL';
-          });
-
-          const ownLiClone = li.cloneNode(true) as HTMLElement;
-          Array.from(ownLiClone.children).forEach((c) => {
-            const t = c.tagName.toUpperCase();
-            if (t === 'UL' || t === 'OL') c.remove();
-          });
-
-          const specialBlock = tryBuildSpecialBlockFromElement(ownLiClone);
-          if (specialBlock) {
-            flushListItems();
-            outBlocks.push(specialBlock);
-          } else {
-            const inlineHtml = cleanInline(ownLiClone).trim();
-            if (inlineHtml || nestedLists.length === 0) {
-              items.push(`<li>${inlineHtml || '<br>'}</li>`);
+        const collectListChildren = (listNode: HTMLElement, depth: number) => {
+          Array.from(listNode.children).forEach((child) => {
+            const childEl = child as HTMLElement;
+            const childTag = childEl.tagName.toUpperCase();
+            if (childTag === 'UL' || childTag === 'OL') {
+              collectListChildren(childEl, depth + 1);
+              return;
             }
-          }
+            if (childTag !== 'LI') return;
+            const li = childEl;
+            const attrIndent = parseInt(li.getAttribute('data-indent') || '0', 10);
+            const itemDepth = Math.min(
+              MAX_LIST_INDENT,
+              depth + (Number.isFinite(attrIndent) && attrIndent > 0 ? attrIndent : 0)
+            );
+            const indentAttr = itemDepth > 0 ? ` data-indent="${itemDepth}"` : '';
 
-          if (nestedLists.length > 0) {
-            flushListItems();
-            nestedLists.forEach((nl) => cleanBlocks(nl));
-          }
-        });
+            // Extract any nested <ul>/<ol> inside <li> so we can process the <li>'s own line and nested lists cleanly
+            const nestedLists = Array.from(li.children).filter((c) => {
+              const t = c.tagName.toUpperCase();
+              return t === 'UL' || t === 'OL';
+            }) as HTMLElement[];
 
+            const ownLiClone = li.cloneNode(true) as HTMLElement;
+            Array.from(ownLiClone.children).forEach((c) => {
+              const t = c.tagName.toUpperCase();
+              if (t === 'UL' || t === 'OL') c.remove();
+            });
+
+            const specialBlock = tryBuildSpecialBlockFromElement(ownLiClone, depth);
+            if (specialBlock) {
+              flushListItems();
+              outBlocks.push(specialBlock);
+            } else {
+              const inlineHtml = cleanInline(ownLiClone).trim();
+              if (inlineHtml || nestedLists.length === 0) {
+                items.push(`<li${indentAttr}>${inlineHtml || '<br>'}</li>`);
+              }
+            }
+
+            nestedLists.forEach((nl) => collectListChildren(nl, itemDepth + 1));
+          });
+        };
+
+        collectListChildren(el, listDepth);
         flushListItems();
         return;
       }
@@ -913,23 +1014,33 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
 
       if (el.classList.contains('doc-task')) {
         const st = escAttr(el.getAttribute('data-status') || 'todo');
+        const attrIndent = parseInt(el.getAttribute('data-indent') || '0', 10);
+        const indentAttr =
+          Number.isFinite(attrIndent) && attrIndent > 0
+            ? ` data-indent="${Math.min(MAX_LIST_INDENT, attrIndent)}"`
+            : '';
         const stripped = stripLeadingMarkerFromClone(el, 'task');
-        outBlocks.push(`<p class="doc-task" data-status="${st}">${cleanInline(stripped) || '<br>'}</p>`);
+        outBlocks.push(`<p class="doc-task" data-status="${st}"${indentAttr}>${cleanInline(stripped) || '<br>'}</p>`);
         return;
       }
 
       if (el.classList.contains('doc-decision')) {
         const st = escAttr(normalizeDecisionStatus(el.getAttribute('data-status')));
+        const attrIndent = parseInt(el.getAttribute('data-indent') || '0', 10);
+        const indentAttr =
+          Number.isFinite(attrIndent) && attrIndent > 0
+            ? ` data-indent="${Math.min(MAX_LIST_INDENT, attrIndent)}"`
+            : '';
         const stripped = stripLeadingMarkerFromClone(el, 'decision');
-        outBlocks.push(`<p class="doc-decision" data-status="${st}">${cleanInline(stripped) || '<br>'}</p>`);
+        outBlocks.push(`<p class="doc-decision" data-status="${st}"${indentAttr}>${cleanInline(stripped) || '<br>'}</p>`);
         return;
       }
 
       if (tag === 'P' || tag === 'DIV' || tag === 'LI') {
         if (hasNestedBlockElements(el)) {
-          cleanBlocks(el);
+          cleanBlocks(el, listDepth);
         } else {
-          const specialBlock = tryBuildSpecialBlockFromElement(el);
+          const specialBlock = tryBuildSpecialBlockFromElement(el, listDepth);
           if (specialBlock) {
             outBlocks.push(specialBlock);
           } else {
@@ -943,7 +1054,7 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
         return;
       }
 
-      const specialFallback = tryBuildSpecialBlockFromElement(el);
+      const specialFallback = tryBuildSpecialBlockFromElement(el, listDepth);
       if (specialFallback) {
         outBlocks.push(specialFallback);
       } else {

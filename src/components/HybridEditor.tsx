@@ -123,22 +123,53 @@ type ActiveFormatState = {
 
 const TASK_CYCLE: TaskStatus[] = ['todo', 'doing', 'waiting', 'done'];
 const DECISION_CYCLE: DecisionStatus[] = ['agreed', 'proposed', 'superseded'];
+const MAX_LIST_INDENT = 6;
+
+function getBlockIndent(el: HTMLElement): number {
+  const raw = parseInt(el.getAttribute('data-indent') || '0', 10);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(MAX_LIST_INDENT, raw) : 0;
+}
+
+function setBlockIndent(el: HTMLElement, nextIndent: number): void {
+  const clamped = Math.max(0, Math.min(MAX_LIST_INDENT, nextIndent));
+  if (clamped <= 0) {
+    el.removeAttribute('data-indent');
+  } else {
+    el.setAttribute('data-indent', String(clamped));
+  }
+}
+
+function isIndentableBlock(el: HTMLElement): boolean {
+  const tag = el.tagName.toUpperCase();
+  return (
+    tag === 'LI' ||
+    el.classList.contains('doc-task') ||
+    el.classList.contains('doc-decision')
+  );
+}
 
 function getOrderedDocBlocks(root: HTMLElement): HTMLElement[] {
   const blocks: HTMLElement[] = [];
-  Array.from(root.children).forEach((child) => {
-    const el = child as HTMLElement;
-    const tag = el.tagName.toUpperCase();
-    if (tag === 'UL' || tag === 'OL') {
-      Array.from(el.children).forEach((li) => {
-        if (li.tagName.toUpperCase() === 'LI') {
-          blocks.push(li as HTMLElement);
-        }
-      });
-    } else {
-      blocks.push(el);
-    }
-  });
+  const collect = (container: HTMLElement) => {
+    Array.from(container.children).forEach((child) => {
+      const el = child as HTMLElement;
+      const tag = el.tagName.toUpperCase();
+      if (tag === 'UL' || tag === 'OL') {
+        collect(el);
+      } else if (tag === 'LI') {
+        blocks.push(el);
+        Array.from(el.children).forEach((sub) => {
+          const subTag = sub.tagName.toUpperCase();
+          if (subTag === 'UL' || subTag === 'OL') {
+            collect(sub as HTMLElement);
+          }
+        });
+      } else {
+        blocks.push(el);
+      }
+    });
+  };
+  collect(root);
   return blocks;
 }
 
@@ -611,22 +642,13 @@ function getSelectedEditableBlocks(root: HTMLElement): HTMLElement[] {
     return single ? [single] : [];
   }
 
-  const candidates: HTMLElement[] = [];
-  Array.from(root.children).forEach((child) => {
-    const el = child as HTMLElement;
+  return getOrderedDocBlocks(root).filter((el) => {
     const tag = el.tagName.toUpperCase();
     if (tag === 'FIGURE' || tag === 'HR' || el.classList.contains('doc-image-block')) {
-      return;
+      return false;
     }
-    if (tag === 'UL' || tag === 'OL') {
-      Array.from(el.children).forEach((li) => {
-        if (range.intersectsNode(li)) candidates.push(li as HTMLElement);
-      });
-    } else if (range.intersectsNode(el)) {
-      candidates.push(el);
-    }
+    return range.intersectsNode(el);
   });
-  return candidates;
 }
 
 export const HybridEditor: React.FC<HybridEditorProps> = ({
@@ -1735,6 +1757,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           blk.removeAttribute('data-status');
         });
         document.execCommand(targetStyle === 'ul' ? 'insertUnorderedList' : 'insertOrderedList');
+        root
+          .querySelectorAll('p[data-indent]:not(.doc-task):not(.doc-decision), div[data-indent]')
+          .forEach((el) => el.removeAttribute('data-indent'));
         emitMarkdownFromDom({
           label: targetStyle === 'ul' ? 'Bullet list' : 'Numbered list',
           coalesceKey: null,
@@ -1768,6 +1793,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
       blocks.forEach((blk) => {
         const inner = blk.innerHTML || '<br>';
+        const existingIndent = getBlockIndent(blk);
         let nextEl: HTMLElement;
 
         if (allAlreadySame && targetStyle !== 'p') {
@@ -1776,10 +1802,12 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           nextEl = document.createElement('p');
           nextEl.className = 'doc-task';
           nextEl.setAttribute('data-status', 'todo');
+          if (existingIndent > 0) setBlockIndent(nextEl, existingIndent);
         } else if (targetStyle === 'decision' || targetStyle === 'proposed') {
           nextEl = document.createElement('p');
           nextEl.className = 'doc-decision';
           nextEl.setAttribute('data-status', targetStyle === 'proposed' ? 'proposed' : 'agreed');
+          if (existingIndent > 0) setBlockIndent(nextEl, existingIndent);
         } else if (targetStyle === 'blockquote') {
           nextEl = document.createElement('blockquote');
           if (blk.previousElementSibling?.classList.contains('doc-decision')) {
@@ -1986,6 +2014,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     // Inside a fresh <li> (e.g. user typed "- " which became <li>, then typed "[ ] ", "- [ ] ", "[D] ", or "- [D:proposed] ")
     if (tag === 'LI') {
+      const existingIndent = getBlockIndent(blk);
       const liTaskMatch = prefix.match(/^\s*(?:[-*+•]\s*)*\[([ /?xX])?\]\s$/);
       if (liTaskMatch) {
         const ch = (liTaskMatch[1] || ' ').toLowerCase();
@@ -1994,6 +2023,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           const p = document.createElement('p');
           p.className = 'doc-task';
           p.setAttribute('data-status', st);
+          if (existingIndent > 0) setBlockIndent(p, existingIndent);
           return p;
         });
       }
@@ -2004,6 +2034,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           const p = document.createElement('p');
           p.className = 'doc-decision';
           p.setAttribute('data-status', st);
+          if (existingIndent > 0) setBlockIndent(p, existingIndent);
           return p;
         });
       }
@@ -2031,29 +2062,39 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       });
     }
     if (/^\s*(?:[-*+•]\s*)*\[([ /?xX])?\]\s$/.test(prefix)) {
-      const m = prefix.match(/\[([ /?xX])?\]/);
-      const ch = (m?.[1] || ' ').toLowerCase();
+      const m = prefix.match(/^([ \t]*)(?:[-*+•]\s*)*\[([ /?xX])?\]/);
+      const indentSpaces = (m?.[1] || '').replace(/\t/g, '  ').length;
+      const indentLvl = Math.min(MAX_LIST_INDENT, Math.ceil(indentSpaces / 2));
+      const ch = (m?.[2] || ' ').toLowerCase();
       const st: TaskStatus = ch === 'x' ? 'done' : ch === '/' ? 'doing' : ch === '?' ? 'waiting' : 'todo';
       return stripPrefixAndConvert(() => {
         const p = document.createElement('p');
         p.className = 'doc-task';
         p.setAttribute('data-status', st);
+        if (indentLvl > 0) setBlockIndent(p, indentLvl);
         return p;
       });
     }
     if (/^\s*(?:[-*+•]\s*)*\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\]\s$/i.test(prefix)) {
-      const m = prefix.match(/\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\]/i);
-      const st = normalizeDecisionStatus(m?.[1]);
+      const m = prefix.match(/^([ \t]*)(?:[-*+•]\s*)*\[D(?::([a-zA-ZäöüÄÖÜß_-]+))?\]/i);
+      const indentSpaces = (m?.[1] || '').replace(/\t/g, '  ').length;
+      const indentLvl = Math.min(MAX_LIST_INDENT, Math.ceil(indentSpaces / 2));
+      const st = normalizeDecisionStatus(m?.[2]);
       return stripPrefixAndConvert(() => {
         const p = document.createElement('p');
         p.className = 'doc-decision';
         p.setAttribute('data-status', st);
+        if (indentLvl > 0) setBlockIndent(p, indentLvl);
         return p;
       });
     }
-    if (prefix === '- ' || prefix === '* ') {
+    const bulletPrefixMatch = prefix.match(/^([ \t]*)[-*]\s$/);
+    if (bulletPrefixMatch) {
+      const indentSpaces = bulletPrefixMatch[1].replace(/\t/g, '  ').length;
+      const indentLvl = Math.min(MAX_LIST_INDENT, Math.ceil(indentSpaces / 2));
       probe.deleteContents();
       const li = document.createElement('li');
+      if (indentLvl > 0) setBlockIndent(li, indentLvl);
       li.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
       const prev = blk.previousElementSibling;
       if (prev && prev.tagName.toUpperCase() === 'UL') {
@@ -2069,9 +2110,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       refreshSelectionToolbarState();
       return true;
     }
-    if (prefix === '1. ') {
+    const orderedPrefixMatch = prefix.match(/^([ \t]*)1\.\s$/);
+    if (orderedPrefixMatch) {
+      const indentSpaces = orderedPrefixMatch[1].replace(/\t/g, '  ').length;
+      const indentLvl = Math.min(MAX_LIST_INDENT, Math.ceil(indentSpaces / 2));
       probe.deleteContents();
       const li = document.createElement('li');
+      if (indentLvl > 0) setBlockIndent(li, indentLvl);
       li.innerHTML = blk.innerHTML.trim() ? blk.innerHTML : '<br>';
       const prev = blk.previousElementSibling;
       if (prev && prev.tagName.toUpperCase() === 'OL') {
@@ -2445,62 +2490,146 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   };
 
   const handleDocKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const root = docRef.current;
+    const sel = window.getSelection();
+
     if (autocomplete && autocompleteItems.length > 0) {
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setAcIndex((i) => (i < 0 ? 0 : (i + 1) % autocompleteItems.length));
-        return;
-      }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setAcIndex((i) => (i <= 0 ? autocompleteItems.length - 1 : i - 1));
-        return;
-      }
-      if (e.key === 'Tab') {
-        e.preventDefault();
-        applyAutocompleteItem(autocompleteItems[acIndex >= 0 ? acIndex : 0]);
-        return;
-      }
-      if (e.key === 'Enter') {
-        if (acIndex >= 0 && autocompleteItems[acIndex]) {
+      const isAutocompleteAtCaret =
+        !autocomplete.textNode ||
+        Boolean(
+          sel &&
+            sel.isCollapsed &&
+            sel.anchorNode === autocomplete.textNode &&
+            sel.anchorOffset === autocomplete.cursorPos
+        );
+
+      if (!isAutocompleteAtCaret) {
+        setAutocomplete(null);
+      } else {
+        if (e.key === 'ArrowDown') {
           e.preventDefault();
-          applyAutocompleteItem(autocompleteItems[acIndex]);
+          setAcIndex((i) => (i < 0 ? 0 : (i + 1) % autocompleteItems.length));
           return;
         }
-        // User pressed Enter at the end of a line after typing a new @person or #label without selecting '+ Add':
-        // finalize the mention/label token cleanly and allow Enter to create the next line normally!
-        if (
-          autocomplete.textNode &&
-          docRef.current?.contains(autocomplete.textNode) &&
-          autocomplete.query.trim().length >= 1
-        ) {
-          if (autocomplete.kind === 'person' && !/\s/.test(autocomplete.query.trim())) {
-            recordPreEditSelection();
-            const span = createPersonTokenSpan(autocomplete.query.trim());
-            replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
-            emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
-          } else if (autocomplete.kind === 'label') {
-            recordPreEditSelection();
-            const span = createLabelTokenSpan(autocomplete.query.trim());
-            replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
-            emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
-          }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setAcIndex((i) => (i <= 0 ? autocompleteItems.length - 1 : i - 1));
+          return;
         }
-        setAutocomplete(null);
-        setActiveToken(null);
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        setAutocomplete(null);
-        return;
+        if (e.key === 'Tab' && !e.shiftKey) {
+          e.preventDefault();
+          applyAutocompleteItem(autocompleteItems[acIndex >= 0 ? acIndex : 0]);
+          return;
+        }
+        if (e.key === 'Tab' && e.shiftKey) {
+          setAutocomplete(null);
+        }
+        if (e.key === 'Enter') {
+          if (acIndex >= 0 && autocompleteItems[acIndex]) {
+            e.preventDefault();
+            applyAutocompleteItem(autocompleteItems[acIndex]);
+            return;
+          }
+          // User pressed Enter at the end of a line after typing a new @person or #label without selecting '+ Add':
+          // finalize the mention/label token cleanly and allow Enter to create the next line normally!
+          if (
+            autocomplete.textNode &&
+            docRef.current?.contains(autocomplete.textNode) &&
+            autocomplete.query.trim().length >= 1
+          ) {
+            if (autocomplete.kind === 'person' && !/\s/.test(autocomplete.query.trim())) {
+              recordPreEditSelection();
+              const span = createPersonTokenSpan(autocomplete.query.trim());
+              replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
+              emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
+            } else if (autocomplete.kind === 'label') {
+              recordPreEditSelection();
+              const span = createLabelTokenSpan(autocomplete.query.trim());
+              replaceSliceInTextNode(autocomplete.textNode, autocomplete.tokenStart, autocomplete.cursorPos, span, '');
+              emitMarkdownFromDom({ label: 'Mention / tag', coalesceKey: null });
+            }
+          }
+          setAutocomplete(null);
+          setActiveToken(null);
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          setAutocomplete(null);
+          return;
+        }
       }
     }
 
-    const root = docRef.current;
-    const sel = window.getSelection();
     if (!root || !sel || sel.rangeCount === 0) return;
     const range = sel.getRangeAt(0);
     const blk = findEditableBlock(range.startContainer, root);
+
+    // Tab / Shift+Tab indents or outdents bullet lists, numbered lists, tasks, and decisions
+    if (e.key === 'Tab') {
+      e.preventDefault();
+      setAutocomplete(null);
+
+      const selectedBlocks = getSelectedEditableBlocks(root);
+      const targetBlocks = selectedBlocks.length > 0 ? selectedBlocks : blk ? [blk] : [];
+      const indentableBlocks = targetBlocks.filter(isIndentableBlock);
+
+      if (indentableBlocks.length > 0) {
+        recordPreEditSelection();
+        const delta = e.shiftKey ? -1 : 1;
+        indentableBlocks.forEach((b) => {
+          setBlockIndent(b, getBlockIndent(b) + delta);
+        });
+        emitMarkdownFromDom({
+          label: e.shiftKey ? 'Outdent list item' : 'Indent list item',
+          coalesceKey: null,
+        });
+        refreshSelectionToolbarState();
+        return;
+      }
+
+      if (blk) {
+        const prevSibling = blk.previousElementSibling as HTMLElement | null;
+        const isPlainEmpty =
+          (blk.tagName.toUpperCase() === 'P' || blk.tagName.toUpperCase() === 'DIV') &&
+          !blk.classList.contains('doc-task') &&
+          !blk.classList.contains('doc-decision') &&
+          !(blk.textContent || '').trim() &&
+          !blk.querySelector('img');
+
+        if (
+          !e.shiftKey &&
+          isPlainEmpty &&
+          prevSibling &&
+          (prevSibling.tagName.toUpperCase() === 'UL' || prevSibling.tagName.toUpperCase() === 'OL')
+        ) {
+          recordPreEditSelection();
+          const lastLi = prevSibling.lastElementChild as HTMLElement | null;
+          const targetIndent = lastLi ? Math.min(MAX_LIST_INDENT, getBlockIndent(lastLi) + 1) : 1;
+          const li = document.createElement('li');
+          setBlockIndent(li, targetIndent);
+          li.innerHTML = '<br>';
+          prevSibling.appendChild(li);
+          blk.remove();
+          placeCaretAtStart(li);
+          emitMarkdownFromDom({ label: 'Indent list item', coalesceKey: null });
+          refreshSelectionToolbarState();
+          return;
+        }
+      }
+
+      if (!e.shiftKey && range.collapsed) {
+        recordPreEditSelection();
+        const tabText = document.createTextNode('\u00A0\u00A0');
+        range.insertNode(tabText);
+        const nextRange = document.createRange();
+        nextRange.setStart(tabText, tabText.length);
+        nextRange.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(nextRange);
+        emitMarkdownFromDom({ label: 'Indent', coalesceKey: null });
+      }
+      return;
+    }
 
     // Smooth ArrowUp from very top of document into Note Title
     if (
@@ -2515,21 +2644,78 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
-    // Smooth Enter behavior on Tasks, Decisions, Headings, and Blockquotes
+    // Smooth Enter behavior on List Items, Tasks, Decisions, Headings, and Blockquotes
     if (e.key === 'Enter' && !e.shiftKey && range.collapsed && blk) {
       const tag = blk.tagName.toUpperCase();
+      const isLi = tag === 'LI';
       const isTask = blk.classList.contains('doc-task');
       const isDec = blk.classList.contains('doc-decision');
       const isHeading = tag === 'H1' || tag === 'H2' || tag === 'H3';
       const isQuote = tag === 'BLOCKQUOTE';
 
+      if (isLi) {
+        e.preventDefault();
+        recordPreEditSelection();
+        const isEmpty = !(blk.textContent || '').trim() && !blk.querySelector('img');
+        const currentIndent = getBlockIndent(blk);
+
+        if (isEmpty) {
+          if (currentIndent > 0) {
+            setBlockIndent(blk, currentIndent - 1);
+            placeCaretAtStart(blk);
+            emitMarkdownFromDom({ label: 'Outdent list item', coalesceKey: null });
+            refreshSelectionToolbarState();
+            return;
+          }
+          const p = document.createElement('p');
+          p.innerHTML = '<br>';
+          const mounted = replaceBlockElement(blk, p);
+          placeCaretAtStart(mounted);
+          emitMarkdownFromDom({ label: 'Convert to paragraph', coalesceKey: null });
+          refreshSelectionToolbarState();
+          return;
+        }
+
+        const tailRange = document.createRange();
+        tailRange.selectNodeContents(blk);
+        tailRange.setStart(range.startContainer, range.startOffset);
+        const tailFrag = tailRange.extractContents();
+
+        if (!blk.innerHTML.trim()) {
+          blk.innerHTML = '<br>';
+        }
+
+        const nextLi = document.createElement('li');
+        if (currentIndent > 0) {
+          setBlockIndent(nextLi, currentIndent);
+        }
+        nextLi.appendChild(tailFrag);
+        if (!nextLi.innerHTML.trim()) {
+          nextLi.innerHTML = '<br>';
+        }
+
+        blk.after(nextLi);
+        placeCaretAtStart(nextLi);
+        emitMarkdownFromDom({ label: 'New list item', coalesceKey: null });
+        refreshSelectionToolbarState();
+        return;
+      }
+
       if (isTask || isDec || isHeading || isQuote) {
         e.preventDefault();
         recordPreEditSelection();
         const isEmpty = !(blk.textContent || '').trim();
+        const currentIndent = getBlockIndent(blk);
 
-        // Pressing Enter on an empty Task, Decision, or Quote exits back to normal Paragraph
+        // Pressing Enter on an empty indented Task or Decision outdents first; at level 0 exits to Paragraph
         if (isEmpty && (isTask || isDec || isQuote)) {
+          if ((isTask || isDec) && currentIndent > 0) {
+            setBlockIndent(blk, currentIndent - 1);
+            placeCaretAtStart(blk);
+            emitMarkdownFromDom({ label: 'Outdent item', coalesceKey: null });
+            refreshSelectionToolbarState();
+            return;
+          }
           const p = document.createElement('p');
           p.innerHTML = '<br>';
           blk.replaceWith(p);
@@ -2553,6 +2739,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         if (isTask) {
           nextBlock.className = 'doc-task';
           nextBlock.setAttribute('data-status', 'todo');
+          if (currentIndent > 0) {
+            setBlockIndent(nextBlock, currentIndent);
+          }
         }
         nextBlock.appendChild(tailFrag);
         if (!nextBlock.innerHTML.trim()) {
@@ -2567,22 +2756,33 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       }
     }
 
-    // Smooth Backspace at start of Task, Decision, Heading, or Quote converts to normal Paragraph;
+    // Smooth Backspace at start of indented item outdents first; at level 0 converts to normal Paragraph;
     // or removes an immediately preceding image block
     if (e.key === 'Backspace' && range.collapsed && blk && isCaretAtStartOfBlock(blk, range)) {
       const tag = blk.tagName.toUpperCase();
+      const isLi = tag === 'LI';
       const isTask = blk.classList.contains('doc-task');
       const isDec = blk.classList.contains('doc-decision');
       const isHeading = tag === 'H1' || tag === 'H2' || tag === 'H3';
       const isQuote = tag === 'BLOCKQUOTE';
 
-      if (isTask || isDec || isHeading || isQuote) {
+      if (isIndentableBlock(blk) && getBlockIndent(blk) > 0) {
+        e.preventDefault();
+        recordPreEditSelection();
+        setBlockIndent(blk, getBlockIndent(blk) - 1);
+        placeCaretAtStart(blk);
+        emitMarkdownFromDom({ label: 'Outdent list item', coalesceKey: null });
+        refreshSelectionToolbarState();
+        return;
+      }
+
+      if (isLi || isTask || isDec || isHeading || isQuote) {
         e.preventDefault();
         recordPreEditSelection();
         const p = document.createElement('p');
         p.innerHTML = blk.innerHTML || '<br>';
-        blk.replaceWith(p);
-        placeCaretAtStart(p);
+        const mounted = replaceBlockElement(blk, p);
+        placeCaretAtStart(mounted);
         emitMarkdownFromDom({ label: 'Convert to paragraph', coalesceKey: null });
         refreshSelectionToolbarState();
         return;
@@ -3566,7 +3766,98 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             placeholder="Write plain Markdown… Use @[Name], #label, [[Note Title]], - [ ] Task, or - [D:agreed] Decision"
             onFocus={syncRawSelectionBefore}
             onSelect={syncRawSelectionBefore}
-            onKeyDown={syncRawSelectionBefore}
+            onKeyDown={(e) => {
+              syncRawSelectionBefore();
+              if (autocomplete && autocompleteItems.length > 0) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  setAcIndex((i) => (i < 0 ? 0 : (i + 1) % autocompleteItems.length));
+                  return;
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  setAcIndex((i) => (i <= 0 ? autocompleteItems.length - 1 : i - 1));
+                  return;
+                }
+                if ((e.key === 'Tab' && !e.shiftKey) || (e.key === 'Enter' && acIndex >= 0)) {
+                  e.preventDefault();
+                  applyAutocompleteItem(autocompleteItems[acIndex >= 0 ? acIndex : 0]);
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setAutocomplete(null);
+                  return;
+                }
+              }
+
+              if (e.key === 'Tab') {
+                e.preventDefault();
+                setAutocomplete(null);
+                const ta = e.currentTarget;
+                const val = ta.value;
+                const selStart = ta.selectionStart ?? 0;
+                const selEnd = ta.selectionEnd ?? selStart;
+                const lineStart = val.lastIndexOf('\n', Math.max(0, selStart - 1)) + 1;
+                const lineEndIdx = val.indexOf('\n', selEnd);
+                const blockEnd = lineEndIdx === -1 ? val.length : lineEndIdx;
+                const segment = val.slice(lineStart, blockEnd);
+                const rawLines = segment.split('\n');
+
+                if (!e.shiftKey) {
+                  const nextLines = rawLines.map((l) => `  ${l}`);
+                  const nextVal = val.slice(0, lineStart) + nextLines.join('\n') + val.slice(blockEnd);
+                  const nextStart = selStart + 2;
+                  const nextEnd = selEnd + 2 * rawLines.length;
+                  lastEmittedMarkdownRef.current = nextVal;
+                  patchNote(
+                    { body: nextVal },
+                    {
+                      label: 'Indent list item',
+                      coalesceKey: null,
+                      selectionAfter: { kind: 'raw', start: nextStart, end: nextEnd },
+                    }
+                  );
+                  queueMicrotask(() => {
+                    try {
+                      ta.setSelectionRange(nextStart, nextEnd);
+                    } catch {
+                      // Ignore selection range errors
+                    }
+                  });
+                } else {
+                  let removedFirst = 0;
+                  let removedTotal = 0;
+                  const nextLines = rawLines.map((l, idx) => {
+                    const m = l.match(/^(?: {1,2}|\t)/);
+                    const rm = m ? m[0].length : 0;
+                    if (idx === 0) removedFirst = rm;
+                    removedTotal += rm;
+                    return rm > 0 ? l.slice(rm) : l;
+                  });
+                  if (removedTotal === 0) return;
+                  const nextVal = val.slice(0, lineStart) + nextLines.join('\n') + val.slice(blockEnd);
+                  const nextStart = Math.max(lineStart, selStart - removedFirst);
+                  const nextEnd = Math.max(nextStart, selEnd - removedTotal);
+                  lastEmittedMarkdownRef.current = nextVal;
+                  patchNote(
+                    { body: nextVal },
+                    {
+                      label: 'Outdent list item',
+                      coalesceKey: null,
+                      selectionAfter: { kind: 'raw', start: nextStart, end: nextEnd },
+                    }
+                  );
+                  queueMicrotask(() => {
+                    try {
+                      ta.setSelectionRange(nextStart, nextEnd);
+                    } catch {
+                      // Ignore selection range errors
+                    }
+                  });
+                }
+              }
+            }}
             onChange={(e) => {
               const prevLen = noteRef.current.body.length;
               const nextVal = e.target.value;
