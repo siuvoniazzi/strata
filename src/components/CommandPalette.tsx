@@ -49,6 +49,8 @@ interface CommandPaletteProps {
   onOpenReportForLabel: (label: string) => void;
   onOpenPersonNotes: (personName: string) => void;
   onSwitchMainView: (view: 'notes' | 'tasks' | 'decisions' | 'reports' | 'people') => void;
+  onOpenDailyBriefing?: () => void;
+  onOpenDailyReportNote?: () => void;
   onTriggerAiStructure: () => void;
   onToggleTheme: () => void;
   onConnectFolder: () => void;
@@ -86,6 +88,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onOpenReportForLabel,
   onOpenPersonNotes,
   onSwitchMainView,
+  onOpenDailyBriefing,
+  onOpenDailyReportNote,
   onTriggerAiStructure,
   onToggleTheme,
   onConnectFolder,
@@ -186,6 +190,28 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         icon: <Users size={14} />,
         action: () => onSwitchMainView('people'),
       },
+      ...(onOpenDailyBriefing
+        ? [
+            {
+              id: 'view-daily-briefing',
+              title: 'Open Daily Briefing & AI Overview (Today’s Priorities, Tasks & Decisions)',
+              category: 'Daily Briefing',
+              icon: <Sun size={14} />,
+              action: onOpenDailyBriefing,
+            },
+          ]
+        : []),
+      ...(onOpenDailyReportNote
+        ? [
+            {
+              id: 'note-daily-briefing',
+              title: 'Open Auto-Updated Daily Report Note in Editor',
+              category: 'Daily Briefing',
+              icon: <FileText size={14} />,
+              action: onOpenDailyReportNote,
+            },
+          ]
+        : []),
       {
         id: 'view-reports',
         title: 'Open Reports Hub (Topics, Tasks, Decisions, Clients)',
@@ -294,6 +320,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onDeleteCurrentNote,
     onTriggerAiStructure,
     onSwitchMainView,
+    onOpenDailyBriefing,
+    onOpenDailyReportNote,
     onConnectFolder,
     onToggleTheme,
     onSelectNote,

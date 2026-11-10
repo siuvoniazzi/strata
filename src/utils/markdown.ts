@@ -325,6 +325,11 @@ export function normalizeStructuredMarkdown(markdown: string): string {
   return out.join('\n');
 }
 
+export function isDailyBriefingNote(note: Pick<Note, 'id' | 'labels'>): boolean {
+  if (note.id === 'note-daily-briefing') return true;
+  return note.labels.some((l) => normalizeLabel(l) === 'daily-briefing');
+}
+
 /**
  * Parses inline Tasks and Decisions from a Note's Markdown body.
  */
@@ -332,6 +337,9 @@ export function parseNoteItems(
   note: Note,
   knownPeople: Person[] = []
 ): { tasks: ParsedTask[]; decisions: ParsedDecision[] } {
+  if (isDailyBriefingNote(note)) {
+    return { tasks: [], decisions: [] };
+  }
   const lines = note.body.replace(/\r\n?/g, '\n').split('\n');
   const tasks: ParsedTask[] = [];
   const decisions: ParsedDecision[] = [];

@@ -38,7 +38,7 @@ import {
   TasksGlobalView,
 } from './components/DirectoryViews';
 import { HybridEditor } from './components/HybridEditor';
-import { ReportsView } from './components/ReportsView';
+import { type ReportsHubMode, ReportsView } from './components/ReportsView';
 import { SyncModal } from './components/SyncModal';
 import {
   WorkspaceOverlay,
@@ -68,6 +68,18 @@ import {
   subscribeAiActivity,
 } from './utils/aiProvider';
 import {
+  buildDailyBriefingNote,
+  buildDeterministicDailyBriefing,
+  composeFullDailyNoteMarkdown,
+  computeDailyBriefingData,
+  DAILY_BRIEFING_NOTE_ID,
+  generateDailyBriefingWithAiOrFallback,
+  getTodayDateString,
+  loadDailyBriefingState,
+  type PersistedDailyBriefingState,
+  saveDailyBriefingState,
+} from './utils/dailyBriefing';
+import {
   consumeUrlGoogleDriveParams,
   GoogleDriveDirectoryHandle,
   isGoogleDriveTokenValid,
@@ -83,6 +95,7 @@ import {
   deleteTaskFromBody,
   extractInlineMentions,
   getAllNoteLabels,
+  isDailyBriefingNote,
   normalizeLabel,
   parseNoteItems,
   removeLabelFromNote,
@@ -199,10 +212,16 @@ export function App() {
   const restoreNonceRef = useRef<number>(0);
 
   const [reportInitialFilter, setReportInitialFilter] = useState<{
+    mode?: ReportsHubMode;
     label?: string;
     clientId?: string;
     person?: string;
   }>({});
+  const [dailyBriefingState, setDailyBriefingState] =
+    useState<PersistedDailyBriefingState | null>(() => loadDailyBriefingState());
+  const dailyBriefingStateRef = useRef<PersistedDailyBriefingState | null>(dailyBriefingState);
+  const [isRefreshingDailyBriefing, setIsRefreshingDailyBriefing] = useState<boolean>(false);
+  const aiDailyAutoGenDateRef = useRef<string | null>(null);
   const [overlayStack, setOverlayStack] = useState<OverlayEntry[]>([]);
 
   const [isMobile, setIsMobile] = useState<boolean>(() =>
@@ -291,7 +310,8 @@ export function App() {
     directoryRef.current = directory;
     dirHandleRef.current = dirHandle;
     dirPermissionRef.current = dirPermission;
-  }, [gdriveConfig, tombstones, notes, directory, dirHandle, dirPermission]);
+    dailyBriefingStateRef.current = dailyBriefingState;
+  }, [gdriveConfig, tombstones, notes, directory, dirHandle, dirPermission, dailyBriefingState]);
 
   // Debounced single-note write queue so rapid typing never creates duplicate slug files
   const pendingNoteWritesRef = useRef<
@@ -1222,13 +1242,22 @@ export function App() {
     let openTasks = 0;
     let totalDecisions = 0;
     let inboxCount = 0;
+    let dailyUrgentCount = 0;
+    const today = getTodayDateString();
     for (const n of notes) {
       if (n.scope === 'inbox') inboxCount++;
       const items = parseNoteItems(n, directory.people);
-      openTasks += items.tasks.filter((t) => t.status !== 'done').length;
+      for (const t of items.tasks) {
+        if (t.status !== 'done') {
+          openTasks++;
+          if (t.dueDate && t.dueDate <= today) {
+            dailyUrgentCount++;
+          }
+        }
+      }
       totalDecisions += items.decisions.length;
     }
-    return { openTasks, totalDecisions, inboxCount };
+    return { openTasks, totalDecisions, inboxCount, dailyUrgentCount };
   }, [notes, directory.people]);
 
   const filteredNotesList = useMemo(() => {
@@ -1273,6 +1302,164 @@ export function App() {
     },
     [notes, directory, syncSingleNoteToDisk]
   );
+
+  const handleRefreshDailyBriefing = useCallback(
+    async (windowDays = 7) => {
+      const today = getTodayDateString();
+      const currentNotes = notesRef.current;
+      const currentDir = directoryRef.current;
+      const data = computeDailyBriefingData(currentNotes, currentDir, today, windowDays);
+      setIsRefreshingDailyBriefing(true);
+      try {
+        const result = await generateDailyBriefingWithAiOrFallback(data, currentDir, aiConfig);
+        const nowIso = new Date().toISOString();
+        const nextState: PersistedDailyBriefingState = {
+          date: today,
+          generatedAt: nowIso,
+          sourceSignature: data.sourceSignature,
+          overviewMarkdown: result.overviewMarkdown,
+          fullNoteMarkdown: result.fullNoteMarkdown,
+          usedProvider: result.usedProvider,
+        };
+        saveDailyBriefingState(nextState);
+        dailyBriefingStateRef.current = nextState;
+        setDailyBriefingState(nextState);
+
+        const existingDaily = notesRef.current.find((n) => n.id === DAILY_BRIEFING_NOTE_ID);
+        const built = buildDailyBriefingNote({
+          existingNote: existingDaily,
+          todayDate: today,
+          fullNoteMarkdown: result.fullNoteMarkdown,
+          directory: directoryRef.current,
+        });
+        setNotes((prev) =>
+          prev.some((n) => n.id === DAILY_BRIEFING_NOTE_ID)
+            ? prev.map((n) => (n.id === DAILY_BRIEFING_NOTE_ID ? built : n))
+            : [built, ...prev]
+        );
+        syncSingleNoteToDisk(built, existingDaily?.filePath);
+      } finally {
+        setIsRefreshingDailyBriefing(false);
+      }
+    },
+    [aiConfig, syncSingleNoteToDisk]
+  );
+
+  const handleOpenDailyReportNote = useCallback(() => {
+    const existing = notesRef.current.find((n) => n.id === DAILY_BRIEFING_NOTE_ID);
+    if (existing) {
+      openNoteEditor(existing.id);
+      return;
+    }
+    const today = getTodayDateString();
+    const currentDir = directoryRef.current;
+    const data = computeDailyBriefingData(notesRef.current, currentDir, today, 7);
+    const prev = dailyBriefingStateRef.current;
+    const deterministic = buildDeterministicDailyBriefing(data, currentDir);
+    const overviewMd =
+      prev && prev.date === today && prev.overviewMarkdown.trim()
+        ? prev.overviewMarkdown
+        : deterministic.overviewMarkdown;
+    const fullMarkdown = composeFullDailyNoteMarkdown(overviewMd, data, currentDir);
+    const built = buildDailyBriefingNote({
+      todayDate: today,
+      fullNoteMarkdown: fullMarkdown,
+      directory: currentDir,
+    });
+    setNotes((prevNotes) => [built, ...prevNotes]);
+    syncSingleNoteToDisk(built);
+    openNoteEditor(built.id);
+  }, [openNoteEditor, syncSingleNoteToDisk]);
+
+  // Auto-update the Daily Briefing state & Daily Report Note whenever source notes or date change
+  useEffect(() => {
+    if (!hydrated) return;
+    const sourceNotes = notes.filter((n) => !isDailyBriefingNote(n));
+    const hasDailyNote = notes.some((n) => n.id === DAILY_BRIEFING_NOTE_ID);
+    if (sourceNotes.length === 0 && !hasDailyNote) return;
+
+    const timer = window.setTimeout(() => {
+      const today = getTodayDateString();
+      const currentNotes = notesRef.current;
+      const currentDir = directoryRef.current;
+      const data = computeDailyBriefingData(currentNotes, currentDir, today, 7);
+      const prev = dailyBriefingStateRef.current;
+      const deterministic = buildDeterministicDailyBriefing(data, currentDir);
+
+      const preserveAiOverview =
+        prev &&
+        prev.date === today &&
+        prev.usedProvider !== 'Local Smart Engine' &&
+        Boolean(prev.overviewMarkdown.trim());
+
+      const overviewMd = preserveAiOverview
+        ? prev.overviewMarkdown
+        : deterministic.overviewMarkdown;
+      const usedProvider = preserveAiOverview ? prev.usedProvider : deterministic.usedProvider;
+      const fullMarkdown = composeFullDailyNoteMarkdown(overviewMd, data, currentDir);
+      const stateNeedsUpdate =
+        !prev || prev.date !== today || prev.sourceSignature !== data.sourceSignature;
+
+      const nowIso = stateNeedsUpdate ? new Date().toISOString() : prev.generatedAt;
+
+      if (stateNeedsUpdate) {
+        const nextState: PersistedDailyBriefingState = {
+          date: today,
+          generatedAt: nowIso,
+          sourceSignature: data.sourceSignature,
+          overviewMarkdown: overviewMd,
+          fullNoteMarkdown: fullMarkdown,
+          usedProvider,
+        };
+        saveDailyBriefingState(nextState);
+        dailyBriefingStateRef.current = nextState;
+        setDailyBriefingState(nextState);
+      }
+
+      // Keep the auto-updated Daily Report note synchronized in the workspace
+      if (activeNoteId !== DAILY_BRIEFING_NOTE_ID) {
+        const existingDaily = currentNotes.find((n) => n.id === DAILY_BRIEFING_NOTE_ID);
+        if (
+          !existingDaily ||
+          existingDaily.date !== today ||
+          existingDaily.body !== fullMarkdown
+        ) {
+          const built = buildDailyBriefingNote({
+            existingNote: existingDaily,
+            todayDate: today,
+            fullNoteMarkdown: fullMarkdown,
+            directory: currentDir,
+          });
+          setNotes((prevNotes) =>
+            prevNotes.some((n) => n.id === DAILY_BRIEFING_NOTE_ID)
+              ? prevNotes.map((n) => (n.id === DAILY_BRIEFING_NOTE_ID ? built : n))
+              : [built, ...prevNotes]
+          );
+          syncSingleNoteToDisk(built, existingDaily?.filePath);
+        }
+      }
+
+      // If an external AI provider is configured and we haven't generated today's AI briefing yet, trigger once
+      if (
+        aiConfig.provider !== 'local' &&
+        (!prev || prev.date !== today || prev.usedProvider === 'Local Smart Engine') &&
+        aiDailyAutoGenDateRef.current !== today
+      ) {
+        aiDailyAutoGenDateRef.current = today;
+        void handleRefreshDailyBriefing(7);
+      }
+    }, 150);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    hydrated,
+    notes,
+    directory,
+    activeNoteId,
+    aiConfig.provider,
+    handleRefreshDailyBriefing,
+    syncSingleNoteToDisk,
+  ]);
 
   const handleUpdateNote = useCallback(
     (updated: Note, meta?: NoteEditMeta) => {
@@ -1935,7 +2122,9 @@ export function App() {
     .join(' ');
 
   const activeBreadcrumbLabel = useMemo(() => {
-    if (mainView === 'reports') return 'Reports Hub';
+    if (mainView === 'reports') {
+      return reportInitialFilter.mode === 'explorer' ? 'Reports Hub' : 'Daily Briefing';
+    }
     if (mainView === 'tasks') return 'Tasks Rollup';
     if (mainView === 'decisions') return 'Decision Register';
     if (mainView === 'people') return 'Workspace Directory';
@@ -1950,7 +2139,7 @@ export function App() {
     if (noteFilter.kind === 'label') return `#${noteFilter.label}`;
     if (noteFilter.kind === 'person') return `@${noteFilter.personName}`;
     return 'All Notes';
-  }, [mainView, noteFilter, directory.clients, directory.projects]);
+  }, [mainView, reportInitialFilter.mode, noteFilter, directory.clients, directory.projects]);
 
   const internalProjects = useMemo(
     () => directory.projects.filter((p) => p.scope === 'internal'),
@@ -2080,6 +2269,25 @@ export function App() {
               </button>
 
               <button
+                id="nav-daily-briefing"
+                type="button"
+                className={`nav-item ${mainView === 'reports' && reportInitialFilter.mode !== 'explorer' ? 'active' : ''}`}
+                onClick={() => {
+                  setReportInitialFilter({ mode: 'daily' });
+                  switchPrimaryView('reports');
+                }}
+              >
+                <span className="nav-item-left">
+                  <Sun size={14} /> Daily Briefing
+                </span>
+                {globalCounts.dailyUrgentCount > 0 && (
+                  <span className="nav-item-count" title="Tasks due today or overdue">
+                    {globalCounts.dailyUrgentCount}
+                  </span>
+                )}
+              </button>
+
+              <button
                 type="button"
                 className={`nav-item ${mainView === 'tasks' ? 'active' : ''}`}
                 onClick={() => switchPrimaryView('tasks')}
@@ -2104,9 +2312,9 @@ export function App() {
               <button
                 id="nav-reports"
                 type="button"
-                className={`nav-item ${mainView === 'reports' ? 'active' : ''}`}
+                className={`nav-item ${mainView === 'reports' && reportInitialFilter.mode === 'explorer' ? 'active' : ''}`}
                 onClick={() => {
-                  setReportInitialFilter({});
+                  setReportInitialFilter({ mode: 'explorer' });
                   switchPrimaryView('reports');
                 }}
               >
@@ -2995,6 +3203,19 @@ export function App() {
                             <div className="note-card-title">{n.title || 'Untitled Note'}</div>
                             <div className="note-card-meta">
                               <span>{n.date}</span>
+                              {isDailyBriefingNote(n) && (
+                                <span
+                                  style={{
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    gap: 3,
+                                    color: 'var(--accent-text)',
+                                    fontWeight: 600,
+                                  }}
+                                >
+                                  <Sun size={10} /> Daily Report
+                                </span>
+                              )}
                               {client && (
                                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                                   <span className="client-dot" style={{ background: client.color }} />
@@ -3061,14 +3282,22 @@ export function App() {
 
         {mainView === 'reports' && (
           <ReportsView
-            key={`${reportInitialFilter.label || ''}-${reportInitialFilter.clientId || ''}-${reportInitialFilter.person || ''}`}
+            key={`${reportInitialFilter.mode || 'daily'}-${reportInitialFilter.label || ''}-${reportInitialFilter.clientId || ''}-${reportInitialFilter.person || ''}`}
             notes={notes}
             directory={directory}
             allLabels={allWorkspaceLabels}
             aiConfig={aiConfig}
+            initialMode={reportInitialFilter.mode}
             initialLabelFilter={reportInitialFilter.label}
             initialClientFilter={reportInitialFilter.clientId}
             initialPersonFilter={reportInitialFilter.person}
+            dailyBriefingState={dailyBriefingState}
+            isRefreshingDailyBriefing={isRefreshingDailyBriefing}
+            onRefreshDailyBriefing={handleRefreshDailyBriefing}
+            onOpenDailyReportNote={handleOpenDailyReportNote}
+            onModeChange={(nextMode) => {
+              setReportInitialFilter((prev) => ({ ...prev, mode: nextMode }));
+            }}
             onOpenNote={openNoteEditor}
             onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
@@ -3216,14 +3445,17 @@ export function App() {
           type="button"
           className={`mobile-nav-item ${mainView === 'reports' ? 'active' : ''}`}
           onClick={() => {
-            setReportInitialFilter({});
+            setReportInitialFilter({ mode: 'daily' });
             switchPrimaryView('reports');
           }}
         >
           <span className="mobile-nav-icon-wrap">
-            <BarChart3 size={18} />
+            <Sun size={18} />
+            {globalCounts.dailyUrgentCount > 0 && (
+              <span className="mobile-nav-badge">{globalCounts.dailyUrgentCount}</span>
+            )}
           </span>
-          <span>Reports</span>
+          <span>Daily</span>
         </button>
 
         <button
@@ -3289,7 +3521,7 @@ export function App() {
           onOpenNoteInEditor={openNoteEditor}
           onOpenOrPeekNoteByTitle={handlePeekOrCreateNoteByTitle}
           onOpenFullReportsView={(filter) => {
-            setReportInitialFilter(filter);
+            setReportInitialFilter({ ...filter, mode: 'explorer' });
             switchPrimaryView('reports');
           }}
           onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
@@ -3444,7 +3676,7 @@ export function App() {
             if (mainView === 'notes') {
               openOverlay({ kind: 'report', label: lbl });
             } else {
-              setReportInitialFilter({ label: lbl });
+              setReportInitialFilter({ mode: 'explorer', label: lbl });
               switchPrimaryView('reports');
             }
           }}
@@ -3455,7 +3687,17 @@ export function App() {
               applyNotesFilter({ kind: 'person', personName: name });
             }
           }}
-          onSwitchMainView={switchPrimaryView}
+          onSwitchMainView={(view) => {
+            if (view === 'reports') {
+              setReportInitialFilter({ mode: 'explorer' });
+            }
+            switchPrimaryView(view);
+          }}
+          onOpenDailyBriefing={() => {
+            setReportInitialFilter({ mode: 'daily' });
+            switchPrimaryView('reports');
+          }}
+          onOpenDailyReportNote={handleOpenDailyReportNote}
           onTriggerAiStructure={() => {
             switchPrimaryView('notes');
             setMobileNotesPane('editor');

@@ -5,7 +5,7 @@ import type {
   RelatedNoteMatch,
   WorkspaceDirectory,
 } from '../types';
-import { extractInlineMentions, getAllNoteLabels, parseNoteItems } from './markdown';
+import { extractInlineMentions, getAllNoteLabels, isDailyBriefingNote, parseNoteItems } from './markdown';
 
 const STOP_WORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'will', 'are',
@@ -83,7 +83,7 @@ export function computeContextRadar(
   ]);
   const activeTokens = Array.from(new Set(tokenizeUnicode(`${activeNote.title} ${activeNote.body}`)));
 
-  const otherNotes = allNotes.filter((n) => n.id !== activeNote.id);
+  const otherNotes = allNotes.filter((n) => n.id !== activeNote.id && !isDailyBriefingNote(n));
 
   // Document frequency for IDF weighting
   const docFreq = new Map<string, number>();
@@ -208,8 +208,9 @@ export function localAskWorkspace(
 ): { answerMarkdown: string; citedNotes: Note[] } {
   const qTokens = tokenizeUnicode(question);
   const qLower = question.toLowerCase();
+  const sourceNotes = allNotes.filter((n) => !isDailyBriefingNote(n));
 
-  const scored = allNotes
+  const scored = sourceNotes
     .map((note) => {
       const fullText = `${note.title} ${note.participants.join(' ')} ${getAllNoteLabels(note).join(' ')} ${note.body}`.toLowerCase();
       let score = 0;

@@ -48,7 +48,7 @@ export function saveAiConfig(config: AiConfig): void {
   }
 }
 
-async function callConfiguredLlm(systemPrompt: string, userPrompt: string, config: AiConfig): Promise<string> {
+export async function callConfiguredLlm(systemPrompt: string, userPrompt: string, config: AiConfig): Promise<string> {
   if (config.provider === 'local' || !config.apiKey.trim()) {
     throw new Error('Local deterministic engine active');
   }
@@ -461,7 +461,7 @@ export function getAiActivitySnapshot(): AiActivitySnapshot {
   return currentAiSnapshot;
 }
 
-async function withAiActivity<T>(
+export async function withAiActivity<T>(
   label: string,
   config: AiConfig,
   fn: () => Promise<T>
@@ -554,7 +554,7 @@ ${note.body}`;
   });
 }
 
-function unwrapOuterMarkdownFence(raw: string): string {
+export function unwrapOuterMarkdownFence(raw: string): string {
   const trimmed = raw.trim();
   const match = trimmed.match(/^```(?:markdown|md)?\s*\r?\n([\s\S]*?)\r?\n```$/i);
   return match ? match[1].trim() : trimmed;

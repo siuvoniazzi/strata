@@ -3989,6 +3989,151 @@ textarea {
   color: var(--text-secondary);
 }
 
+/* Daily Briefing & Reports Mode Bar */
+.reports-mode-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  margin-bottom: 18px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface-subtle);
+  flex-wrap: wrap;
+}
+
+.reports-mode-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.reports-mode-tab:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.reports-mode-tab.active {
+  background: var(--bg-surface);
+  color: var(--accent-text);
+  border-color: var(--border-default);
+  box-shadow: var(--shadow-xs);
+}
+
+.reports-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--bg-kbd);
+  color: var(--text-secondary);
+}
+
+.reports-mode-tab.active .reports-mode-badge {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.daily-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  background: var(--status-done-bg);
+  color: var(--status-done-text);
+  border: 1px solid var(--border-subtle);
+}
+
+.inline-note-jump-btn {
+  display: inline;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-subtle);
+  background: var(--link-bg);
+  color: var(--link-text);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.12s ease;
+}
+
+.inline-note-jump-btn:hover {
+  filter: brightness(0.96);
+}
+
+.stat-box-urgent {
+  border-color: var(--priority-high-text);
+  background: linear-gradient(180deg, var(--priority-high-bg) 0%, var(--bg-surface) 88%);
+}
+
+.stat-box-urgent .stat-value {
+  color: var(--priority-high-text);
+}
+
+.daily-overview-panel {
+  border-left: 3px solid var(--accent-primary);
+}
+
+.daily-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.daily-ai-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.task-card-overdue {
+  border-left: 3px solid var(--priority-high-text);
+}
+
+.task-card-due-today {
+  border-left: 3px solid var(--status-waiting-text);
+}
+
+.daily-due-today-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: var(--radius-xs);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: var(--status-waiting-bg);
+  color: var(--status-waiting-text);
+}
+
+.decision-card-pending {
+  border-left: 3px solid var(--decision-proposed-text);
+}
+
 /* Clean Print / Save-to-PDF Brief Styling */
 @media print {
   .sidebar,
