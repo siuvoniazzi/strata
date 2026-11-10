@@ -130,6 +130,7 @@ export function createSeedWorkspace(): { notes: Note[]; directory: WorkspaceDire
       projects: [],
       people: [],
       customLabels: [],
+      sensitiveTerms: [],
     },
   };
 }
@@ -161,6 +162,7 @@ export function purgeLegacyDemoData(
       projects: filteredProjects,
       people: filteredPeople,
       customLabels: filteredLabels,
+      sensitiveTerms: directory.sensitiveTerms || [],
     },
     didPurge,
   };

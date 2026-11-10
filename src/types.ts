@@ -83,6 +83,7 @@ export interface WorkspaceDirectory {
   projects: Project[];
   people: Person[];
   customLabels: string[];
+  sensitiveTerms?: string[];
 }
 
 export type AiProviderType = 'local' | 'openai' | 'azure' | 'gemini' | 'anthropic';
@@ -94,6 +95,28 @@ export interface AiConfig {
   baseUrl?: string; // OpenAI-compatible gateway or Azure endpoint
   azureDeployment?: string;
   azureApiVersion?: string;
+  /** Defaults to true (enabled) when undefined so all external LLM calls are pseudonymized by default */
+  pseudonymize?: boolean;
+}
+
+export type AiPrivacyCategory =
+  | 'PERSON'
+  | 'ORG'
+  | 'PROJECT'
+  | 'TERM'
+  | 'NOTE'
+  | 'EMAIL'
+  | 'PHONE'
+  | 'IBAN'
+  | 'URL';
+
+export interface AiPrivacyReport {
+  enabled: boolean;
+  maskedCount: number;
+  totalReplacements: number;
+  countsByCategory: Partial<Record<AiPrivacyCategory, number>>;
+  scrubbedSystemPrompt: string;
+  scrubbedUserPrompt: string;
 }
 
 export interface AiStructureProposal {
@@ -119,6 +142,7 @@ export interface AiStructureProposal {
   }>;
   restructuredBody: string;
   usedProvider: string;
+  privacyReport?: AiPrivacyReport;
 }
 
 export interface RelatedNoteMatch {

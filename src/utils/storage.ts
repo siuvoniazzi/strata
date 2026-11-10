@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import type { Client, Note, Person, Project, SyncTombstones, WorkspaceDirectory } from '../types';
+import { normalizeSensitiveTerms } from './aiPrivacy';
 import {
   dataUrlToBlob,
   extractReferencedAssetPaths,
@@ -435,6 +436,7 @@ export async function writeDirectoryMetadata(
     projects: directory.projects,
     people: directory.people,
     customLabels: directory.customLabels,
+    sensitiveTerms: normalizeSensitiveTerms(directory.sensitiveTerms),
     tombstones: extra?.tombstones,
     syncedNoteIds: extra?.syncedNoteIds,
     lastSyncedAt: new Date().toISOString(),
@@ -448,6 +450,7 @@ export async function writeDirectoryMetadata(
         projects: prev.projects || [],
         people: prev.people || [],
         customLabels: prev.customLabels || [],
+        sensitiveTerms: normalizeSensitiveTerms(prev.sensitiveTerms),
         tombstones: prev.tombstones || {},
         syncedNoteIds: prev.syncedNoteIds || [],
       });
@@ -456,6 +459,7 @@ export async function writeDirectoryMetadata(
         projects: payload.projects,
         people: payload.people,
         customLabels: payload.customLabels,
+        sensitiveTerms: payload.sensitiveTerms || [],
         tombstones: payload.tombstones || {},
         syncedNoteIds: payload.syncedNoteIds || [],
       });
@@ -696,11 +700,17 @@ export async function syncWorkspaceWithFolder(
       if (norm) customLabelSet.add(norm);
     }
 
+    const mergedSensitiveTerms = normalizeSensitiveTerms([
+      ...diskConfigs.flatMap((cfg) => cfg.sensitiveTerms || []),
+      ...(currentDirectory.sensitiveTerms || []),
+    ]);
+
     let mergedDirectory: WorkspaceDirectory = {
       clients: canonicalClients,
       projects: canonicalProjects,
       people: canonicalPeople,
       customLabels: Array.from(customLabelSet),
+      sensitiveTerms: mergedSensitiveTerms,
     };
 
     // 5. Hydrate image assets from root/assets/ (and any assets (1)/ conflict folders)
@@ -743,6 +753,7 @@ export async function syncWorkspaceWithFolder(
         projects: canonicalProjects,
         people: canonicalPeople,
         customLabels: mergedDirectory.customLabels,
+        sensitiveTerms: mergedDirectory.sensitiveTerms,
       };
 
       const mappedClientId = parsed.note.clientId
@@ -936,11 +947,12 @@ export async function importFilesIntoWorkspace(
   currentNotes: Note[],
   currentDirectory: WorkspaceDirectory
 ): Promise<{ notes: Note[]; directory: WorkspaceDirectory; importedCount: number }> {
-  let directory = {
+  let directory: WorkspaceDirectory = {
     clients: [...currentDirectory.clients],
     projects: [...currentDirectory.projects],
     people: [...currentDirectory.people],
     customLabels: [...currentDirectory.customLabels],
+    sensitiveTerms: normalizeSensitiveTerms(currentDirectory.sensitiveTerms),
   };
   const byId = new Map(currentNotes.map((n) => [n.id, n]));
   let importedCount = 0;
@@ -977,6 +989,12 @@ export async function importFilesIntoWorkspace(
                 directory.people.push(p);
               }
             }
+          }
+          if (parsedDir.sensitiveTerms) {
+            directory.sensitiveTerms = normalizeSensitiveTerms([
+              ...(directory.sensitiveTerms || []),
+              ...parsedDir.sensitiveTerms,
+            ]);
           }
         } catch {
           // Ignore malformed metadata

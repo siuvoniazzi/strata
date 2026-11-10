@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
   Code2,
   Copy,
@@ -7,6 +8,7 @@ import {
   Loader2,
   Maximize2,
   PanelLeft,
+  Plus,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -20,10 +22,12 @@ import type {
   WorkspaceDirectory,
   WorkspacePreferences,
 } from '../types';
+import { normalizeSensitiveTerms } from '../utils/aiPrivacy';
 import { formatAiEngineLabel, generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
 import { normalizeStructuredMarkdown, serializeTaskLine } from '../utils/markdown';
 import { saveWorkspacePreferences } from '../utils/preferences';
 import { AiLoadingState } from './AiLoadingState';
+import { AiPrivacyInlineControls, AiPrivacyPromptDrawer } from './AiPrivacyBadge';
 import { RichMarkdown } from './RichMarkdown';
 
 interface AiStructureModalProps {
@@ -50,6 +54,7 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
   const [applyMetadata, setApplyMetadata] = useState(true);
   const [bodyMode, setBodyMode] = useState<'append' | 'replace' | 'none'>('replace');
   const [showRawDiff, setShowRawDiff] = useState(false);
+  const [showPrivacyPrompt, setShowPrivacyPrompt] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
 
   useEffect(() => {
@@ -200,8 +205,15 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
                   fontSize: 12,
                 }}
               >
-                <span>
-                  Engine: <strong>{proposal.usedProvider}</strong>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span>
+                    Engine: <strong>{proposal.usedProvider}</strong>
+                  </span>
+                  <AiPrivacyInlineControls
+                    report={proposal.privacyReport}
+                    isOpen={showPrivacyPrompt}
+                    onToggleOpen={() => setShowPrivacyPrompt((v) => !v)}
+                  />
                 </span>
                 <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
                   <input
@@ -212,6 +224,8 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
                   Apply inferred Header Metadata (Title, Client/Project, Participants, #Labels)
                 </label>
               </div>
+
+              <AiPrivacyPromptDrawer report={proposal.privacyReport} isOpen={showPrivacyPrompt} />
 
               {/* Proposed Metadata Summary */}
               <div className="radar-card" style={{ gap: 6 }}>
@@ -353,20 +367,31 @@ export const AiStructureModal: React.FC<AiStructureModalProps> = ({
 interface AiSettingsModalProps {
   config: AiConfig;
   preferences: WorkspacePreferences;
+  sensitiveTerms?: string[];
   onSave: (next: AiConfig) => void;
   onSavePreferences: (next: WorkspacePreferences) => void;
+  onSaveSensitiveTerms?: (nextTerms: string[]) => void;
   onClose: () => void;
 }
 
 export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
   config,
   preferences,
+  sensitiveTerms = [],
   onSave,
   onSavePreferences,
+  onSaveSensitiveTerms,
   onClose,
 }) => {
-  const [draft, setDraft] = useState<AiConfig>(config);
+  const [draft, setDraft] = useState<AiConfig>({
+    ...config,
+    pseudonymize: config.pseudonymize !== false,
+  });
   const [draftPrefs, setDraftPrefs] = useState<WorkspacePreferences>(preferences);
+  const [draftTerms, setDraftTerms] = useState<string[]>(() =>
+    normalizeSensitiveTerms(sensitiveTerms)
+  );
+  const [termInput, setTermInput] = useState('');
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -395,9 +420,25 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
     });
   };
 
+  const commitTermInput = (raw: string) => {
+    const parts = raw
+      .split(/[,;\n]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2);
+    if (parts.length === 0) return;
+    setDraftTerms((prev) => normalizeSensitiveTerms([...prev, ...parts]));
+    setTermInput('');
+  };
+
+  const handleRemoveTerm = (target: string) => {
+    setDraftTerms((prev) => prev.filter((t) => t.toLowerCase() !== target.toLowerCase()));
+  };
+
+  const isPseudonymized = draft.pseudonymize !== false;
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-card" style={{ maxWidth: 600 }} onClick={(e) => e.stopPropagation()}>
+      <div className="modal-card" style={{ maxWidth: 620 }} onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Settings size={16} />
@@ -492,7 +533,7 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
           <div className="settings-section">
             <div className="settings-section-title">
               <ShieldCheck size={13} />
-              <span>AI Engine &amp; Corporate Compliance</span>
+              <span>AI Engine &amp; Data Protection</span>
             </div>
 
             <div
@@ -506,8 +547,111 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
               }}
             >
               <strong>Local-Only Key Storage:</strong> API keys stay exclusively in this browser's{' '}
-              <code>localStorage</code> and are <strong>never</strong> written into synced OneDrive <code>.md</code> or{' '}
-              <code>.zip</code> files. When set to <em>Local Smart Engine</em>, zero note text leaves your laptop.
+              <code>localStorage</code> and are <strong>never</strong> written into synced OneDrive/Drive{' '}
+              <code>.md</code> or <code>.zip</code> files. When set to <em>Local Smart Engine</em>, zero note text
+              leaves your laptop.
+            </div>
+
+            <label className="settings-toggle-row" htmlFor="pref-ai-pseudonymize">
+              <input
+                id="pref-ai-pseudonymize"
+                type="checkbox"
+                checked={isPseudonymized}
+                onChange={(e) =>
+                  setDraft({ ...draft, pseudonymize: e.target.checked })
+                }
+              />
+              <div className="settings-toggle-copy">
+                <span
+                  className="settings-toggle-label"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}
+                >
+                  <span>Pseudonymize personal data, companies &amp; projects before AI requests</span>
+                  <span className="settings-default-pill">Default</span>
+                </span>
+                <span className="settings-toggle-desc">
+                  Replaces known clients, projects, people, custom terms, and PII (emails, phones, IBANs, URLs, legal
+                  entities like AG/GmbH/Inc) with ephemeral tokens (<code>PERSON_01</code>, <code>ORG_01</code>,{' '}
+                  <code>PROJECT_01</code>) in RAM before calling external LLMs, then restores real names locally.
+                </span>
+              </div>
+            </label>
+
+            {!isPseudonymized && (
+              <div
+                role="alert"
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 8,
+                  padding: '9px 12px',
+                  borderRadius: 'var(--radius-sm)',
+                  background: 'var(--status-waiting-bg)',
+                  color: 'var(--status-waiting-text)',
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                }}
+              >
+                <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 1 }} />
+                <div>
+                  <strong>Unshielded Outbound AI:</strong> Raw personal names, client names, project titles, and
+                  contact details in your notes will be sent directly to the configured provider. Only disable this for
+                  approved corporate tenants or local <code>localhost</code> gateways.
+                </div>
+              </div>
+            )}
+
+            <div className="form-field">
+              <label className="form-label" htmlFor="custom-sensitive-term-input">
+                Custom Protected Terms (Synced Across Devices)
+              </label>
+              <span style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 4 }}>
+                Add your own company name, internal codenames, or unlisted prospects to always mask as{' '}
+                <code>TERM_01</code>… Synced in <code>_strata/directory.json</code> across paired devices.
+              </span>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input
+                  id="custom-sensitive-term-input"
+                  type="text"
+                  className="form-input"
+                  style={{ flex: 1 }}
+                  placeholder="e.g., Acme Advisory AG, Project Apollo (comma-separated)…"
+                  value={termInput}
+                  onChange={(e) => setTermInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      commitTermInput(termInput);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={termInput.trim().length < 2}
+                  onClick={() => commitTermInput(termInput)}
+                >
+                  <Plus size={13} /> Add
+                </button>
+              </div>
+
+              {draftTerms.length > 0 && (
+                <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 6 }}>
+                  {draftTerms.map((term) => (
+                    <span key={term} className="pill pill-label" style={{ cursor: 'default' }}>
+                      <span>{term}</span>
+                      <button
+                        type="button"
+                        className="pill-remove"
+                        aria-label={`Remove ${term}`}
+                        onClick={() => handleRemoveTerm(term)}
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="form-field">
@@ -594,6 +738,12 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
             type="button"
             className="btn btn-primary"
             onClick={() => {
+              const pendingParts = termInput
+                .split(/[,;\n]+/)
+                .map((s) => s.trim())
+                .filter((s) => s.length >= 2);
+              const finalTerms = normalizeSensitiveTerms([...draftTerms, ...pendingParts]);
+              onSaveSensitiveTerms?.(finalTerms);
               saveWorkspacePreferences(draftPrefs);
               onSavePreferences(draftPrefs);
               saveAiConfig(draft);

@@ -1,12 +1,13 @@
 import type {
   AiConfig,
+  AiPrivacyReport,
   Note,
   ParsedDecision,
   ParsedTask,
   WorkspaceDirectory,
 } from '../types';
 import {
-  callConfiguredLlm,
+  callConfiguredLlmDetailed,
   formatAiEngineLabel,
   unwrapOuterMarkdownFence,
   withAiActivity,
@@ -32,6 +33,7 @@ export interface PersistedDailyBriefingState {
   overviewMarkdown: string;
   fullNoteMarkdown: string;
   usedProvider: string;
+  privacyReport?: AiPrivacyReport;
 }
 
 export interface DailyBriefingData {
@@ -507,6 +509,7 @@ export async function generateDailyBriefingWithAiOrFallback(
   overviewMarkdown: string;
   fullNoteMarkdown: string;
   usedProvider: string;
+  privacyReport?: AiPrivacyReport;
 }> {
   return withAiActivity('AI: Synthesizing daily briefing…', config, async () => {
     const localResult = buildDeterministicDailyBriefing(data, directory);
@@ -547,7 +550,8 @@ export async function generateDailyBriefingWithAiOrFallback(
           const client = n.clientId
             ? directory.clients.find((c) => c.id === n.clientId)?.name
             : null;
-          return `[[${n.title || 'Untitled Note'}]] (${n.date}${client ? ` · ${client}` : ''}):\n${n.body.slice(
+          const title = n.title || 'Untitled Note';
+          return `[[${title}]] (Topic: ${title}, ${n.date}${client ? ` · ${client}` : ''}):\n${n.body.slice(
             0,
             900
           )}`;
@@ -581,9 +585,12 @@ ${decisionsContext || 'None'}
 Recent Workspace Notes:
 ${notesContext || 'None'}`;
 
-      const rawAi = await callConfiguredLlm(systemPrompt, userPrompt, config);
-      const cleanedOverview = sanitizeRollupMarkdown(unwrapOuterMarkdownFence(rawAi));
-      if (!cleanedOverview) return localResult;
+      const llmRes = await callConfiguredLlmDetailed(systemPrompt, userPrompt, config, {
+        directory,
+        notes: data.sourceNotes,
+      });
+      const cleanedOverview = sanitizeRollupMarkdown(unwrapOuterMarkdownFence(llmRes.text));
+      if (!cleanedOverview) return { ...localResult, privacyReport: llmRes.privacyReport };
 
       const providerLabel = formatAiEngineLabel(config);
       const fullNoteMarkdown = composeFullDailyNoteMarkdown(
@@ -596,6 +603,7 @@ ${notesContext || 'None'}`;
         overviewMarkdown: cleanedOverview,
         fullNoteMarkdown,
         usedProvider: providerLabel,
+        privacyReport: llmRes.privacyReport,
       };
     } catch {
       return {

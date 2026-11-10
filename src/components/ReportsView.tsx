@@ -19,6 +19,7 @@ import {
 } from 'lucide-react';
 import type {
   AiConfig,
+  AiPrivacyReport,
   DecisionStatus,
   Note,
   ParsedDecision,
@@ -44,6 +45,7 @@ import {
   stripMarkdownFormatting,
 } from '../utils/markdown';
 import { AiLoadingState } from './AiLoadingState';
+import { AiPrivacyInlineControls, AiPrivacyPromptDrawer } from './AiPrivacyBadge';
 import { RichInlineText } from './RichInlineText';
 import { RichMarkdown } from './RichMarkdown';
 
@@ -162,6 +164,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   const [briefMarkdown, setBriefMarkdown] = useState<string | null>(null);
   const [briefProvider, setBriefProvider] = useState<string>('');
+  const [briefPrivacyReport, setBriefPrivacyReport] = useState<AiPrivacyReport | undefined>(undefined);
+  const [showBriefPrivacyPrompt, setShowBriefPrivacyPrompt] = useState(false);
+  const [showDailyPrivacyPrompt, setShowDailyPrivacyPrompt] = useState(false);
   const [generatingBrief, setGeneratingBrief] = useState(false);
   const [copied, setCopied] = useState<'teams' | 'md' | null>(null);
 
@@ -189,6 +194,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     dailyBriefingState && dailyBriefingState.date === todayDate && dailyBriefingState.usedProvider
       ? dailyBriefingState.usedProvider
       : deterministicDailyBriefing.usedProvider;
+
+  const activeDailyPrivacyReport =
+    dailyBriefingState && dailyBriefingState.date === todayDate
+      ? dailyBriefingState.privacyReport
+      : undefined;
 
   const dailyReportNote = useMemo(
     () => notes.find((n) => n.id === DAILY_BRIEFING_NOTE_ID || isDailyBriefingNote(n)),
@@ -279,10 +289,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         notes: filteredData.matchingNotes,
         tasks: filteredData.matchingTasks,
         decisions: filteredData.matchingDecisions,
+        directory,
         config: aiConfig,
       });
       setBriefMarkdown(res.markdown);
       setBriefProvider(res.usedProvider);
+      setBriefPrivacyReport(res.privacyReport);
     } finally {
       setGeneratingBrief(false);
     }
@@ -582,6 +594,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     <span>Daily Executive Overview &amp; Top Priorities</span>
                   </span>
                   <span className="due-chip">Engine: {activeDailyProvider}</span>
+                  <AiPrivacyInlineControls
+                    report={activeDailyPrivacyReport}
+                    isOpen={showDailyPrivacyPrompt}
+                    onToggleOpen={() => setShowDailyPrivacyPrompt((v) => !v)}
+                  />
                   {dailyBriefingState?.generatedAt && (
                     <span className="due-chip">
                       <Clock size={11} /> Updated{' '}
@@ -616,6 +633,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   </button>
                 </div>
               </div>
+
+              <AiPrivacyPromptDrawer
+                report={activeDailyPrivacyReport}
+                isOpen={showDailyPrivacyPrompt}
+              />
 
               {isRefreshingDailyBriefing ? (
                 <AiLoadingState
@@ -1215,9 +1237,16 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           gap: 8,
                         }}
                       >
-                        <strong style={{ fontSize: 14 }}>
-                          Synthesized Executive Brief ({briefProvider})
-                        </strong>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                          <strong style={{ fontSize: 14 }}>
+                            Synthesized Executive Brief ({briefProvider})
+                          </strong>
+                          <AiPrivacyInlineControls
+                            report={briefPrivacyReport}
+                            isOpen={showBriefPrivacyPrompt}
+                            onToggleOpen={() => setShowBriefPrivacyPrompt((v) => !v)}
+                          />
+                        </div>
                         <div className="no-print" style={{ display: 'flex', gap: 6 }}>
                           <button
                             type="button"
@@ -1236,12 +1265,20 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           <button
                             type="button"
                             className="btn btn-xs btn-ghost"
-                            onClick={() => setBriefMarkdown(null)}
+                            onClick={() => {
+                              setBriefMarkdown(null);
+                              setBriefPrivacyReport(undefined);
+                              setShowBriefPrivacyPrompt(false);
+                            }}
                           >
                             Dismiss
                           </button>
                         </div>
                       </div>
+                      <AiPrivacyPromptDrawer
+                        report={briefPrivacyReport}
+                        isOpen={showBriefPrivacyPrompt}
+                      />
                       <div className="narrative-brief">
                         <RichMarkdown
                           markdown={briefMarkdown}

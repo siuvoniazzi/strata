@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import type {
   AiConfig,
+  AiPrivacyReport,
   Note,
   ParsedTask,
   TaskStatus,
@@ -25,6 +26,7 @@ import {
   parseNoteItems,
 } from '../utils/markdown';
 import { AiLoadingState } from './AiLoadingState';
+import { AiPrivacyInlineControls, AiPrivacyPromptDrawer } from './AiPrivacyBadge';
 import { RichInlineText } from './RichInlineText';
 import { RichMarkdown } from './RichMarkdown';
 
@@ -62,10 +64,12 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
   const [tab, setTab] = useState<'context' | 'ask' | 'outline'>('context');
   const [askQuery, setAskQuery] = useState('');
   const [askLoading, setAskLoading] = useState(false);
+  const [showAskPrivacyPrompt, setShowAskPrivacyPrompt] = useState(false);
   const [askResult, setAskResult] = useState<{
     answerMarkdown: string;
     citedNotes: Note[];
     usedProvider: string;
+    privacyReport?: AiPrivacyReport;
   } | null>(null);
 
   React.useEffect(() => {
@@ -478,14 +482,23 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                     display: 'flex',
                     justifyContent: 'space-between',
                     alignItems: 'center',
+                    flexWrap: 'wrap',
                     gap: 6,
                     fontSize: 11,
                     color: 'var(--text-muted)',
                   }}
                 >
-                  <span>
-                    <Sparkles size={11} style={{ verticalAlign: '-1px', marginRight: 4 }} />
-                    {askResult.usedProvider}
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <span>
+                      <Sparkles size={11} style={{ verticalAlign: '-1px', marginRight: 4 }} />
+                      {askResult.usedProvider}
+                    </span>
+                    <AiPrivacyInlineControls
+                      report={askResult.privacyReport}
+                      isOpen={showAskPrivacyPrompt}
+                      onToggleOpen={() => setShowAskPrivacyPrompt((v) => !v)}
+                      compact
+                    />
                   </span>
                   <button
                     type="button"
@@ -495,6 +508,11 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                     <ArrowDownLeft size={11} /> Insert into Note
                   </button>
                 </div>
+
+                <AiPrivacyPromptDrawer
+                  report={askResult.privacyReport}
+                  isOpen={showAskPrivacyPrompt}
+                />
 
                 <RichMarkdown
                   markdown={askResult.answerMarkdown}

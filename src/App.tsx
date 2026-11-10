@@ -1320,6 +1320,7 @@ export function App() {
           overviewMarkdown: result.overviewMarkdown,
           fullNoteMarkdown: result.fullNoteMarkdown,
           usedProvider: result.usedProvider,
+          privacyReport: result.privacyReport,
         };
         saveDailyBriefingState(nextState);
         dailyBriefingStateRef.current = nextState;
@@ -2097,6 +2098,7 @@ export function App() {
       projects: [],
       people: [],
       customLabels: [],
+      sensitiveTerms: [],
     };
     draftBaselineRef.current = fresh;
     setDraftNote(fresh);
@@ -3630,7 +3632,14 @@ export function App() {
         <AiSettingsModal
           config={aiConfig}
           preferences={preferences}
+          sensitiveTerms={directory.sensitiveTerms || []}
           onSave={setAiConfig}
+          onSaveSensitiveTerms={(nextTerms) => {
+            setDirectory((prev) => ({
+              ...prev,
+              sensitiveTerms: nextTerms,
+            }));
+          }}
           onSavePreferences={(nextPrefs) => {
             const layoutChanged = nextPrefs.startupLayout !== preferences.startupLayout;
             setPreferences(nextPrefs);

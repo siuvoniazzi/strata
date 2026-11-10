@@ -1,5 +1,6 @@
 import type {
   AiConfig,
+  AiPrivacyReport,
   AiStructureProposal,
   DecisionStatus,
   Note,
@@ -9,6 +10,12 @@ import type {
   TaskPriority,
   WorkspaceDirectory,
 } from '../types';
+import {
+  type AiPrivacySession,
+  createAiPrivacySession,
+  isAiPseudonymizationEnabled,
+  selectRelevantDirectoryForNote,
+} from './aiPrivacy';
 import { buildDeterministicExecutiveBrief, localAskWorkspace } from './contextEngine';
 import {
   detectUnlinkedPeopleInText,
@@ -27,7 +34,13 @@ const AI_CONFIG_KEY = 'strata.aiConfig.v1';
 export function loadAiConfig(): AiConfig {
   try {
     const raw = localStorage.getItem(AI_CONFIG_KEY);
-    if (raw) return JSON.parse(raw) as AiConfig;
+    if (raw) {
+      const parsed = JSON.parse(raw) as AiConfig;
+      return {
+        ...parsed,
+        pseudonymize: parsed.pseudonymize !== false,
+      };
+    }
   } catch {
     // Ignore storage read errors
   }
@@ -37,6 +50,7 @@ export function loadAiConfig(): AiConfig {
     model: 'gpt-4o-mini',
     baseUrl: 'https://api.openai.com/v1',
     azureApiVersion: '2024-10-21',
+    pseudonymize: true,
   };
 }
 
@@ -48,7 +62,11 @@ export function saveAiConfig(config: AiConfig): void {
   }
 }
 
-export async function callConfiguredLlm(systemPrompt: string, userPrompt: string, config: AiConfig): Promise<string> {
+async function sendRawLlmHttpRequest(
+  systemPrompt: string,
+  userPrompt: string,
+  config: AiConfig
+): Promise<string> {
   if (config.provider === 'local' || !config.apiKey.trim()) {
     throw new Error('Local deterministic engine active');
   }
@@ -140,6 +158,60 @@ export async function callConfiguredLlm(systemPrompt: string, userPrompt: string
   }
 
   throw new Error('Unsupported AI provider');
+}
+
+export interface LlmPrivacyCallOptions {
+  directory?: WorkspaceDirectory;
+  notes?: Note[];
+  skipAutoRehydrate?: boolean;
+}
+
+export async function callConfiguredLlmDetailed(
+  systemPrompt: string,
+  userPrompt: string,
+  config: AiConfig,
+  privacyOptions?: LlmPrivacyCallOptions
+): Promise<{
+  text: string;
+  rawText: string;
+  privacyReport: AiPrivacyReport;
+  session: AiPrivacySession;
+}> {
+  if (config.provider === 'local' || !config.apiKey.trim()) {
+    throw new Error('Local deterministic engine active');
+  }
+
+  // Fail-closed: if pseudonymization is enabled and scrubbing throws, never send raw text externally
+  const session = createAiPrivacySession({
+    directory: privacyOptions?.directory,
+    notes: privacyOptions?.notes,
+    enabled: isAiPseudonymizationEnabled(config),
+  });
+  const scrubbed = session.scrubPrompts(systemPrompt, userPrompt);
+
+  const rawText = await sendRawLlmHttpRequest(
+    scrubbed.systemPrompt,
+    scrubbed.userPrompt,
+    config
+  );
+  const text = privacyOptions?.skipAutoRehydrate ? rawText : session.rehydrateText(rawText);
+
+  return {
+    text,
+    rawText,
+    privacyReport: scrubbed.report,
+    session,
+  };
+}
+
+export async function callConfiguredLlm(
+  systemPrompt: string,
+  userPrompt: string,
+  config: AiConfig,
+  privacyOptions?: LlmPrivacyCallOptions
+): Promise<string> {
+  const res = await callConfiguredLlmDetailed(systemPrompt, userPrompt, config, privacyOptions);
+  return res.text;
 }
 
 function inferRelativeDueDate(line: string, baseDateStr: string): string | null {
@@ -495,6 +567,25 @@ export async function generateStructureProposal(
     }
 
     try {
+      const hintDir = isAiPseudonymizationEnabled(config)
+        ? selectRelevantDirectoryForNote(note, directory)
+        : directory;
+
+      const formatProjectHint = (p: WorkspaceDirectory['projects'][number]) => {
+        const clientName = p.clientId
+          ? directory.clients.find((c) => c.id === p.clientId)?.name
+          : null;
+        return clientName ? `${p.name} (Client: ${clientName})` : p.name;
+      };
+
+      const formatPersonHint = (p: WorkspaceDirectory['people'][number]) => {
+        const clientName = p.clientId
+          ? directory.clients.find((c) => c.id === p.clientId)?.name
+          : null;
+        const meta = [p.role, clientName ? `Client: ${clientName}` : null].filter(Boolean).join(', ');
+        return meta ? `${p.name} (${meta})` : p.name;
+      };
+
       const systemPrompt = `You are an executive note-structuring assistant. Return STRICT JSON matching this schema:
 {
   "suggestedTitle": "string",
@@ -508,18 +599,24 @@ export async function generateStructureProposal(
 }
 Preserve the original language and factual precision of the note.`;
 
-      const userPrompt = `Known Clients: ${directory.clients.map((c) => c.name).join(', ') || 'None'}
-Known Projects: ${directory.projects.map((p) => p.name).join(', ') || 'None'}
-Known People: ${directory.people.map((p) => `${p.name}${p.role ? ` (${p.role})` : ''}`).join(', ') || 'None'}
+      const userPrompt = `Known Clients: ${hintDir.clients.map((c) => c.name).join(', ') || 'None'}
+Known Projects: ${hintDir.projects.map(formatProjectHint).join(', ') || 'None'}
+Known People: ${hintDir.people.map(formatPersonHint).join(', ') || 'None'}
 Note Date: ${note.date}
 Current Title: ${note.title}
 Current Body:
 ${note.body}`;
 
-      const raw = await callConfiguredLlm(systemPrompt, userPrompt, config);
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return localProposal;
-      const parsed = JSON.parse(jsonMatch[0]);
+      const llmRes = await callConfiguredLlmDetailed(systemPrompt, userPrompt, config, {
+        directory,
+        notes: [note],
+        skipAutoRehydrate: true,
+      });
+
+      const jsonMatch = llmRes.rawText.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return { ...localProposal, privacyReport: llmRes.privacyReport };
+      const rawParsed = JSON.parse(jsonMatch[0]);
+      const parsed = llmRes.session.rehydrateValue(rawParsed);
 
       const matchedClient = parsed.clientName
         ? directory.clients.find((c) => c.name.toLowerCase() === String(parsed.clientName).toLowerCase())
@@ -547,6 +644,7 @@ ${note.body}`;
           unwrapOuterMarkdownFence(parsed.restructuredBody || localProposal.restructuredBody)
         ),
         usedProvider: formatAiEngineLabel(config),
+        privacyReport: llmRes.privacyReport,
       };
     } catch {
       return localProposal;
@@ -565,7 +663,12 @@ export async function askWorkspaceWithAiOrFallback(
   allNotes: Note[],
   directory: WorkspaceDirectory,
   config: AiConfig
-): Promise<{ answerMarkdown: string; citedNotes: Note[]; usedProvider: string }> {
+): Promise<{
+  answerMarkdown: string;
+  citedNotes: Note[];
+  usedProvider: string;
+  privacyReport?: AiPrivacyReport;
+}> {
   return withAiActivity('AI: Answering query…', config, async () => {
     const localResult = localAskWorkspace(question, allNotes, directory);
     if (config.provider === 'local' || !config.apiKey.trim() || localResult.citedNotes.length === 0) {
@@ -574,21 +677,29 @@ export async function askWorkspaceWithAiOrFallback(
 
     try {
       const contextDump = localResult.citedNotes
-        .map((n) => `--- NOTE: [[${n.title}]] (${n.date}) ---\n${n.body}`)
+        .map(
+          (n) =>
+            `--- NOTE: [[${n.title || 'Untitled Note'}]] (Topic: ${n.title || 'Untitled Note'}, Date: ${n.date}) ---\n${n.body}`
+        )
         .join('\n\n');
 
-      const answer = await callConfiguredLlm(
+      const llmRes = await callConfiguredLlmDetailed(
         'Answer concisely using ONLY the provided notes. Cite source notes inline using [[Exact Note Title]]. Highlight relevant decisions and open tasks.',
         `Question: ${question}\n\nNotes:\n${contextDump}`,
-        config
+        config,
+        {
+          directory,
+          notes: allNotes,
+        }
       );
 
-      const cleanedAnswer = unwrapOuterMarkdownFence(answer);
+      const cleanedAnswer = unwrapOuterMarkdownFence(llmRes.text);
 
       return {
         answerMarkdown: cleanedAnswer || localResult.answerMarkdown,
         citedNotes: localResult.citedNotes,
         usedProvider: formatAiEngineLabel(config),
+        privacyReport: llmRes.privacyReport,
       };
     } catch {
       return { ...localResult, usedProvider: 'Local Context Index (Fallback)' };
@@ -601,8 +712,13 @@ export async function generateExecutiveBriefWithAiOrFallback(params: {
   notes: Note[];
   tasks: ParsedTask[];
   decisions: ParsedDecision[];
+  directory?: WorkspaceDirectory;
   config: AiConfig;
-}): Promise<{ markdown: string; usedProvider: string }> {
+}): Promise<{
+  markdown: string;
+  usedProvider: string;
+  privacyReport?: AiPrivacyReport;
+}> {
   return withAiActivity('AI: Synthesizing brief…', params.config, async () => {
     const fallback = buildDeterministicExecutiveBrief(params);
     if (params.config.provider === 'local' || !params.config.apiKey.trim()) {
@@ -612,18 +728,26 @@ export async function generateExecutiveBriefWithAiOrFallback(params: {
     try {
       const context = params.notes
         .slice(0, 10)
-        .map((n) => `[[${n.title}]] (${n.date}):\n${n.body.slice(0, 1200)}`)
+        .map(
+          (n) =>
+            `[[${n.title || 'Untitled Note'}]] (Topic: ${n.title || 'Untitled Note'}, ${n.date}):\n${n.body.slice(0, 1200)}`
+        )
         .join('\n\n');
 
-      const md = await callConfiguredLlm(
+      const llmRes = await callConfiguredLlmDetailed(
         'Write a crisp, high-signal executive status report in Markdown with sections for Executive Summary, Key Decisions, Open Action Items (with @owners & due dates), and Risks/Dependencies. Cite notes using [[Note Title]].',
         `Report Topic: ${params.heading}\n\nSource Notes:\n${context}`,
-        params.config
+        params.config,
+        {
+          directory: params.directory,
+          notes: params.notes,
+        }
       );
-      const cleanedMd = unwrapOuterMarkdownFence(md);
+      const cleanedMd = unwrapOuterMarkdownFence(llmRes.text);
       return {
         markdown: cleanedMd || fallback,
         usedProvider: formatAiEngineLabel(params.config),
+        privacyReport: llmRes.privacyReport,
       };
     } catch {
       return { markdown: fallback, usedProvider: 'Local Structured Synthesizer (Fallback)' };
