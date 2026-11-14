@@ -51,13 +51,32 @@ interface ContextTimelineProps {
   onCollapse: () => void;
 }
 
+function toLocalYmd(ms: number): string {
+  const d = new Date(ms);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function hasMatchingCreatedAtDay(note: Note): boolean {
+  if (!note.createdAt) return false;
+  const parsed = Date.parse(note.createdAt);
+  if (Number.isNaN(parsed)) return false;
+  if (!note.date) return true;
+  return toLocalYmd(parsed) === note.date;
+}
+
 function getNoteCreationMs(note: Note): number {
-  if (note.createdAt) {
-    const parsed = Date.parse(note.createdAt);
-    if (!Number.isNaN(parsed)) return parsed;
+  if (hasMatchingCreatedAtDay(note)) {
+    return Date.parse(note.createdAt);
   }
   if (note.date) {
     const parsed = Date.parse(`${note.date}T12:00:00`);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  if (note.createdAt) {
+    const parsed = Date.parse(note.createdAt);
     if (!Number.isNaN(parsed)) return parsed;
   }
   return 0;
@@ -78,8 +97,7 @@ function formatCreationPoint(
     ...(sameYear ? {} : { year: 'numeric' }),
   });
 
-  const hasExplicitCreatedAt = Boolean(note.createdAt && !Number.isNaN(Date.parse(note.createdAt)));
-  const timeLabel = hasExplicitCreatedAt
+  const timeLabel = hasMatchingCreatedAtDay(note)
     ? d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })
     : null;
 
