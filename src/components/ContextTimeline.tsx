@@ -367,27 +367,27 @@ export const ContextTimeline: React.FC<ContextTimelineProps> = ({
                           </div>
                         )}
 
-                        <div
-                          className="timeline-entry"
-                          style={{ animationDelay: `${Math.min(idx, 10) * 55}ms` }}
-                        >
+                        <div className="timeline-entry">
                           {/* Reference point on the vertical timeline spine */}
                           <div
                             className="timeline-node-col"
-                            style={{ animationDelay: `${Math.min(idx, 10) * 55 + 620}ms` }}
+                            style={{ animationDelay: `${Math.min(idx, 10) * 80 + 750}ms` }}
                             aria-hidden="true"
                           >
                             <span className="timeline-node">
                               <span
                                 className="timeline-node-ring"
-                                style={{ animationDelay: `${Math.min(idx, 10) * 55 + 720}ms` }}
+                                style={{ animationDelay: `${Math.min(idx, 10) * 80 + 850}ms` }}
                               />
                             </span>
                             <span className="timeline-connector" />
                           </div>
 
                           {/* Note Object flowing to its creation point */}
-                          <div className="timeline-entry-body">
+                          <div
+                            className="timeline-entry-body"
+                            style={{ animationDelay: `${Math.min(idx, 10) * 80}ms` }}
+                          >
                             <div className="timeline-point-meta">
                               <span className="timeline-point-date">
                                 {entry.dateLabel}
@@ -396,7 +396,10 @@ export const ContextTimeline: React.FC<ContextTimelineProps> = ({
                               <span className="timeline-point-rel">{entry.relativeLabel}</span>
                             </div>
 
-                            <article className="timeline-note-card">
+                            <article
+                              className="timeline-note-card"
+                              style={{ animationDelay: `${Math.min(idx, 10) * 80}ms` }}
+                            >
                               <div className="timeline-card-header">
                                 <button
                                   type="button"

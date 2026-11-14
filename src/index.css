@@ -2265,12 +2265,12 @@ textarea {
 @keyframes timelineFlowFromBottom {
   0% {
     opacity: 0;
-    transform: translateY(88vh) scale(0.93);
+    transform: translateY(calc(100vh - 140px)) scale(0.92);
   }
-  14% {
+  6% {
     opacity: 1;
   }
-  78% {
+  80% {
     opacity: 1;
     transform: translateY(-4px) scale(1.01);
   }
@@ -2304,22 +2304,13 @@ textarea {
 
 @keyframes timelineCardArrive {
   0%,
-  55% {
+  65% {
     border-color: var(--accent-primary);
     box-shadow: 0 0 0 2px var(--accent-soft), var(--shadow-md);
   }
   100% {
     border-color: var(--border-subtle);
     box-shadow: var(--shadow-xs);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .timeline-entry-body,
-  .timeline-node-col,
-  .timeline-node-ring,
-  .timeline-note-card {
-    animation: none !important;
   }
 }
 
