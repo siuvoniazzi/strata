@@ -11,6 +11,7 @@ export interface RichMarkdownProps {
   people: Person[];
   clients: Client[];
   notes: Note[];
+  noteId?: string;
   compact?: boolean;
   className?: string;
   onClickPerson?: (personName: string) => void;
@@ -97,6 +98,7 @@ export const RichMarkdown: React.FC<RichMarkdownProps> = ({
   people,
   clients,
   notes,
+  noteId,
   compact = false,
   className = '',
   onClickPerson,
@@ -112,6 +114,7 @@ export const RichMarkdown: React.FC<RichMarkdownProps> = ({
       people={people}
       clients={clients}
       notes={notes}
+      noteId={noteId}
       onClickPerson={onClickPerson}
       onClickLabel={onClickLabel}
       onClickNoteLink={onClickNoteLink}
@@ -303,7 +306,7 @@ export const RichMarkdown: React.FC<RichMarkdownProps> = ({
     const imgBlockMatch = line.match(/^\s*!\[([^\]]*)\]\(([^)\n]+)\)\s*$/);
     if (imgBlockMatch) {
       const { alt, width } = parseAltAndWidth(imgBlockMatch[1]);
-      const resolved = resolveImageSrc(imgBlockMatch[2].trim());
+      const resolved = resolveImageSrc(imgBlockMatch[2].trim(), noteId);
       const cssWidth = width ? (width.endsWith('%') ? width : `${width}px`) : undefined;
       blocks.push(
         <figure

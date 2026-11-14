@@ -54,15 +54,41 @@ export function parseAltAndWidth(rawAlt: string): { alt: string; width: string }
   return { alt: rawAlt.trim(), width: '' };
 }
 
+function attachmentExtBadge(name: string): string {
+  const ext = (name.split('.').pop() || '').toUpperCase();
+  if (ext === 'PDF') return 'PDF';
+  if (ext && ext.length <= 4) return ext;
+  return 'FILE';
+}
+
+export function buildAttachmentChipHtml(name: string, src: string): string {
+  const cleanName = (name || src.split('/').pop() || 'attachment').replace(/[[\]]/g, '').trim();
+  const cleanSrc = src.trim();
+  const badge = attachmentExtBadge(cleanName);
+  return (
+    `<span class="doc-token doc-attachment" contenteditable="false" data-attachment-src="${escAttr(cleanSrc)}" data-attachment-name="${escAttr(cleanName)}" title="Open ${escAttr(cleanName)}">` +
+    `<span class="doc-attachment-badge">${escHtml(badge)}</span>` +
+    `<span class="doc-attachment-name">${escHtml(cleanName)}</span>` +
+    `</span>`
+  );
+}
+
+export function createAttachmentChipElement(name: string, src: string): HTMLElement {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = buildAttachmentChipHtml(name, src);
+  return tpl.content.firstElementChild as HTMLElement;
+}
+
 export function buildImageBlockHtml(params: {
   src: string;
   alt?: string;
   width?: string | null;
+  noteId?: string;
 }): string {
   const cleanSrc = params.src.startsWith('data:image/')
-    ? registerDataUrlAssetSync(params.src)
+    ? registerDataUrlAssetSync(params.src, undefined, params.noteId)
     : params.src.trim();
-  const resolvedSrc = resolveImageSrc(cleanSrc);
+  const resolvedSrc = resolveImageSrc(cleanSrc, params.noteId);
   const alt = (params.alt ?? 'Pasted image').replace(/[[\]|]/g, '').trim();
   const width = normalizeImageWidth(params.width);
   const cssWidth = width ? (width.endsWith('%') ? width : `${width}px`) : '';
@@ -101,6 +127,7 @@ export function createImageBlockElement(params: {
   src: string;
   alt?: string;
   width?: string | null;
+  noteId?: string;
 }): HTMLElement {
   const tpl = document.createElement('template');
   tpl.innerHTML = buildImageBlockHtml(params);
@@ -108,10 +135,14 @@ export function createImageBlockElement(params: {
 }
 
 /**
- * Converts inline Markdown (bold, italic, strike, code, @[Person], #label, [[Note]], due:, !prio)
+ * Converts inline Markdown (bold, italic, strike, code, @[Person], #label, [[Note]], [file](assets/...), due:, !prio)
  * into clean semantic HTML spans for the continuous Word-like document surface.
  */
-export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): string {
+export function inlineMarkdownToHtml(
+  text: string,
+  knownPeople: Person[] = [],
+  noteId?: string
+): string {
   if (!text) return '';
 
   // Build dynamic alternation for unbracketed multi-word known people (@Jane Doe)
@@ -126,6 +157,7 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
   const patternParts = [
     '`([^`]+)`', // inline code
     '!\\[([^\\]]*)\\]\\(([^)\\n]+)\\)', // inline image ![alt|width](src)
+    '\\[([^\\]]+)\\]\\(((?:\\./|\\.\\./)*assets/[^)\\n]+)\\)', // local attachment [name](assets/...)
     '\\[\\[([^\\]]+)\\]\\]', // [[Note Link]]
     '@\\[([^\\]]+)\\]', // @[Full Name]
     ...(multiWordPersonAlternation
@@ -160,15 +192,22 @@ export function inlineMarkdownToHtml(text: string, knownPeople: Person[] = []): 
       if (imgMatch) {
         const { alt, width } = parseAltAndWidth(imgMatch[1]);
         const cleanSrc = imgMatch[2].trim().startsWith('data:image/')
-          ? registerDataUrlAssetSync(imgMatch[2].trim())
+          ? registerDataUrlAssetSync(imgMatch[2].trim(), undefined, noteId)
           : imgMatch[2].trim();
-        const resolved = resolveImageSrc(cleanSrc);
+        const resolved = resolveImageSrc(cleanSrc, noteId);
         const cssWidth = width ? (width.endsWith('%') ? width : `${width}px`) : '';
         out.push(
           `<img class="doc-inline-image" src="${escAttr(resolved)}" data-src="${escAttr(cleanSrc)}" alt="${escAttr(alt || 'Image')}"` +
             `${width ? ` data-width="${escAttr(width)}"` : ''}` +
             `${cssWidth ? ` style="width: ${escAttr(cssWidth)};"` : ''} />`
         );
+      } else {
+        out.push(escHtml(raw));
+      }
+    } else if (raw.startsWith('[') && !raw.startsWith('[[') && raw.endsWith(')')) {
+      const attMatch = raw.match(/^\[([^\]]+)\]\(([^)\n]+)\)$/);
+      if (attMatch) {
+        out.push(buildAttachmentChipHtml(attMatch[1], attMatch[2]));
       } else {
         out.push(escHtml(raw));
       }
@@ -231,8 +270,8 @@ function getIndentLevelFromWhitespace(rawIndent?: string | null): number {
   return Math.min(MAX_LIST_INDENT, Math.ceil(spaces / 2));
 }
 
-function renderBlockInlineHtml(text: string, knownPeople: Person[]): string {
-  const html = inlineMarkdownToHtml(text, knownPeople);
+function renderBlockInlineHtml(text: string, knownPeople: Person[], noteId?: string): string {
+  const html = inlineMarkdownToHtml(text, knownPeople, noteId);
   if (!html) return '';
   return html.endsWith(' ') ? `${html.slice(0, -1)}&nbsp;` : html;
 }
@@ -240,7 +279,11 @@ function renderBlockInlineHtml(text: string, knownPeople: Person[]): string {
 /**
  * Hydrates a Markdown note body into clean semantic block HTML for the continuous Word-like page.
  */
-export function markdownToHtml(markdown: string, knownPeople: Person[] = []): string {
+export function markdownToHtml(
+  markdown: string,
+  knownPeople: Person[] = [],
+  noteId?: string
+): string {
   if (!markdown) {
     return '<p><br></p>';
   }
@@ -275,6 +318,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
           src: imgBlockMatch[2].trim(),
           alt,
           width,
+          noteId,
         })
       );
       i++;
@@ -287,7 +331,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       const status = decMatch.status;
       const indent = getIndentLevelFromWhitespace(decMatch.indent);
       const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
-      const inner = renderBlockInlineHtml(decMatch.text || '', knownPeople);
+      const inner = renderBlockInlineHtml(decMatch.text || '', knownPeople, noteId);
       htmlBlocks.push(
         `<p class="doc-decision" data-status="${status}"${indentAttr}>${inner || '<br>'}</p>`
       );
@@ -295,7 +339,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       if (i + 1 < lines.length) {
         const ratText = matchRationaleLine(lines[i + 1]);
         if (ratText !== null) {
-          const ratInner = renderBlockInlineHtml(ratText, knownPeople);
+          const ratInner = renderBlockInlineHtml(ratText, knownPeople, noteId);
           htmlBlocks.push(`<blockquote class="doc-rationale">${ratInner || '<br>'}</blockquote>`);
           i += 2;
           continue;
@@ -311,7 +355,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
       const status = taskMatch.status;
       const indent = getIndentLevelFromWhitespace(taskMatch.indent);
       const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
-      const inner = renderBlockInlineHtml(taskMatch.text || '', knownPeople);
+      const inner = renderBlockInlineHtml(taskMatch.text || '', knownPeople, noteId);
       htmlBlocks.push(
         `<p class="doc-task" data-status="${status}"${indentAttr}>${inner || '<br>'}</p>`
       );
@@ -326,7 +370,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
         const m = lines[i].match(/^([ \t]*)[-*+•](?:\s+(.*)|\s*)$/);
         const indent = m ? getIndentLevelFromWhitespace(m[1]) : 0;
         const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
-        const itemHtml = renderBlockInlineHtml(m && m[2] ? m[2] : '', knownPeople);
+        const itemHtml = renderBlockInlineHtml(m && m[2] ? m[2] : '', knownPeople, noteId);
         items.push(`<li${indentAttr}>${itemHtml || '<br>'}</li>`);
         i++;
       }
@@ -341,7 +385,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
         const m = lines[i].match(/^([ \t]*)\d+[.)](?:\s+(.*)|\s*)$/);
         const indent = m ? getIndentLevelFromWhitespace(m[1]) : 0;
         const indentAttr = indent > 0 ? ` data-indent="${indent}"` : '';
-        const itemHtml = renderBlockInlineHtml(m && m[2] ? m[2] : '', knownPeople);
+        const itemHtml = renderBlockInlineHtml(m && m[2] ? m[2] : '', knownPeople, noteId);
         items.push(`<li${indentAttr}>${itemHtml || '<br>'}</li>`);
         i++;
       }
@@ -352,7 +396,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     // 5. Headings
     const h3Match = line.match(/^\s*#{3,6}\s+(.*)$/);
     if (h3Match) {
-      const inner = renderBlockInlineHtml(h3Match[1], knownPeople);
+      const inner = renderBlockInlineHtml(h3Match[1], knownPeople, noteId);
       htmlBlocks.push(`<h3>${inner || '<br>'}</h3>`);
       i++;
       continue;
@@ -360,7 +404,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
 
     const h2Match = line.match(/^\s*##\s+(.*)$/);
     if (h2Match) {
-      const inner = renderBlockInlineHtml(h2Match[1], knownPeople);
+      const inner = renderBlockInlineHtml(h2Match[1], knownPeople, noteId);
       htmlBlocks.push(`<h2>${inner || '<br>'}</h2>`);
       i++;
       continue;
@@ -368,7 +412,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
 
     const h1Match = line.match(/^\s*#\s+(.*)$/);
     if (h1Match) {
-      const inner = renderBlockInlineHtml(h1Match[1], knownPeople);
+      const inner = renderBlockInlineHtml(h1Match[1], knownPeople, noteId);
       htmlBlocks.push(`<h1>${inner || '<br>'}</h1>`);
       i++;
       continue;
@@ -384,7 +428,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     // 7. Blockquote
     const quoteMatch = line.match(/^\s*>\s?(.*)$/);
     if (quoteMatch) {
-      const inner = renderBlockInlineHtml(quoteMatch[1], knownPeople);
+      const inner = renderBlockInlineHtml(quoteMatch[1], knownPeople, noteId);
       htmlBlocks.push(`<blockquote>${inner || '<br>'}</blockquote>`);
       i++;
       continue;
@@ -394,7 +438,7 @@ export function markdownToHtml(markdown: string, knownPeople: Person[] = []): st
     if (!line.trim()) {
       htmlBlocks.push('<p><br></p>');
     } else {
-      htmlBlocks.push(`<p>${renderBlockInlineHtml(line, knownPeople)}</p>`);
+      htmlBlocks.push(`<p>${renderBlockInlineHtml(line, knownPeople, noteId)}</p>`);
     }
     i++;
   }
@@ -471,6 +515,11 @@ function serializeInlineNode(node: Node): string {
       const trail = rawTxt.match(/\s*$/)?.[0] || '';
       const core = rawTxt.trim();
       return core ? `${lead}[[${core}]]${trail}` : rawTxt;
+    }
+    if (el.classList.contains('doc-attachment')) {
+      const src = (el.getAttribute('data-attachment-src') || '').trim();
+      const name = (el.getAttribute('data-attachment-name') || src.split('/').pop() || 'attachment').trim();
+      return src ? `[${name}](${src})` : '';
     }
     if (el.classList.contains('doc-label')) {
       return (el.textContent || '').replace(/\u00A0/g, ' ');

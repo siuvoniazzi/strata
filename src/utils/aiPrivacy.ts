@@ -660,13 +660,13 @@ export function createAiPrivacySession(options: {
     if (!rawInput) return rawInput;
     let work = rawInput;
 
-    // Step A: Protect local Markdown image asset paths `(assets/img-...)` while scrubbing alt text
+    // Step A: Protect local Markdown asset paths `![alt](assets/...)` and `[label](assets/...)`
     work = work.replace(
-      /!\[([^\]]*)\]\((assets\/[^)\s]+)\)/gi,
-      (_, alt: string, assetPath: string) => {
-        const scrubbedAlt = alt ? scrubInternal(alt) : '';
+      /(!?)\[([^\]]*)\]\((assets\/[^)\s]+)\)/gi,
+      (_, bang: string, label: string, assetPath: string) => {
+        const scrubbedLabel = label ? scrubInternal(label) : '';
         const protectedPath = makeStructuralSentinel(assetPath);
-        return `![${scrubbedAlt}](${protectedPath})`;
+        return `${bang}[${scrubbedLabel}](${protectedPath})`;
       }
     );
 

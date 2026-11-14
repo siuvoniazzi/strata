@@ -11,6 +11,7 @@ import type {
   TaskStatus,
   WorkspaceDirectory,
 } from '../types';
+import { extractReferencedAssetPaths } from './imageStore';
 
 export function slugify(input: string): string {
   const cleaned = input
@@ -62,7 +63,7 @@ export function stripMarkdownFormatting(text: string): string {
       (alias || target).trim()
     )
     .replace(/@\[([^\]]+)\]/g, '@$1')
-    .replace(/\[([^\]]+)\]\((?:https?:\/\/|mailto:)[^)\s]+\)/g, '$1')
+    .replace(/\[([^\]]+)\]\((?:https?:\/\/|mailto:|assets\/)[^)\s]+\)/g, '$1')
     .replace(/`([^`\n]+)`/g, '$1')
     .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
     .replace(/\*\*(.+?)\*\*/g, '$1')
@@ -613,20 +614,24 @@ export function removeLabelFromNote(note: Note, targetLabel: string): Note {
  * Inbox/ | Internal/<Project>/ | Clients/<Client>/<Project>/
  */
 export function computeNoteFilePath(note: Note, directory: WorkspaceDirectory): string {
-  const fileSlug = `${note.date || 'undated'}-${slugify(note.title || 'untitled')}.md`;
+  const bundleSlug = `${note.date || 'undated'}-${slugify(note.title || 'untitled')}`;
+  const fileSlug = `${bundleSlug}.md`;
+  const hasAssets = extractReferencedAssetPaths(note.body).length > 0;
+  const leafPath = hasAssets ? `${bundleSlug}/${fileSlug}` : fileSlug;
+
   if (note.scope === 'inbox') {
-    return `Inbox/${fileSlug}`;
+    return `Inbox/${leafPath}`;
   }
   if (note.scope === 'internal') {
     const proj = directory.projects.find((p) => p.id === note.projectId);
     const projFolder = proj ? folderSegment(proj.name) : 'General';
-    return `Internal/${projFolder}/${fileSlug}`;
+    return `Internal/${projFolder}/${leafPath}`;
   }
   const client = directory.clients.find((c) => c.id === note.clientId);
   const clientFolder = client ? folderSegment(client.name) : 'Unassigned-Client';
   const proj = directory.projects.find((p) => p.id === note.projectId);
   const projFolder = proj ? folderSegment(proj.name) : 'General';
-  return `Clients/${clientFolder}/${projFolder}/${fileSlug}`;
+  return `Clients/${clientFolder}/${projFolder}/${leafPath}`;
 }
 
 function escapeYaml(val: string): string {

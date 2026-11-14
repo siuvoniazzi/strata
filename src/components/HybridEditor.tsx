@@ -5,9 +5,11 @@ import {
   CheckSquare,
   ClipboardPaste,
   Code2,
+  Download,
   ExternalLink,
   Eye,
   FilePlus2,
+  FileText,
   FolderKanban,
   Gavel,
   Hash,
@@ -17,6 +19,7 @@ import {
   List,
   ListOrdered,
   MailPlus,
+  Paperclip,
   Plus,
   Quote,
   Redo2,
@@ -37,6 +40,7 @@ import type {
   WorkspaceDirectory,
 } from '../types';
 import {
+  computeNoteFilePath,
   detectUnlinkedPeopleInText,
   folderSegment,
   formatPersonMention,
@@ -49,15 +53,20 @@ import {
   parseNoteItems,
   removeLabelFromNote,
   resolveKnownPersonName,
-  slugify,
 } from '../utils/markdown';
 import {
+  createAttachmentChipElement,
   createImageBlockElement,
   domToMarkdown,
   markdownToHtml,
   sanitizePastedHtml,
 } from '../utils/docSerializer';
-import { resolveImageSrc, saveBlobAsImageAsset } from '../utils/imageStore';
+import {
+  createAssetObjectUrl,
+  resolveImageSrc,
+  saveBlobAsFileAsset,
+  saveBlobAsImageAsset,
+} from '../utils/imageStore';
 import { type ParsedSharedNote, parseSharedMarkdownNote } from '../utils/noteShare';
 import { NOTE_TEMPLATES } from '../utils/seedData';
 import type {
@@ -396,20 +405,19 @@ function isGenericClipboardImageName(name: string): boolean {
   return !trimmed || /^(?:image|blob|clipboard|pasted[-_ ]?image)(?:\.[a-z0-9]+)?$/i.test(trimmed);
 }
 
-function extractImageFilesFromDataTransfer(
+function extractFilesFromDataTransfer(
   dt: DataTransfer | null,
-  options?: { fromClipboard?: boolean }
+  options?: { fromClipboard?: boolean; imagesOnly?: boolean }
 ): File[] {
   if (!dt) return [];
   const files: File[] = [];
   const seen = new Set<string>();
+  const imagesOnly = Boolean(options?.imagesOnly);
 
-  // 1. Read dt.files first; do NOT also iterate dt.items when dt.files already yielded images,
-  // because Chromium synthesizes a new File with a fresh lastModified timestamp on each call.
   if (dt.files && dt.files.length > 0) {
     for (let i = 0; i < dt.files.length; i++) {
       const f = dt.files[i];
-      if (f.type.startsWith('image/')) {
+      if (!imagesOnly || f.type.startsWith('image/')) {
         const sig = `${f.name}:${f.size}:${f.type}`;
         if (!seen.has(sig)) {
           seen.add(sig);
@@ -419,11 +427,10 @@ function extractImageFilesFromDataTransfer(
     }
   }
 
-  // 2. Fallback to dt.items ONLY if dt.files yielded zero image files
   if (files.length === 0 && dt.items && dt.items.length > 0) {
     for (let i = 0; i < dt.items.length; i++) {
       const item = dt.items[i];
-      if (item.kind === 'file' && item.type.startsWith('image/')) {
+      if (item.kind === 'file' && (!imagesOnly || item.type.startsWith('image/'))) {
         const f = item.getAsFile();
         if (f) {
           const sig = `${f.name}:${f.size}:${f.type}`;
@@ -436,8 +443,6 @@ function extractImageFilesFromDataTransfer(
     }
   }
 
-  // 3. On clipboard paste, OS clipboards often expose multiple MIME representations (e.g. PNG + BMP/JPEG,
-  // or a real file alongside a synthesized "image.png" bitmap) for a single copied image.
   if (options?.fromClipboard && files.length > 1) {
     const namedFiles = files.filter((f) => !isGenericClipboardImageName(f.name));
     if (namedFiles.length > 0) {
@@ -713,6 +718,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const rawTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [previewAttachment, setPreviewAttachment] = useState<{
+    name: string;
+    src: string;
+    objectUrl: string;
+    isPdf: boolean;
+  } | null>(null);
   const savedInsertRangeRef = useRef<Range | null>(null);
   const suppressImageClickUntilRef = useRef<number>(0);
   const lastSyncedNoteIdRef = useRef<string>('');
@@ -859,7 +871,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     const externalBodyChanged = note.body !== lastEmittedMarkdownRef.current;
 
     if (noteChanged || externalBodyChanged || el.innerHTML === '') {
-      el.innerHTML = markdownToHtml(note.body, directory.people);
+      el.innerHTML = markdownToHtml(note.body, directory.people, note.id);
       lastSyncedNoteIdRef.current = note.id;
       lastEmittedMarkdownRef.current = note.body;
       syncEmptyAttr();
@@ -1499,9 +1511,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const insertImageFiles = useCallback(
     async (files: File[], explicitRange?: Range | null) => {
       if (files.length === 0) return;
+      const currentNoteId = noteRef.current.id;
       const uploaded = await Promise.all(
         files.map(async (file) => {
-          const { assetPath } = await saveBlobAsImageAsset(file);
+          const { assetPath } = await saveBlobAsImageAsset(file, undefined, currentNoteId);
           const alt = cleanImageLabelFromFile(file);
           return { assetPath, alt };
         })
@@ -1534,6 +1547,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         createImageBlockElement({
           src: u.assetPath,
           alt: u.alt,
+          noteId: currentNoteId,
         })
       );
       insertImageBlocksAtRange(figures, explicitRange);
@@ -1541,10 +1555,123 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     [insertImageBlocksAtRange, patchNote, rawMode, syncRawSelectionBefore]
   );
 
+  const insertAttachmentFiles = useCallback(
+    async (files: File[], explicitRange?: Range | null) => {
+      if (files.length === 0) return;
+      const currentNoteId = noteRef.current.id;
+      const uploaded = await Promise.all(
+        files.map(async (file) => {
+          const { assetPath, fileName } = await saveBlobAsFileAsset(file, {
+            noteId: currentNoteId,
+            filename: file.name,
+          });
+          return { assetPath, fileName };
+        })
+      );
+
+      if (rawMode) {
+        syncRawSelectionBefore();
+        const mdSnippet = uploaded.map((u) => `[${u.fileName}](${u.assetPath})`).join(' ');
+        const ta = rawTextareaRef.current;
+        const currentBody = noteRef.current.body;
+        if (ta) {
+          const start = ta.selectionStart ?? currentBody.length;
+          const end = ta.selectionEnd ?? start;
+          const before = currentBody.slice(0, start);
+          const after = currentBody.slice(end);
+          const sepBefore = before.length > 0 && !/[\s\n]$/.test(before) ? ' ' : '';
+          const sepAfter = after.length > 0 && !/^[\s\n]/.test(after) ? ' ' : '';
+          const updated = `${before}${sepBefore}${mdSnippet}${sepAfter}${after}`;
+          lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+          patchNote({ body: updated }, { label: 'Attach file', coalesceKey: null });
+        } else {
+          const updated = currentBody.trim() ? `${currentBody.trim()}\n\n${mdSnippet}\n` : `${mdSnippet}\n`;
+          lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+          patchNote({ body: updated }, { label: 'Attach file', coalesceKey: null });
+        }
+        return;
+      }
+
+      const root = docRef.current;
+      if (!root) return;
+      recordPreEditSelection();
+
+      let range = explicitRange;
+      if (!range || !root.contains(range.commonAncestorContainer)) {
+        range = captureCurrentDocRange();
+      }
+      if (!range || !root.contains(range.commonAncestorContainer)) {
+        const lastBlock = root.lastElementChild as HTMLElement | null;
+        if (lastBlock) {
+          range = document.createRange();
+          range.selectNodeContents(lastBlock);
+          range.collapse(false);
+        } else {
+          const p = document.createElement('p');
+          p.innerHTML = '<br>';
+          root.appendChild(p);
+          range = document.createRange();
+          range.setStart(p, 0);
+          range.collapse(true);
+        }
+      }
+
+      range.deleteContents();
+      const frag = document.createDocumentFragment();
+      let lastInserted: Node | null = null;
+      uploaded.forEach((u, idx) => {
+        if (idx > 0) {
+          frag.appendChild(document.createTextNode(' '));
+        }
+        const chip = createAttachmentChipElement(u.fileName, u.assetPath);
+        frag.appendChild(chip);
+        const space = document.createTextNode('\u00A0');
+        frag.appendChild(space);
+        lastInserted = space;
+      });
+      range.insertNode(frag);
+
+      if (lastInserted) {
+        const afterRange = document.createRange();
+        afterRange.setStartAfter(lastInserted);
+        afterRange.collapse(true);
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(afterRange);
+      }
+
+      root.focus();
+      emitMarkdownFromDom({ label: 'Attach file', coalesceKey: null });
+      refreshSelectionToolbarState();
+    },
+    [captureCurrentDocRange, emitMarkdownFromDom, patchNote, rawMode, recordPreEditSelection, refreshSelectionToolbarState, syncRawSelectionBefore]
+  );
+
+  const insertAttachedFiles = useCallback(
+    async (files: File[], explicitRange?: Range | null) => {
+      if (files.length === 0) return;
+      const imageFiles = files.filter((f) => f.type.startsWith('image/'));
+      const otherFiles = files.filter((f) => !f.type.startsWith('image/'));
+      if (imageFiles.length > 0) {
+        await insertImageFiles(imageFiles, explicitRange);
+      }
+      if (otherFiles.length > 0) {
+        await insertAttachmentFiles(otherFiles, imageFiles.length > 0 ? null : explicitRange);
+      }
+    },
+    [insertAttachmentFiles, insertImageFiles]
+  );
+
   const handleTriggerImageUpload = () => {
     savedInsertRangeRef.current = captureCurrentDocRange();
     setShowInsertMenu(false);
     imageInputRef.current?.click();
+  };
+
+  const handleTriggerFileUpload = () => {
+    savedInsertRangeRef.current = captureCurrentDocRange();
+    setShowInsertMenu(false);
+    fileInputRef.current?.click();
   };
 
   const openLightboxForElement = useCallback((targetEl: HTMLElement) => {
@@ -1569,7 +1696,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         imgEl.getAttribute('data-src') ||
         imgEl.getAttribute('src') ||
         '';
-      const resolvedSrc = resolveImageSrc(rawSrc) || imgEl.currentSrc || imgEl.src;
+      const resolvedSrc = resolveImageSrc(rawSrc, noteRef.current.id) || imgEl.currentSrc || imgEl.src;
       if (!resolvedSrc) return;
       const alt =
         fig?.getAttribute('data-alt') || imgEl.getAttribute('alt') || 'Pasted image';
@@ -1836,6 +1963,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       const dueStr = new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10);
       const commands = [
         { id: 'image', label: '/image — Upload or insert image', sub: 'Resizable image', replacement: '__INSERT_IMAGE__', tokenValue: '' },
+        { id: 'file', label: '/file — Attach PDF or document', sub: 'Saved in note assets/', replacement: '__INSERT_FILE__', tokenValue: '' },
         { id: 'task', label: '/task — Action item checkbox', sub: 'Checklist task', replacement: '__BLOCK_TASK__', tokenValue: '' },
         { id: 'decision', label: '/decision — Agreed decision', sub: 'Decision record', replacement: '__BLOCK_DECISION__', tokenValue: '' },
         { id: 'proposed', label: '/proposed — Proposed decision', sub: 'Proposed status', replacement: '__BLOCK_PROPOSED__', tokenValue: '' },
@@ -1969,7 +2097,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
-    if (item.replacement === '__INSERT_IMAGE__') {
+    if (item.replacement === '__INSERT_IMAGE__' || item.replacement === '__INSERT_FILE__') {
+      const isFile = item.replacement === '__INSERT_FILE__';
       if (autocomplete.textNode && docRef.current?.contains(autocomplete.textNode)) {
         const r = document.createRange();
         r.setStart(autocomplete.textNode, autocomplete.tokenStart);
@@ -1985,7 +2114,11 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         emitMarkdownFromDom({ label: 'Slash command', coalesceKey: null });
       }
       setAutocomplete(null);
-      imageInputRef.current?.click();
+      if (isFile) {
+        fileInputRef.current?.click();
+      } else {
+        imageInputRef.current?.click();
+      }
       return;
     }
 
@@ -3098,6 +3231,27 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
+    const attachmentEl = target.closest('.doc-attachment') as HTMLElement | null;
+    if (attachmentEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      const src = attachmentEl.getAttribute('data-attachment-src') || '';
+      const name = attachmentEl.getAttribute('data-attachment-name') || src.split('/').pop() || 'attachment';
+      const objUrl = createAssetObjectUrl(src, noteRef.current.id);
+      if (objUrl) {
+        setPreviewAttachment((prev) => {
+          if (prev?.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+          return {
+            name,
+            src,
+            objectUrl: objUrl,
+            isPdf: name.toLowerCase().endsWith('.pdf'),
+          };
+        });
+      }
+      return;
+    }
+
     const clickedImg = target.closest('img') as HTMLImageElement | null;
     if (clickedImg && docRef.current?.contains(clickedImg)) {
       if (performance.now() < suppressImageClickUntilRef.current) return;
@@ -3134,13 +3288,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     const htmlData = e.clipboardData.getData('text/html');
     const plainData = e.clipboardData.getData('text/plain');
-    const imageFiles = extractImageFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
+    const pastedFiles = extractFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
 
-    // Direct clipboard image paste (screenshots, copied browser images, or copied image files)
-    if (imageFiles.length > 0 && (!htmlData || htmlContainsOnlyImageOrEmpty(htmlData))) {
+    // Direct clipboard file/image paste (screenshots, copied browser images, or copied files)
+    if (pastedFiles.length > 0 && (!htmlData || htmlContainsOnlyImageOrEmpty(htmlData))) {
       e.preventDefault();
       const capturedRange = captureCurrentDocRange();
-      void insertImageFiles(imageFiles, capturedRange);
+      void insertAttachedFiles(pastedFiles, capturedRange);
       return;
     }
 
@@ -3153,7 +3307,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         return;
       }
       if (sharedNote.kind === 'frontmatter') {
-        const cleanBodyHtml = markdownToHtml(sharedNote.body, directory.people);
+        const cleanBodyHtml = markdownToHtml(sharedNote.body, directory.people, noteRef.current.id);
         if (cleanBodyHtml) {
           const htmlWithMarkers = cleanBodyHtml.replace(
             /<p class="doc-(decision|task)" data-status="([^"]*)">/g,
@@ -3178,7 +3332,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       cleanHtml = sanitizePastedHtml(htmlData, directory.people);
     }
     if (!cleanHtml && plainData) {
-      cleanHtml = markdownToHtml(plainData.replace(/\r\n?/g, '\n'), directory.people);
+      cleanHtml = markdownToHtml(plainData.replace(/\r\n?/g, '\n'), directory.people, noteRef.current.id);
     }
     if (!cleanHtml) return;
 
@@ -3196,17 +3350,17 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   };
 
   const handleRawPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const imageFiles = extractImageFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
+    const pastedFiles = extractFilesFromDataTransfer(e.clipboardData, { fromClipboard: true });
     const htmlData = e.clipboardData.getData('text/html');
     const plainData = e.clipboardData.getData('text/plain');
 
     if (
-      imageFiles.length > 0 &&
+      pastedFiles.length > 0 &&
       !plainData.trim() &&
       (!htmlData || htmlContainsOnlyImageOrEmpty(htmlData))
     ) {
       e.preventDefault();
-      void insertImageFiles(imageFiles, null);
+      void insertAttachedFiles(pastedFiles, null);
       return;
     }
 
@@ -3235,8 +3389,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
   const handleSheetDrop = (e: React.DragEvent<HTMLDivElement>) => {
     setIsDragOverPage(false);
-    const imageFiles = extractImageFilesFromDataTransfer(e.dataTransfer);
-    if (imageFiles.length === 0) return;
+    const droppedFiles = extractFilesFromDataTransfer(e.dataTransfer);
+    if (droppedFiles.length === 0) return;
 
     e.preventDefault();
     e.stopPropagation();
@@ -3253,7 +3407,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         dropRange = candidate;
       }
     }
-    void insertImageFiles(imageFiles, dropRange ?? captureCurrentDocRange());
+    void insertAttachedFiles(droppedFiles, dropRange ?? captureCurrentDocRange());
   };
 
   const scopeSelectValue =
@@ -3474,6 +3628,14 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 >
                   <ImageIcon size={13} />
                   <span>Upload Image… (or Paste)</span>
+                </button>
+                <button
+                  type="button"
+                  className="doc-insert-item"
+                  onClick={handleTriggerFileUpload}
+                >
+                  <Paperclip size={13} />
+                  <span>Attach File (PDF, Doc…)</span>
                 </button>
                 <div className="doc-insert-divider" />
                 <div className="doc-insert-section-title">Page Templates</div>
@@ -4121,8 +4283,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         <div className="word-page-footer no-print">
           <span>
             <FolderKanban size={12} style={{ verticalAlign: '-2px', marginRight: 5 }} />
-            {note.filePath ||
-              `${note.scope === 'inbox' ? 'Inbox' : note.scope === 'internal' ? 'Internal' : 'Clients'}/${note.date}-${slugify(note.title || 'untitled')}.md`}
+            {computeNoteFilePath(note, directory)}
           </span>
           <span>
             {parsedItems.decisions.length} decision(s) · {parsedItems.tasks.length} task(s)
@@ -4144,6 +4305,23 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             const savedRange = savedInsertRangeRef.current;
             savedInsertRangeRef.current = null;
             void insertImageFiles(files, savedRange);
+          }
+        }}
+      />
+
+      {/* Hidden File Input for General File Attachments (/file, Insert Menu) */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => {
+          const files = Array.from(e.target.files || []);
+          e.target.value = '';
+          if (files.length > 0) {
+            const savedRange = savedInsertRangeRef.current;
+            savedInsertRangeRef.current = null;
+            void insertAttachedFiles(files, savedRange);
           }
         }}
       />
@@ -4298,6 +4476,84 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           initialIndex={lightbox.index}
           onClose={() => setLightbox(null)}
         />
+      )}
+
+      {/* Attachment Preview Modal (PDF inline preview + Download) */}
+      {previewAttachment && (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            URL.revokeObjectURL(previewAttachment.objectUrl);
+            setPreviewAttachment(null);
+          }}
+        >
+          <div
+            className="modal-dialog attachment-preview-modal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <FileText size={16} />
+                <strong style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {previewAttachment.name}
+                </strong>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <a
+                  href={previewAttachment.objectUrl}
+                  download={previewAttachment.name}
+                  className="btn btn-xs"
+                  title="Download file"
+                >
+                  <Download size={13} /> Download
+                </a>
+                <a
+                  href={previewAttachment.objectUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn btn-xs"
+                  title="Open in new tab"
+                >
+                  <ExternalLink size={13} /> Open
+                </a>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={() => {
+                    URL.revokeObjectURL(previewAttachment.objectUrl);
+                    setPreviewAttachment(null);
+                  }}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+            </div>
+            <div className="modal-body" style={{ padding: 0, flex: 1, minHeight: 0 }}>
+              {previewAttachment.isPdf ? (
+                <iframe
+                  src={previewAttachment.objectUrl}
+                  title={previewAttachment.name}
+                  className="attachment-preview-frame"
+                />
+              ) : (
+                <div className="attachment-preview-fallback">
+                  <FileText size={40} style={{ opacity: 0.45 }} />
+                  <p style={{ margin: '8px 0 4px', fontWeight: 600 }}>{previewAttachment.name}</p>
+                  <p className="muted" style={{ fontSize: 12, marginBottom: 14 }}>
+                    Stored in <code>{previewAttachment.src}</code>
+                  </p>
+                  <a
+                    href={previewAttachment.objectUrl}
+                    download={previewAttachment.name}
+                    className="btn btn-primary"
+                  >
+                    <Download size={14} /> Download File
+                  </a>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

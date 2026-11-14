@@ -6,6 +6,7 @@ import {
   extractReferencedAssetPaths,
   getCachedAssetDataUrl,
   mimeFromFilename,
+  saveBlobAsFileAsset,
   saveBlobAsImageAsset,
 } from './imageStore';
 import {
@@ -376,6 +377,68 @@ export async function removeNestedFileIfExists(root: FsDirectoryHandle, relative
   }
 }
 
+function getNoteBundleDir(relativePath?: string): string | null {
+  if (!relativePath) return null;
+  const parts = relativePath.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  const fileName = parts[parts.length - 1];
+  const parentDir = parts[parts.length - 2];
+  const stem = fileName.replace(/\.md$/i, '').replace(/\s*\(\d+\)$/, '');
+  const cleanParent = parentDir.replace(/\s*\(\d+\)$/, '');
+  if (stem && cleanParent.toLowerCase() === stem.toLowerCase()) {
+    return parts.slice(0, -1).join('/');
+  }
+  return null;
+}
+
+export async function removeNestedDirIfExists(root: FsDirectoryHandle, dirPath?: string | null): Promise<void> {
+  if (!dirPath) return;
+  try {
+    const parts = dirPath.split('/').filter(Boolean);
+    const dirName = parts.pop();
+    if (!dirName) return;
+    let dir = root;
+    for (const part of parts) {
+      dir = await getSafeDirectoryHandle(dir, part, false);
+    }
+    await dir.removeEntry(dirName, { recursive: true });
+  } catch {
+    // Ignore if directory was already moved/deleted
+  }
+}
+
+async function hydrateNoteFolderAssets(
+  root: FsDirectoryHandle,
+  noteDirPath: string,
+  noteId: string
+): Promise<void> {
+  try {
+    const parts = noteDirPath.split('/').filter(Boolean);
+    let noteDir = root;
+    for (const part of parts) {
+      noteDir = await getSafeDirectoryHandle(noteDir, part, false);
+    }
+    for await (const [dirName, dirEntry] of noteDir.entries()) {
+      if (dirEntry.kind !== 'directory' || !/^assets(?:\s*\(\d+\))?$/i.test(dirName)) continue;
+      for await (const [name, entry] of dirEntry.entries()) {
+        if (entry.kind !== 'file' || name.startsWith('.')) continue;
+        const cleanAssetName = name.replace(/\s*\(\d+\)(\.[^.]+)$/i, '$1');
+        const assetKey = `assets/${cleanAssetName}`;
+        if (!getCachedAssetDataUrl(assetKey, noteId)) {
+          const file = await entry.getFile();
+          await saveBlobAsFileAsset(file, {
+            noteId,
+            filename: cleanAssetName,
+            explicitPath: assetKey,
+          });
+        }
+      }
+    }
+  } catch {
+    // No per-note assets folder on disk yet
+  }
+}
+
 export async function writeNoteToFolder(
   root: FsDirectoryHandle,
   note: Note,
@@ -384,8 +447,11 @@ export async function writeNoteToFolder(
   options?: { skipIfContentMatches?: string }
 ): Promise<string> {
   const nextPath = computeNoteFilePath(note, directory);
-  if (previousPath && previousPath !== nextPath) {
-    await removeNestedFileIfExists(root, previousPath);
+  const nextBundleDir = getNoteBundleDir(nextPath);
+  const prevBundleDir = getNoteBundleDir(previousPath);
+
+  if (prevBundleDir && prevBundleDir !== nextBundleDir) {
+    await hydrateNoteFolderAssets(root, prevBundleDir, note.id);
   }
 
   const serialized = serializeNoteToMarkdown(note, directory);
@@ -401,21 +467,29 @@ export async function writeNoteToFolder(
     await writable.close();
   }
 
-  // Persist any referenced pasted images into root/assets/... (skip if already on disk)
+  // Persist any referenced images/files into <noteBundleDir>/assets/... (skip if already on disk)
   const referencedAssets = extractReferencedAssetPaths(note.body);
   for (const assetPath of referencedAssets) {
-    const dataUrl = getCachedAssetDataUrl(assetPath);
+    const dataUrl = getCachedAssetDataUrl(assetPath, note.id);
     if (!dataUrl) continue;
+    const diskAssetPath = nextBundleDir ? `${nextBundleDir}/${assetPath}` : assetPath;
     try {
-      const alreadyExists = await fileExistsInFolder(root, assetPath);
+      const alreadyExists = await fileExistsInFolder(root, diskAssetPath);
       if (!alreadyExists) {
-        const assetHandle = await ensureNestedFile(root, assetPath);
+        const assetHandle = await ensureNestedFile(root, diskAssetPath);
         const assetWritable = await assetHandle.createWritable();
         await assetWritable.write(dataUrlToBlob(dataUrl));
         await assetWritable.close();
       }
     } catch {
       // Ignore individual asset sync error
+    }
+  }
+
+  if (previousPath && previousPath !== nextPath) {
+    await removeNestedFileIfExists(root, previousPath);
+    if (prevBundleDir && prevBundleDir !== nextBundleDir) {
+      await removeNestedDirIfExists(root, prevBundleDir);
     }
   }
 
@@ -774,6 +848,11 @@ export async function syncWorkspaceWithFolder(
       existingPaths.push({ path: df.path, text: df.text });
       diskPathsByNoteId.set(normalizedDiskNote.id, existingPaths);
 
+      const dfBundleDir = getNoteBundleDir(df.path);
+      if (dfBundleDir) {
+        await hydrateNoteFolderAssets(root, dfBundleDir, normalizedDiskNote.id);
+      }
+
       // Check tombstone
       const deletedAt = mergedTombstones.notes[normalizedDiskNote.id];
       if (deletedAt && new Date(deletedAt).getTime() >= new Date(normalizedDiskNote.updatedAt).getTime()) {
@@ -848,7 +927,12 @@ export async function syncWorkspaceWithFolder(
     for (const [noteId, paths] of diskPathsByNoteId.entries()) {
       if (!byId.has(noteId)) {
         for (const p of paths) {
-          await removeNestedFileIfExists(root, p.path);
+          const bundleDir = getNoteBundleDir(p.path);
+          if (bundleDir) {
+            await removeNestedDirIfExists(root, bundleDir);
+          } else {
+            await removeNestedFileIfExists(root, p.path);
+          }
         }
       }
     }
@@ -867,10 +951,16 @@ export async function syncWorkspaceWithFolder(
         skipIfContentMatches: matchingCanonicalEntry?.text,
       });
 
-      // Remove any duplicate or old-slug files on disk for this same note ID
+      // Remove any duplicate or old-slug files/folders on disk for this same note ID
+      const newBundleDir = getNoteBundleDir(filePath);
       for (const entry of diskEntries) {
         if (entry.path !== filePath) {
-          await removeNestedFileIfExists(root, entry.path);
+          const oldBundleDir = getNoteBundleDir(entry.path);
+          if (oldBundleDir && oldBundleDir !== newBundleDir) {
+            await removeNestedDirIfExists(root, oldBundleDir);
+          } else {
+            await removeNestedFileIfExists(root, entry.path);
+          }
         }
       }
 
@@ -896,7 +986,7 @@ export async function syncWorkspaceWithFolder(
 }
 
 /**
- * Exports the entire workspace (including pasted note images) as a clean .zip mirroring the OneDrive/Google Drive folder layout.
+ * Exports the entire workspace (including per-note assets & attachments) as a clean .zip mirroring the folder layout.
  */
 export async function exportWorkspaceZip(notes: Note[], directory: WorkspaceDirectory): Promise<void> {
   const zip = new JSZip();
@@ -919,13 +1009,15 @@ export async function exportWorkspaceZip(notes: Note[], directory: WorkspaceDire
   for (const note of notes) {
     const path = computeNoteFilePath(note, directory);
     zip.file(path, serializeNoteToMarkdown(note, directory));
+    const noteBundleDir = getNoteBundleDir(path);
 
     for (const assetPath of extractReferencedAssetPaths(note.body)) {
-      if (bundledAssets.has(assetPath)) continue;
-      const dataUrl = getCachedAssetDataUrl(assetPath);
+      const zipAssetPath = noteBundleDir ? `${noteBundleDir}/${assetPath}` : assetPath;
+      if (bundledAssets.has(zipAssetPath)) continue;
+      const dataUrl = getCachedAssetDataUrl(assetPath, note.id);
       if (dataUrl) {
-        zip.file(assetPath, dataUrlToBlob(dataUrl));
-        bundledAssets.add(assetPath);
+        zip.file(zipAssetPath, dataUrlToBlob(dataUrl));
+        bundledAssets.add(zipAssetPath);
       }
     }
   }
@@ -940,7 +1032,7 @@ export async function exportWorkspaceZip(notes: Note[], directory: WorkspaceDire
 }
 
 /**
- * Imports either .md files or a .zip workspace archive (including assets/ images).
+ * Imports either .md files or a .zip workspace archive (including per-note assets/).
  */
 export async function importFilesIntoWorkspace(
   files: FileList,
@@ -1001,14 +1093,28 @@ export async function importFilesIntoWorkspace(
         }
       }
 
-      // Hydrate image assets from zip BEFORE parsing markdown notes
+      // Collect asset entries from zip (both legacy root assets/ and per-note <bundle>/assets/)
+      const zipAssetsByDir = new Map<string, Array<{ assetPath: string; entry: JSZip.JSZipObject }>>();
       for (const [relPath, entry] of Object.entries(zip.files)) {
         if (entry.dir) continue;
-        const assetMatch = relPath.match(/(?:^|\/)(assets\/[^/]+\.(?:png|jpe?g|webp|gif|svg|bmp|avif))$/i);
-        if (assetMatch) {
+        const normRel = relPath.replace(/^\/+/, '');
+        const assetIdx = normRel.lastIndexOf('assets/');
+        if (assetIdx === -1) continue;
+        const assetPath = normRel.slice(assetIdx);
+        if (!/^assets\/[^/]+$/i.test(assetPath)) continue;
+        const parentDir = normRel.slice(0, assetIdx).replace(/\/+$/, '');
+        if (!parentDir) {
+          // Legacy root assets/
           const rawBlob = await entry.async('blob');
-          const typedBlob = new Blob([rawBlob], { type: mimeFromFilename(assetMatch[1]) });
-          await saveBlobAsImageAsset(typedBlob, assetMatch[1]);
+          const typedBlob = new Blob([rawBlob], { type: mimeFromFilename(assetPath) });
+          await saveBlobAsFileAsset(typedBlob, {
+            filename: assetPath.replace(/^assets\//, ''),
+            explicitPath: assetPath,
+          });
+        } else {
+          const list = zipAssetsByDir.get(parentDir) || [];
+          list.push({ assetPath, entry });
+          zipAssetsByDir.set(parentDir, list);
         }
       }
 
@@ -1016,6 +1122,21 @@ export async function importFilesIntoWorkspace(
         if (entry.dir || !relPath.toLowerCase().endsWith('.md')) continue;
         const mdText = await entry.async('string');
         const parsed = parseMarkdownToNote(mdText, relPath, directory);
+        const normRel = relPath.replace(/^\/+/, '');
+        const lastSlash = normRel.lastIndexOf('/');
+        const noteParentDir = lastSlash !== -1 ? normRel.slice(0, lastSlash) : '';
+        const folderAssets = noteParentDir ? zipAssetsByDir.get(noteParentDir) : undefined;
+        if (folderAssets) {
+          for (const fa of folderAssets) {
+            const rawBlob = await fa.entry.async('blob');
+            const typedBlob = new Blob([rawBlob], { type: mimeFromFilename(fa.assetPath) });
+            await saveBlobAsFileAsset(typedBlob, {
+              noteId: parsed.note.id,
+              filename: fa.assetPath.replace(/^assets\//, ''),
+              explicitPath: fa.assetPath,
+            });
+          }
+        }
         directory = {
           ...directory,
           clients: [...directory.clients, ...parsed.newClients],

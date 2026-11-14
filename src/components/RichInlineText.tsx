@@ -1,13 +1,14 @@
 import React, { useMemo } from 'react';
 import type { Client, Note, Person } from '../types';
 import { parseAltAndWidth } from '../utils/docSerializer';
-import { resolveImageSrc } from '../utils/imageStore';
+import { createAssetObjectUrl, resolveImageSrc } from '../utils/imageStore';
 
 export interface RichInlineTextProps {
   text: string;
   people: Person[];
   clients: Client[];
   notes: Note[];
+  noteId?: string;
   onClickPerson?: (personName: string) => void;
   onClickLabel?: (label: string) => void;
   onClickNoteLink?: (noteTitle: string) => void;
@@ -18,6 +19,7 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
   people,
   clients,
   notes,
+  noteId,
   onClickPerson,
   onClickLabel,
   onClickNoteLink,
@@ -35,7 +37,7 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
       '`[^`\\n]+`', // `inline code`
       '!\\[[^\\]]*\\]\\([^)\\n]+\\)', // ![alt|width](src)
       '\\[\\[[^\\]]+\\]\\]', // [[Note Title]] or [[Note Title|Alias]]
-      '\\[[^\\]]+\\]\\((?:https?:\\/\\/|mailto:)[^)\\s]+\\)', // [label](https://...)
+      '\\[[^\\]]+\\]\\((?:https?:\\/\\/|mailto:|(?:\\.\\/|\\.\\.\\/)*assets\\/)[^)\\n]+\\)', // [label](https://... or assets/...)
       '@\\[[^\\]]+\\]', // @[Full Name]
       ...(multiWordAlternation
         ? [`(?<=^|[\\s([{"'])@(?:${multiWordAlternation})(?=$|[\\s,.;:!?)\\]}"'])`]
@@ -128,7 +130,7 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
       const imgMatch = raw.match(/^!\[([^\]]*)\]\(([^)\n]+)\)$/);
       if (imgMatch) {
         const { alt, width } = parseAltAndWidth(imgMatch[1]);
-        const resolved = resolveImageSrc(imgMatch[2].trim());
+        const resolved = resolveImageSrc(imgMatch[2].trim(), noteId);
         const cssWidth = width ? (width.endsWith('%') ? width : `${width}px`) : undefined;
         parts.push(
           <img
@@ -178,20 +180,45 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
         );
       }
     } else if (raw.startsWith('[') && raw.endsWith(')')) {
-      const linkMatch = raw.match(/^\[([^\]]+)\]\(((?:https?:\/\/|mailto:)[^)\s]+)\)$/);
+      const linkMatch = raw.match(/^\[([^\]]+)\]\(([^)\n]+)\)$/);
       if (linkMatch) {
-        parts.push(
-          <a
-            key={key}
-            href={linkMatch[2]}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="rich-md-ext-link"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {renderNested(linkMatch[1])}
-          </a>
-        );
+        const href = linkMatch[2].trim();
+        if (/^(?:https?:\/\/|mailto:)/i.test(href)) {
+          parts.push(
+            <a
+              key={key}
+              href={href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="rich-md-ext-link"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {renderNested(linkMatch[1])}
+            </a>
+          );
+        } else {
+          const label = linkMatch[1].trim();
+          const ext = (label.split('.').pop() || 'FILE').toUpperCase().slice(0, 4);
+          parts.push(
+            <button
+              key={key}
+              type="button"
+              className="pill pill-attachment"
+              title={`Open ${label}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                const objUrl = createAssetObjectUrl(href, noteId);
+                if (objUrl) {
+                  window.open(objUrl, '_blank', 'noopener,noreferrer');
+                  setTimeout(() => URL.revokeObjectURL(objUrl), 60_000);
+                }
+              }}
+            >
+              <span className="pill-attachment-badge">{ext}</span>
+              <span>{label}</span>
+            </button>
+          );
+        }
       } else {
         parts.push(raw);
       }
