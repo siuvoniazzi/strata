@@ -3,6 +3,8 @@ import {
   Bold,
   Calendar,
   CheckSquare,
+  ChevronLeft,
+  ChevronRight,
   ClipboardPaste,
   Code2,
   Download,
@@ -115,13 +117,76 @@ interface HybridEditorProps {
 }
 
 type AutocompleteTrigger = {
-  kind: 'person' | 'label' | 'link' | 'slash';
+  kind: 'person' | 'label' | 'link' | 'slash' | 'date';
   query: string;
   tokenStart: number;
   cursorPos: number;
   textNode: Text | null;
   rect: { top: number; left: number };
 };
+
+function toLocalIsoDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function addDaysToDate(base: Date, days: number): Date {
+  const d = new Date(base.getFullYear(), base.getMonth(), base.getDate() + days);
+  return d;
+}
+
+function resolveDateQuery(rawQuery: string): string {
+  const q = rawQuery.trim().toLowerCase();
+  const now = new Date();
+  if (!q || q === 'today' || q === 'heute') return toLocalIsoDate(now);
+  if ('tomorrow'.startsWith(q) || 'morgen'.startsWith(q)) return toLocalIsoDate(addDaysToDate(now, 1));
+  if ('yesterday'.startsWith(q) || 'gestern'.startsWith(q)) return toLocalIsoDate(addDaysToDate(now, -1));
+
+  const relMatch = q.match(/^\+(\d+)([dw])$/);
+  if (relMatch) {
+    const n = Number(relMatch[1]);
+    return toLocalIsoDate(addDaysToDate(now, relMatch[2] === 'w' ? n * 7 : n));
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(q)) {
+    const parsed = Date.parse(`${q}T12:00:00`);
+    if (!Number.isNaN(parsed)) return q;
+  }
+
+  const euMatch = q.match(/^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?$/);
+  if (euMatch) {
+    const day = Number(euMatch[1]);
+    const month = Number(euMatch[2]);
+    let year = euMatch[3] ? Number(euMatch[3]) : now.getFullYear();
+    if (year < 100) year += 2000;
+    const candidate = new Date(year, month - 1, day);
+    if (candidate.getFullYear() === year && candidate.getMonth() === month - 1 && candidate.getDate() === day) {
+      return toLocalIsoDate(candidate);
+    }
+  }
+
+  return toLocalIsoDate(now);
+}
+
+function buildCalendarDays(year: number, month: number, todayIso: string) {
+  const firstOfMonth = new Date(year, month, 1);
+  const startOffset = (firstOfMonth.getDay() + 6) % 7; // Monday = 0
+  const gridStart = new Date(year, month, 1 - startOffset);
+  const cells: Array<{ iso: string; day: number; inMonth: boolean; isToday: boolean }> = [];
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i);
+    const iso = toLocalIsoDate(d);
+    cells.push({
+      iso,
+      day: d.getDate(),
+      inMonth: d.getMonth() === month,
+      isToday: iso === todayIso,
+    });
+  }
+  return cells;
+}
 
 type ActiveTokenPopover = {
   kind: 'person' | 'label' | 'link';
@@ -706,6 +771,10 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const [isDragOverPage, setIsDragOverPage] = useState(false);
 
   const [autocomplete, setAutocomplete] = useState<AutocompleteTrigger | null>(null);
+  const [datePickerView, setDatePickerView] = useState<{ year: number; month: number }>(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() };
+  });
   const [acIndex, setAcIndex] = useState(0);
   const [activeToken, setActiveToken] = useState<ActiveTokenPopover | null>(null);
   const [activeFormat, setActiveFormat] = useState<ActiveFormatState>({
@@ -1804,6 +1873,27 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
+    const dateMatch = uptoCursor.match(/(?:^|[\s(])\/\/([^\s]{0,16})$/);
+    if (dateMatch) {
+      const doubleSlashIdx = uptoCursor.lastIndexOf('//');
+      const resolvedIso = resolveDateQuery(dateMatch[1]);
+      const rd = new Date(`${resolvedIso}T12:00:00`);
+      setDatePickerView({ year: rd.getFullYear(), month: rd.getMonth() });
+      setAutocomplete({
+        kind: 'date',
+        query: dateMatch[1],
+        tokenStart: doubleSlashIdx,
+        cursorPos,
+        textNode,
+        rect: {
+          top: Math.min(window.innerHeight - 310, anchorTop + 6),
+          left: Math.max(12, Math.min(window.innerWidth - 280, anchorLeft)),
+        },
+      });
+      setAcIndex(0);
+      return;
+    }
+
     const slashMatch = uptoCursor.match(/(?:^|\s)\/([a-z0-9-]{0,16})$/i);
     if (slashMatch) {
       const slashIdx = uptoCursor.lastIndexOf('/');
@@ -1881,6 +1971,26 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         rect: popRect,
       });
       setAcIndex(hasLabelMatch ? 0 : -1);
+      return;
+    }
+
+    const dateMatch = uptoCursor.match(/(?:^|[\s(])\/\/([^\s]{0,16})$/);
+    if (dateMatch) {
+      const resolvedIso = resolveDateQuery(dateMatch[1]);
+      const rd = new Date(`${resolvedIso}T12:00:00`);
+      setDatePickerView({ year: rd.getFullYear(), month: rd.getMonth() });
+      setAutocomplete({
+        kind: 'date',
+        query: dateMatch[1],
+        tokenStart: uptoCursor.lastIndexOf('//'),
+        cursorPos,
+        textNode: null,
+        rect: {
+          top: Math.min(window.innerHeight - 310, rect.top + 48),
+          left: Math.max(12, Math.min(window.innerWidth - 280, rect.left + 16)),
+        },
+      });
+      setAcIndex(0);
       return;
     }
 
@@ -2222,6 +2332,73 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     setAutocomplete(null);
     setActiveToken(null);
     emitMarkdownFromDom({ label: tokenLabel, coalesceKey: null });
+  };
+
+  const applyDateSelection = (isoDate: string) => {
+    if (!autocomplete || autocomplete.kind !== 'date') return;
+
+    if (rawMode && rawTextareaRef.current) {
+      syncRawSelectionBefore();
+      const full = note.body;
+      const lineStart = full.lastIndexOf('\n', autocomplete.tokenStart - 1) + 1;
+      const linePrefix = full.slice(lineStart, autocomplete.tokenStart);
+      const isTaskLine = /^\s*[-*+•]\s*\[[ /?xX]\]/.test(linePrefix);
+      const inserted = isTaskLine ? `due:${isoDate} ` : `${isoDate} `;
+      const updated =
+        full.slice(0, autocomplete.tokenStart) + inserted + full.slice(autocomplete.cursorPos);
+      lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+      patchNote({ body: updated }, { label: 'Insert date', coalesceKey: null });
+      setAutocomplete(null);
+      return;
+    }
+
+    const root = docRef.current;
+    if (!root || !autocomplete.textNode || !root.contains(autocomplete.textNode)) {
+      setAutocomplete(null);
+      return;
+    }
+
+    recordPreEditSelection();
+    const blk = findEditableBlock(autocomplete.textNode, root);
+    const isTaskBlock = Boolean(blk?.classList.contains('doc-task'));
+    const tokenText = isTaskBlock ? `due:${isoDate}` : isoDate;
+
+    const delRange = document.createRange();
+    delRange.setStart(autocomplete.textNode, autocomplete.tokenStart);
+    delRange.setEnd(autocomplete.textNode, autocomplete.cursorPos);
+    delRange.deleteContents();
+
+    const sel = window.getSelection();
+    if (sel) {
+      sel.removeAllRanges();
+      sel.addRange(delRange);
+    }
+
+    const span = document.createElement('span');
+    span.className = 'doc-token doc-due';
+    span.textContent = tokenText;
+
+    const endNode = delRange.endContainer;
+    const isAtLineEnd =
+      endNode.nodeType === Node.TEXT_NODE
+        ? delRange.endOffset >= (endNode.nodeValue || '').length &&
+          (!endNode.nextSibling || endNode.nextSibling.nodeName === 'BR')
+        : delRange.endOffset >= endNode.childNodes.length;
+    const trailingSpace = document.createTextNode(isAtLineEnd ? '\u00A0' : ' ');
+    delRange.insertNode(trailingSpace);
+    delRange.insertNode(span);
+
+    if (sel) {
+      const afterRange = document.createRange();
+      afterRange.setStart(trailingSpace, 1);
+      afterRange.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(afterRange);
+    }
+
+    setAutocomplete(null);
+    setActiveToken(null);
+    emitMarkdownFromDom({ label: 'Insert date', coalesceKey: null });
   };
 
   // Auto-convert Markdown prefixes (# , ## , - , 1. , [] , [d] , > ) into live WYSIWYG blocks on Space
@@ -2738,6 +2915,19 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const handleDocKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     const root = docRef.current;
     const sel = window.getSelection();
+
+    if (autocomplete?.kind === 'date') {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setAutocomplete(null);
+        return;
+      }
+      if ((e.key === 'Enter' || (e.key === 'Tab' && !e.shiftKey))) {
+        e.preventDefault();
+        applyDateSelection(resolveDateQuery(autocomplete.query));
+        return;
+      }
+    }
 
     if (autocomplete && autocompleteItems.length > 0) {
       const isAutocompleteAtCaret =
@@ -4121,6 +4311,18 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             onSelect={syncRawSelectionBefore}
             onKeyDown={(e) => {
               syncRawSelectionBefore();
+              if (autocomplete?.kind === 'date') {
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  setAutocomplete(null);
+                  return;
+                }
+                if (e.key === 'Enter' || (e.key === 'Tab' && !e.shiftKey)) {
+                  e.preventDefault();
+                  applyDateSelection(resolveDateQuery(autocomplete.query));
+                  return;
+                }
+              }
               if (autocomplete && autocompleteItems.length > 0) {
                 if (e.key === 'ArrowDown') {
                   e.preventDefault();
@@ -4379,6 +4581,115 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           ))}
         </div>
       )}
+
+      {/* Confluence-style // Date Picker Popover */}
+      {autocomplete?.kind === 'date' && (() => {
+        const now = new Date();
+        const todayIso = toLocalIsoDate(now);
+        const tomorrowIso = toLocalIsoDate(addDaysToDate(now, 1));
+        const nextWeekIso = toLocalIsoDate(addDaysToDate(now, 7));
+        const highlightedIso = resolveDateQuery(autocomplete.query);
+        const calDays = buildCalendarDays(datePickerView.year, datePickerView.month, todayIso);
+        const monthLabel = new Date(datePickerView.year, datePickerView.month, 1).toLocaleDateString(
+          undefined,
+          { month: 'long', year: 'numeric' }
+        );
+
+        const shiftMonth = (delta: number) => {
+          setDatePickerView((prev) => {
+            const d = new Date(prev.year, prev.month + delta, 1);
+            return { year: d.getFullYear(), month: d.getMonth() };
+          });
+        };
+
+        return (
+          <div
+            className="date-picker-popover no-print"
+            style={{ top: autocomplete.rect.top, left: autocomplete.rect.left }}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="date-picker-presets">
+              <button
+                type="button"
+                className={`date-picker-preset ${highlightedIso === todayIso ? 'active' : ''}`}
+                onClick={() => applyDateSelection(todayIso)}
+              >
+                Today
+              </button>
+              <button
+                type="button"
+                className={`date-picker-preset ${highlightedIso === tomorrowIso ? 'active' : ''}`}
+                onClick={() => applyDateSelection(tomorrowIso)}
+              >
+                Tomorrow
+              </button>
+              <button
+                type="button"
+                className={`date-picker-preset ${highlightedIso === nextWeekIso ? 'active' : ''}`}
+                onClick={() => applyDateSelection(nextWeekIso)}
+              >
+                +1 Week
+              </button>
+            </div>
+
+            <div className="date-picker-header">
+              <button
+                type="button"
+                className="btn btn-icon btn-ghost date-picker-nav"
+                onClick={() => shiftMonth(-1)}
+                title="Previous month"
+                aria-label="Previous month"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <span className="date-picker-month">{monthLabel}</span>
+              <button
+                type="button"
+                className="btn btn-icon btn-ghost date-picker-nav"
+                onClick={() => shiftMonth(1)}
+                title="Next month"
+                aria-label="Next month"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+
+            <div className="date-picker-weekdays">
+              {['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'].map((wd) => (
+                <span key={wd}>{wd}</span>
+              ))}
+            </div>
+
+            <div className="date-picker-grid">
+              {calDays.map((cell) => (
+                <button
+                  key={cell.iso}
+                  type="button"
+                  className={[
+                    'date-picker-day',
+                    !cell.inMonth ? 'outside' : '',
+                    cell.isToday ? 'today' : '',
+                    cell.iso === highlightedIso ? 'selected' : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
+                  onClick={() => applyDateSelection(cell.iso)}
+                >
+                  {cell.day}
+                </button>
+              ))}
+            </div>
+
+            <div className="date-picker-footer">
+              <span>
+                <Calendar size={11} /> {highlightedIso}
+              </span>
+              <span>Enter to insert</span>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Paste Outlook / Microsoft Teams Invite Modal */}
       {showInviteModal && (
