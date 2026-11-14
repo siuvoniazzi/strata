@@ -75,6 +75,7 @@ import type {
   PendingSelectionRestore,
 } from '../utils/undoHistory';
 import { ImageLightboxModal, type LightboxImageItem } from './ImageLightboxModal';
+import { PdfCanvasViewer } from './PdfCanvasViewer';
 import { ShareNoteMenu } from './ShareNoteMenu';
 
 const IS_MAC_PLATFORM =
@@ -4488,7 +4489,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           }}
         >
           <div
-            className="modal-dialog attachment-preview-modal"
+            className="modal-card attachment-preview-modal"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="modal-header">
@@ -4518,22 +4519,22 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 </a>
                 <button
                   type="button"
-                  className="icon-btn"
+                  className="btn btn-xs"
+                  aria-label="Close attachment preview"
                   onClick={() => {
                     URL.revokeObjectURL(previewAttachment.objectUrl);
                     setPreviewAttachment(null);
                   }}
                 >
-                  <X size={16} />
+                  <X size={14} />
                 </button>
               </div>
             </div>
             <div className="modal-body" style={{ padding: 0, flex: 1, minHeight: 0 }}>
               {previewAttachment.isPdf ? (
-                <iframe
-                  src={previewAttachment.objectUrl}
-                  title={previewAttachment.name}
-                  className="attachment-preview-frame"
+                <PdfCanvasViewer
+                  url={previewAttachment.objectUrl}
+                  fileName={previewAttachment.name}
                 />
               ) : (
                 <div className="attachment-preview-fallback">
