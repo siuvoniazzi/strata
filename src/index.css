@@ -79,6 +79,7 @@ html:not([data-theme='dark']) {
 }
 
 [data-theme='dark'] {
+  color-scheme: dark;
   --bg-app: hsl(220, 24%, 9%);
   --bg-sidebar: hsl(220, 24%, 11%);
   --bg-surface: hsl(220, 22%, 13%);
@@ -1936,6 +1937,12 @@ textarea {
 .timeline-scroll {
   gap: 10px;
   overflow-x: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.timeline-scroll::-webkit-scrollbar {
+  display: none;
 }
 
 .timeline-prep-strip {
@@ -1959,6 +1966,8 @@ textarea {
   position: relative;
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 100%;
   padding-bottom: 24px;
 }
 
@@ -2089,8 +2098,6 @@ textarea {
   align-items: flex-start;
   gap: 0;
   z-index: 1;
-  will-change: transform, opacity;
-  animation: timelineFlowFromBottom 0.68s cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 .timeline-node-col {
@@ -2099,6 +2106,7 @@ textarea {
   width: 24px;
   padding-top: 21px;
   flex-shrink: 0;
+  animation: timelineNodeAppear 0.35s ease-out 0.62s both;
 }
 
 .timeline-node {
@@ -2120,7 +2128,7 @@ textarea {
   border: 2px solid var(--accent-primary);
   opacity: 0;
   pointer-events: none;
-  animation: timelineNodePulse 0.85s ease-out both;
+  animation: timelineNodePulse 0.9s ease-out both;
 }
 
 .timeline-connector {
@@ -2135,6 +2143,9 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  will-change: transform, opacity;
+  animation: timelineFlowFromBottom 1.05s cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation-delay: inherit;
 }
 
 .timeline-point-meta {
@@ -2168,7 +2179,7 @@ textarea {
   flex-direction: column;
   gap: 7px;
   transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
-  animation: timelineCardArrive 1.1s ease-out both;
+  animation: timelineCardArrive 1.4s ease-out both;
 }
 
 .timeline-note-card:hover {
@@ -2254,11 +2265,14 @@ textarea {
 @keyframes timelineFlowFromBottom {
   0% {
     opacity: 0;
-    transform: translateY(min(58vh, 440px)) scale(0.92);
+    transform: translateY(88vh) scale(0.93);
   }
-  65% {
+  14% {
     opacity: 1;
-    transform: translateY(-5px) scale(1.01);
+  }
+  78% {
+    opacity: 1;
+    transform: translateY(-4px) scale(1.01);
   }
   100% {
     opacity: 1;
@@ -2266,21 +2280,33 @@ textarea {
   }
 }
 
+@keyframes timelineNodeAppear {
+  0% {
+    opacity: 0;
+    transform: scale(0.5);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
 @keyframes timelineNodePulse {
   0% {
-    opacity: 0.8;
+    opacity: 0.85;
     transform: scale(0.75);
   }
   100% {
     opacity: 0;
-    transform: scale(2.5);
+    transform: scale(2.6);
   }
 }
 
 @keyframes timelineCardArrive {
-  0% {
+  0%,
+  55% {
     border-color: var(--accent-primary);
-    box-shadow: 0 0 0 2px var(--accent-soft), var(--shadow-sm);
+    box-shadow: 0 0 0 2px var(--accent-soft), var(--shadow-md);
   }
   100% {
     border-color: var(--border-subtle);
@@ -2289,7 +2315,8 @@ textarea {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .timeline-entry,
+  .timeline-entry-body,
+  .timeline-node-col,
   .timeline-node-ring,
   .timeline-note-card {
     animation: none !important;

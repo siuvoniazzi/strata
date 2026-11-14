@@ -372,11 +372,15 @@ export const ContextTimeline: React.FC<ContextTimelineProps> = ({
                           style={{ animationDelay: `${Math.min(idx, 10) * 55}ms` }}
                         >
                           {/* Reference point on the vertical timeline spine */}
-                          <div className="timeline-node-col" aria-hidden="true">
+                          <div
+                            className="timeline-node-col"
+                            style={{ animationDelay: `${Math.min(idx, 10) * 55 + 620}ms` }}
+                            aria-hidden="true"
+                          >
                             <span className="timeline-node">
                               <span
                                 className="timeline-node-ring"
-                                style={{ animationDelay: `${Math.min(idx, 10) * 55 + 380}ms` }}
+                                style={{ animationDelay: `${Math.min(idx, 10) * 55 + 720}ms` }}
                               />
                             </span>
                             <span className="timeline-connector" />
