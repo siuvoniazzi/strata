@@ -23,6 +23,7 @@ import type {
 import { extractInlineMentions, getAllNoteLabels } from '../utils/markdown';
 import { ReportsView } from './ReportsView';
 import { RichMarkdown } from './RichMarkdown';
+import { ShareNoteMenu } from './ShareNoteMenu';
 
 export type OverlayEntry =
   | {
@@ -60,6 +61,7 @@ export interface WorkspaceOverlayProps {
   allLabels: string[];
   aiConfig: AiConfig;
   suspendEscape?: boolean;
+  onNotify?: (message: string) => void;
   onBack: () => void;
   onClose: () => void;
   onPushEntry: (entry: OverlayEntry) => void;
@@ -91,6 +93,7 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
   allLabels,
   aiConfig,
   suspendEscape = false,
+  onNotify,
   onBack,
   onClose,
   onPushEntry,
@@ -227,6 +230,11 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
                     Open in Editor
                   </button>
                 )}
+                <ShareNoteMenu
+                  note={targetNote}
+                  directory={directory}
+                  onNotify={onNotify}
+                />
                 <button
                   type="button"
                   className="btn btn-xs btn-ghost desktop-only"

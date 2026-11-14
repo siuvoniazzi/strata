@@ -88,6 +88,13 @@ import {
   saveGoogleDriveConfig,
 } from './utils/googleDriveSync';
 import { hydrateImagesFromIdb } from './utils/imageStore';
+import {
+  copyTextToClipboard,
+  loadShareIncludeMetadataPreference,
+  serializeNoteForShare,
+  shareNoteViaEmail,
+  shareNoteViaWhatsApp,
+} from './utils/noteShare';
 import { loadWorkspacePreferences } from './utils/preferences';
 import {
   computeNoteFilePath,
@@ -3270,6 +3277,7 @@ export function App() {
                   document.getElementById('radar-ask-input')?.focus();
                 }, 40);
               }}
+              onNotify={(msg) => showToastMessage(msg, null)}
               canUndo={historyUi.canUndoNote}
               canRedo={historyUi.canRedoNote}
               undoLabel={historyUi.noteUndoLabel}
@@ -3517,6 +3525,7 @@ export function App() {
           allLabels={allWorkspaceLabels}
           aiConfig={aiConfig}
           suspendEscape={showCommandPalette || showAiStructure || showAiSettings || showSyncModal}
+          onNotify={(msg) => showToastMessage(msg, null)}
           onBack={popOverlay}
           onClose={closeOverlay}
           onPushEntry={pushOverlay}
@@ -3679,6 +3688,40 @@ export function App() {
           onNewNote={handleSpinUpNote}
           onToggleFocusMode={handleToggleFocusMode}
           onOpenSettings={() => setShowAiSettings(true)}
+          onShareEmail={() => {
+            const includeMetadata = loadShareIncludeMetadataPreference();
+            void shareNoteViaEmail(activeNote, directory, { includeMetadata }).then((res) => {
+              showToastMessage(
+                res.truncated && res.copiedBackup
+                  ? 'Opened Email — full Markdown also copied to clipboard (Ctrl+V)'
+                  : 'Opening Email with Markdown note',
+                null
+              );
+            });
+          }}
+          onShareWhatsApp={() => {
+            const includeMetadata = loadShareIncludeMetadataPreference();
+            void shareNoteViaWhatsApp(activeNote, directory, { includeMetadata }).then((res) => {
+              showToastMessage(
+                res.truncated && res.copiedBackup
+                  ? 'Opened WhatsApp — full Markdown also copied to clipboard (Ctrl+V)'
+                  : 'Opened WhatsApp with Markdown note',
+                null
+              );
+            });
+          }}
+          onCopyNoteMarkdown={() => {
+            const includeMetadata = loadShareIncludeMetadataPreference();
+            const md = serializeNoteForShare(activeNote, directory, { includeMetadata });
+            void copyTextToClipboard(md).then((ok) => {
+              showToastMessage(
+                ok
+                  ? 'Copied note Markdown — paste (Ctrl+V) into another client/account'
+                  : 'Unable to access clipboard',
+                null
+              );
+            });
+          }}
           onDeleteCurrentNote={() => handleDeleteNote(activeNote.id)}
           onSelectNote={openNoteEditor}
           onOpenReportForLabel={(lbl) => {

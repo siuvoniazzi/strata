@@ -2,12 +2,15 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   BarChart3,
   CheckSquare,
+  Copy,
   FilePlus2,
   FileText,
   FolderSync,
   Gavel,
   Hash,
+  Mail,
   Maximize2,
+  MessageCircle,
   Minimize2,
   Moon,
   Redo2,
@@ -44,6 +47,9 @@ interface CommandPaletteProps {
   onNewNote: () => void;
   onToggleFocusMode?: () => void;
   onOpenSettings?: () => void;
+  onShareEmail?: () => void;
+  onShareWhatsApp?: () => void;
+  onCopyNoteMarkdown?: () => void;
   onDeleteCurrentNote: () => void;
   onSelectNote: (noteId: string) => void;
   onOpenReportForLabel: (label: string) => void;
@@ -83,6 +89,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onNewNote,
   onToggleFocusMode,
   onOpenSettings,
+  onShareEmail,
+  onShareWhatsApp,
+  onCopyNoteMarkdown,
   onDeleteCurrentNote,
   onSelectNote,
   onOpenReportForLabel,
@@ -166,6 +175,39 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
               category: 'Quick Action',
               icon: isFocusMode ? <Minimize2 size={14} /> : <Maximize2 size={14} />,
               action: onToggleFocusMode,
+            },
+          ]
+        : []),
+      ...(onShareEmail
+        ? [
+            {
+              id: 'act-share-email',
+              title: 'Share Current Note via Email (Markdown)',
+              category: 'Share & Transfer',
+              icon: <Mail size={14} />,
+              action: onShareEmail,
+            },
+          ]
+        : []),
+      ...(onShareWhatsApp
+        ? [
+            {
+              id: 'act-share-whatsapp',
+              title: 'Share Current Note via WhatsApp (Markdown)',
+              category: 'Share & Transfer',
+              icon: <MessageCircle size={14} />,
+              action: onShareWhatsApp,
+            },
+          ]
+        : []),
+      ...(onCopyNoteMarkdown
+        ? [
+            {
+              id: 'act-copy-markdown',
+              title: 'Copy Current Note as Markdown (Transfer to Another Account)',
+              category: 'Share & Transfer',
+              icon: <Copy size={14} />,
+              action: onCopyNoteMarkdown,
             },
           ]
         : []),
@@ -317,6 +359,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onNewNote,
     onToggleFocusMode,
     onOpenSettings,
+    onShareEmail,
+    onShareWhatsApp,
+    onCopyNoteMarkdown,
     onDeleteCurrentNote,
     onTriggerAiStructure,
     onSwitchMainView,

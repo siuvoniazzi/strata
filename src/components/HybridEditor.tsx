@@ -3,6 +3,7 @@ import {
   Bold,
   Calendar,
   CheckSquare,
+  ClipboardPaste,
   Code2,
   ExternalLink,
   Eye,
@@ -37,6 +38,7 @@ import type {
 } from '../types';
 import {
   detectUnlinkedPeopleInText,
+  folderSegment,
   formatPersonMention,
   getAllNoteLabels,
   matchDecisionLine,
@@ -56,6 +58,7 @@ import {
   sanitizePastedHtml,
 } from '../utils/docSerializer';
 import { resolveImageSrc, saveBlobAsImageAsset } from '../utils/imageStore';
+import { type ParsedSharedNote, parseSharedMarkdownNote } from '../utils/noteShare';
 import { NOTE_TEMPLATES } from '../utils/seedData';
 import type {
   EditorSelectionSnapshot,
@@ -63,6 +66,7 @@ import type {
   PendingSelectionRestore,
 } from '../utils/undoHistory';
 import { ImageLightboxModal, type LightboxImageItem } from './ImageLightboxModal';
+import { ShareNoteMenu } from './ShareNoteMenu';
 
 const IS_MAC_PLATFORM =
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
@@ -89,6 +93,7 @@ interface HybridEditorProps {
   onNavigateOrCreateNoteByTitle: (title: string) => void;
   onOpenAiStructure: () => void;
   onOpenQuickAsk: () => void;
+  onNotify?: (message: string) => void;
   canUndo?: boolean;
   canRedo?: boolean;
   undoLabel?: string | null;
@@ -666,6 +671,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   onNavigateOrCreateNoteByTitle,
   onOpenAiStructure,
   onOpenQuickAsk,
+  onNotify,
   canUndo = false,
   canRedo = false,
   undoLabel = null,
@@ -680,6 +686,8 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const [labelInput, setLabelInput] = useState('');
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [inviteRawText, setInviteRawText] = useState('');
+  const [showSharedImportModal, setShowSharedImportModal] = useState(false);
+  const [sharedImportRawText, setSharedImportRawText] = useState('');
   const [newClientPrompt, setNewClientPrompt] = useState(false);
   const [newClientName, setNewClientName] = useState('');
   const [newProjectPrompt, setNewProjectPrompt] = useState(false);
@@ -1174,6 +1182,110 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     );
     setInviteRawText('');
     setShowInviteModal(false);
+  };
+
+  const applySharedNotePayload = (parsed: ParsedSharedNote) => {
+    const current = noteRef.current;
+    let resolvedClientId = current.clientId;
+    let resolvedScope: NoteScope = parsed.scope || current.scope;
+
+    if (parsed.clientName) {
+      const existingClient = directory.clients.find(
+        (c) =>
+          c.name.toLowerCase() === parsed.clientName!.toLowerCase() ||
+          folderSegment(c.name).toLowerCase() === folderSegment(parsed.clientName!).toLowerCase()
+      );
+      resolvedClientId = existingClient
+        ? existingClient.id
+        : onAddClient(parsed.clientName, undefined, { recordHistory: false });
+      resolvedScope = 'client';
+    } else if (parsed.scope === 'inbox' || parsed.scope === 'internal') {
+      resolvedClientId = null;
+    }
+
+    let resolvedProjectId = current.projectId;
+    if (parsed.projectName) {
+      const targetProjScope = resolvedScope === 'client' ? 'client' : 'internal';
+      const existingProj = directory.projects.find(
+        (p) =>
+          (p.name.toLowerCase() === parsed.projectName!.toLowerCase() ||
+            folderSegment(p.name).toLowerCase() ===
+              folderSegment(parsed.projectName!).toLowerCase()) &&
+          p.clientId === (targetProjScope === 'client' ? resolvedClientId : null)
+      );
+      resolvedProjectId = existingProj
+        ? existingProj.id
+        : onAddProject(
+            parsed.projectName,
+            targetProjScope,
+            targetProjScope === 'client' ? resolvedClientId : null,
+            { recordHistory: false }
+          );
+      if (resolvedScope === 'inbox') {
+        resolvedScope = targetProjScope;
+      }
+    } else if (parsed.kind !== 'markdown-heading') {
+      resolvedProjectId = null;
+    }
+
+    const canonicalParticipants: string[] = [];
+    for (const pName of parsed.participants) {
+      const ensured = onEnsurePerson(pName, resolvedClientId);
+      if (!canonicalParticipants.includes(ensured.name)) {
+        canonicalParticipants.push(ensured.name);
+      }
+    }
+
+    const mergedParticipants = Array.from(
+      new Set([...current.participants, ...canonicalParticipants])
+    );
+    const mergedLabels = Array.from(new Set([...current.labels, ...parsed.labels]));
+
+    const resolvedTitle =
+      parsed.title && (!current.title.trim() || parsed.title !== 'Untitled Note')
+        ? parsed.title
+        : current.title;
+
+    const nextBody = current.body.trim()
+      ? parsed.body
+        ? `${current.body.trim()}\n\n${parsed.body}`
+        : current.body
+      : parsed.body;
+
+    lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+    patchNote(
+      {
+        title: resolvedTitle,
+        date: parsed.date || current.date,
+        scope: resolvedScope,
+        clientId: resolvedClientId,
+        projectId: resolvedProjectId,
+        participants: mergedParticipants,
+        labels: mergedLabels,
+        body: nextBody,
+      },
+      { label: 'Import shared Markdown note', coalesceKey: null }
+    );
+    onNotify?.(
+      `Imported note${resolvedTitle ? ` “${resolvedTitle}”` : ''} with metadata & Markdown`
+    );
+  };
+
+  const handleApplySharedImport = () => {
+    const raw = sharedImportRawText.trim();
+    if (!raw) return;
+    const parsed = parseSharedMarkdownNote(raw, { allowHeadingFallback: true });
+    if (parsed) {
+      applySharedNotePayload(parsed);
+    } else {
+      const current = noteRef.current;
+      const nextBody = current.body.trim() ? `${current.body.trim()}\n\n${raw}` : raw;
+      lastEmittedMarkdownRef.current = '__FORCE_SYNC__';
+      patchNote({ body: nextBody }, { label: 'Import shared Markdown note', coalesceKey: null });
+      onNotify?.('Imported Markdown into note');
+    }
+    setSharedImportRawText('');
+    setShowSharedImportModal(false);
   };
 
   const handleApplyTemplate = (templateId: string) => {
@@ -3034,6 +3146,28 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     e.preventDefault();
 
+    const sharedNote = plainData ? parseSharedMarkdownNote(plainData) : null;
+    if (sharedNote) {
+      if (!noteRef.current.body.trim()) {
+        applySharedNotePayload(sharedNote);
+        return;
+      }
+      if (sharedNote.kind === 'frontmatter') {
+        const cleanBodyHtml = markdownToHtml(sharedNote.body, directory.people);
+        if (cleanBodyHtml) {
+          const htmlWithMarkers = cleanBodyHtml.replace(
+            /<p class="doc-(decision|task)" data-status="([^"]*)">/g,
+            '<p class="doc-$1" data-status="$2"><span data-strata-block="$1" data-strata-status="$2"></span>'
+          );
+          document.execCommand('insertHTML', false, htmlWithMarkers);
+          upgradeInlineTaskAndDecisionBlocks(root);
+          emitMarkdownFromDom({ label: 'Paste shared Markdown', coalesceKey: null });
+          refreshSelectionToolbarState();
+        }
+        return;
+      }
+    }
+
     const looksLikeMarkdown =
       /(?:^|\n)\s*(?:#{1,6}\s|(?:[-*+•]\s*)*\[(?:[ /?xX]?|D(?::[a-zA-ZäöüÄÖÜß_-]+)?)\](?:\s|$)|[-*+•]\s+|\d+[.)]\s+|>\s|!\[[^\]]*\]\([^)]+\))/i.test(
         plainData
@@ -3073,6 +3207,15 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     ) {
       e.preventDefault();
       void insertImageFiles(imageFiles, null);
+      return;
+    }
+
+    if (plainData && !noteRef.current.body.trim()) {
+      const sharedNote = parseSharedMarkdownNote(plainData);
+      if (sharedNote) {
+        e.preventDefault();
+        applySharedNotePayload(sharedNote);
+      }
     }
   };
 
@@ -3362,6 +3505,17 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                   className="doc-insert-item"
                   onClick={() => {
                     setShowInsertMenu(false);
+                    setShowSharedImportModal(true);
+                  }}
+                >
+                  <ClipboardPaste size={13} />
+                  <span>Paste Shared Note (Markdown)…</span>
+                </button>
+                <button
+                  type="button"
+                  className="doc-insert-item"
+                  onClick={() => {
+                    setShowInsertMenu(false);
                     onOpenQuickAsk();
                   }}
                 >
@@ -3382,6 +3536,13 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             <Sparkles size={12} />
             <span>Structure</span>
           </button>
+
+          <ShareNoteMenu
+            buttonId="btn-share-note"
+            note={note}
+            directory={directory}
+            onNotify={onNotify}
+          />
 
           <button
             type="button"
@@ -3432,6 +3593,20 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             value={note.title}
             onFocus={syncTitleSelectionBefore}
             onSelect={syncTitleSelectionBefore}
+            onPaste={(e) => {
+              const plainData = e.clipboardData.getData('text/plain');
+              if (!plainData || !plainData.includes('\n')) return;
+              const isBlankNote =
+                !noteRef.current.title.trim() && !noteRef.current.body.trim();
+              const parsed = parseSharedMarkdownNote(plainData, {
+                allowHeadingFallback: isBlankNote,
+              });
+              if (parsed) {
+                e.preventDefault();
+                syncTitleSelectionBefore();
+                applySharedNotePayload(parsed);
+              }
+            }}
             onChange={(e) => {
               const prevLen = noteRef.current.title.length;
               const nextVal = e.target.value;
@@ -4047,6 +4222,53 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 onClick={handleApplyInvite}
               >
                 Auto-Fill Note Metadata
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Paste Shared Note (Markdown from Email / WhatsApp / Clipboard) Modal */}
+      {showSharedImportModal && (
+        <div className="modal-backdrop" onClick={() => setShowSharedImportModal(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <strong>Paste Shared Note (Markdown)</strong>
+              <button
+                type="button"
+                className="btn btn-icon btn-ghost"
+                onClick={() => setShowSharedImportModal(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="modal-body">
+              <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
+                Paste a Markdown note shared via <strong>Email, WhatsApp, or Clipboard</strong> from
+                another Strata client/account. Strata will restore the{' '}
+                <strong>Title, Date, Space/Client, Project, Participants, #Labels</strong>, and
+                formatted content automatically.
+              </p>
+              <textarea
+                className="form-textarea"
+                rows={8}
+                autoFocus
+                placeholder={`---\ntitle: "Q4 Architecture Sync"\ndate: 2026-11-13\nscope: client\nclient: "Acme Corp"\n---\n\n## Key Decisions\n- [D:agreed] ...`}
+                value={sharedImportRawText}
+                onChange={(e) => setSharedImportRawText(e.target.value)}
+              />
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="btn" onClick={() => setShowSharedImportModal(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={!sharedImportRawText.trim()}
+                onClick={handleApplySharedImport}
+              >
+                Import Note Content &amp; Metadata
               </button>
             </div>
           </div>
