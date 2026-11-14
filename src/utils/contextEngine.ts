@@ -5,7 +5,15 @@ import type {
   RelatedNoteMatch,
   WorkspaceDirectory,
 } from '../types';
-import { extractInlineMentions, getAllNoteLabels, isDailyBriefingNote, parseNoteItems } from './markdown';
+import {
+  extractInlineLabels,
+  extractInlineMentions,
+  extractWikiLinkTitles,
+  getAllNoteLabels,
+  isDailyBriefingNote,
+  parseNoteItems,
+  resolveKnownPersonName,
+} from './markdown';
 
 const STOP_WORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'will', 'are',
@@ -61,11 +69,40 @@ function buildSnippetAroundTerms(body: string, queryTerms: string[]): string {
   return joined.length > 165 ? joined.slice(0, 162) + '…' : joined;
 }
 
+function collectNotePeople(note: Note, knownPeople: WorkspaceDirectory['people']): string[] {
+  const byLower = new Map<string, string>();
+  const rawPeople = [
+    ...note.participants,
+    ...extractInlineMentions(`${note.title}\n${note.body}`, knownPeople),
+  ];
+  for (const raw of rawPeople) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const resolved = resolveKnownPersonName(trimmed, knownPeople);
+    const key = resolved.toLowerCase();
+    if (!byLower.has(key)) {
+      byLower.set(key, resolved);
+    }
+  }
+  return Array.from(byLower.values());
+}
+
+function collectNoteLabels(note: Note): string[] {
+  return Array.from(new Set([...getAllNoteLabels(note), ...extractInlineLabels(note.title)]));
+}
+
+function stripPulledProvenanceCitations(body: string): string {
+  return body
+    .replace(/\(from\s+\[\[[^\]\n]+\]\]\)/gi, ' ')
+    .replace(/^>\s*(?:Prior Decision|From\s+\[\[)[^\n]*$/gim, ' ');
+}
+
 /**
  * Computes live Context Radar items for the active note:
- * 1. Related notes scored by Project, Client, shared Participants/@mentions, shared #labels, and lexical BM25-lite overlap
- * 2. Open carry-forward Tasks relevant to the active Client/Project/Participants
- * 3. Prior Decisions relevant to the active Client/Project/Labels
+ * 1. Related notes requiring an explicit connection: shared #labels, shared people (participants/@mentions),
+ *    or direct [[Note Title]] wiki-links — using lexical overlap strictly to rank already-matched notes
+ * 2. Open carry-forward Tasks that themselves match the active note's #labels, people, or direct [[note link]]
+ * 3. Prior Decisions that themselves match the active note's #labels, people, or direct [[note link]]
  */
 export function computeContextRadar(
   activeNote: Note,
@@ -76,16 +113,23 @@ export function computeContextRadar(
   carryForwardTasks: ParsedTask[];
   priorDecisions: ParsedDecision[];
 } {
-  const activeLabels = new Set(getAllNoteLabels(activeNote));
-  const activePeople = new Set([
-    ...activeNote.participants.map((p) => p.toLowerCase()),
-    ...extractInlineMentions(activeNote.body, directory.people).map((p) => p.toLowerCase()),
-  ]);
+  const activeLabels = new Set(collectNoteLabels(activeNote));
+  const activePeopleList = collectNotePeople(activeNote, directory.people);
+  const activePeople = new Set(activePeopleList.map((p) => p.toLowerCase()));
+  const activeTitleNorm = activeNote.title.trim().toLowerCase();
+  const activeOutgoingLinks = new Set(
+    extractWikiLinkTitles(`${activeNote.title}\n${activeNote.body}`)
+  );
+  const activeNonCitationLinks = new Set(
+    extractWikiLinkTitles(
+      `${activeNote.title}\n${stripPulledProvenanceCitations(activeNote.body)}`
+    )
+  );
   const activeTokens = Array.from(new Set(tokenizeUnicode(`${activeNote.title} ${activeNote.body}`)));
 
   const otherNotes = allNotes.filter((n) => n.id !== activeNote.id && !isDailyBriefingNote(n));
 
-  // Document frequency for IDF weighting
+  // Document frequency for IDF tie-breaker ranking among explicitly matched notes
   const docFreq = new Map<string, number>();
   for (const n of otherNotes) {
     const uniq = new Set(tokenizeUnicode(`${n.title} ${n.body}`));
@@ -102,36 +146,53 @@ export function computeContextRadar(
     let score = 0;
     const reasons: string[] = [];
 
-    if (activeNote.projectId && candidate.projectId === activeNote.projectId) {
-      const projName = directory.projects.find((p) => p.id === candidate.projectId)?.name || 'Same project';
-      score += 36;
-      reasons.push(`Project: ${projName}`);
-    } else if (activeNote.clientId && candidate.clientId === activeNote.clientId) {
-      const clientName = directory.clients.find((c) => c.id === candidate.clientId)?.name || 'Same client';
-      score += 22;
-      reasons.push(`Client: ${clientName}`);
+    const candTitleNorm = candidate.title.trim().toLowerCase();
+    const candOutgoingLinks = new Set(
+      extractWikiLinkTitles(`${candidate.title}\n${candidate.body}`)
+    );
+    const activeLinksToCandidate = Boolean(
+      candTitleNorm && activeOutgoingLinks.has(candTitleNorm)
+    );
+    const activeExplicitlyLinksToCandidate = Boolean(
+      candTitleNorm && activeNonCitationLinks.has(candTitleNorm)
+    );
+    const candidateLinksToActive = Boolean(
+      activeTitleNorm && candOutgoingLinks.has(activeTitleNorm)
+    );
+    const hasDirectLink = activeLinksToCandidate || candidateLinksToActive;
+
+    if (hasDirectLink) {
+      score += activeLinksToCandidate && candidateLinksToActive ? 50 : 42;
+      reasons.push(
+        activeLinksToCandidate && candidateLinksToActive
+          ? 'Linked ↔'
+          : activeLinksToCandidate
+            ? 'Linked in note'
+            : 'Links here'
+      );
     }
 
-    const candPeople = [
-      ...candidate.participants,
-      ...extractInlineMentions(candidate.body, directory.people),
-    ];
-    const sharedPeople = Array.from(
-      new Set(candPeople.filter((p) => activePeople.has(p.toLowerCase())))
-    );
+    const candPeople = collectNotePeople(candidate, directory.people);
+    const sharedPeople = candPeople.filter((p) => activePeople.has(p.toLowerCase()));
     if (sharedPeople.length > 0) {
-      score += Math.min(32, sharedPeople.length * 14);
+      score += Math.min(36, sharedPeople.length * 16);
       reasons.push(`People: ${sharedPeople.slice(0, 2).join(', ')}`);
     }
 
-    const candLabels = getAllNoteLabels(candidate);
+    const candLabels = collectNoteLabels(candidate);
     const sharedLabels = candLabels.filter((l) => activeLabels.has(l));
     if (sharedLabels.length > 0) {
-      score += Math.min(30, sharedLabels.length * 13);
+      score += Math.min(36, sharedLabels.length * 16);
       reasons.push(`#${sharedLabels.slice(0, 2).join(', #')}`);
     }
 
-    // Lexical TF-IDF overlap
+    const hasExplicitMatch =
+      hasDirectLink || sharedPeople.length > 0 || sharedLabels.length > 0;
+    if (!hasExplicitMatch) {
+      continue;
+    }
+
+    // Lexical TF-IDF overlap used strictly as a ranking boost among already-qualified notes
     const candTokens = new Set(tokenizeUnicode(`${candidate.title} ${candidate.body}`));
     let lexicalScore = 0;
     const matchedTerms: string[] = [];
@@ -144,42 +205,72 @@ export function computeContextRadar(
       }
     }
     if (lexicalScore >= 5) {
-      score += Math.min(34, Math.round(lexicalScore));
-      if (reasons.length === 0 && matchedTerms.length > 0) {
-        reasons.push(`Topic match: ${matchedTerms.slice(0, 3).join(', ')}`);
-      }
+      score += Math.min(20, Math.round(lexicalScore));
     }
 
     const parsed = parseNoteItems(candidate, directory.people);
+    const allCandPeopleInActive =
+      candPeople.length > 0 && candPeople.every((p) => activePeople.has(p.toLowerCase()));
 
-    // Collect carry-forward open tasks when contextually linked
-    const isSameScope =
-      (activeNote.projectId && candidate.projectId === activeNote.projectId) ||
-      (activeNote.clientId && candidate.clientId === activeNote.clientId) ||
-      sharedPeople.length > 0 ||
-      sharedLabels.length > 0;
+    for (const t of parsed.tasks) {
+      if (t.status === 'done') continue;
+      const taskPeople = extractInlineMentions(t.rawLine, directory.people).map((p) =>
+        resolveKnownPersonName(p, directory.people).toLowerCase()
+      );
+      const matchesLabel = t.labels.some((lbl) => activeLabels.has(lbl));
+      const matchesPeople =
+        taskPeople.length > 0
+          ? taskPeople.some((p) => activePeople.has(p))
+          : allCandPeopleInActive;
+      const matchesDirectLink =
+        candidateLinksToActive ||
+        (activeExplicitlyLinksToCandidate &&
+          (taskPeople.length === 0 || activePeople.size === 0)) ||
+        Boolean(activeTitleNorm && extractWikiLinkTitles(t.rawLine).includes(activeTitleNorm));
 
-    if (isSameScope || score >= 18) {
-      for (const t of parsed.tasks) {
-        if (t.status !== 'done') {
-          carryForwardTasks.push(t);
-        }
-      }
-      for (const d of parsed.decisions) {
-        if (d.status !== 'superseded') {
-          priorDecisions.push(d);
-        }
+      if (matchesLabel || matchesPeople || matchesDirectLink) {
+        carryForwardTasks.push(t);
       }
     }
 
-    if (score >= 12) {
-      relatedNotes.push({
-        note: candidate,
-        score,
-        reasons,
-        snippet: buildSnippetAroundTerms(candidate.body, matchedTerms),
-      });
+    for (const d of parsed.decisions) {
+      if (d.status === 'superseded') continue;
+      const decisionRaw = d.rationale ? `${d.rawLine}\n${d.rationale}` : d.rawLine;
+      const decisionLabels = d.rationale
+        ? Array.from(new Set([...d.labels, ...extractInlineLabels(d.rationale)]))
+        : d.labels;
+      const decisionPeople = extractInlineMentions(decisionRaw, directory.people).map((p) =>
+        resolveKnownPersonName(p, directory.people).toLowerCase()
+      );
+      const matchesLabel = decisionLabels.some((lbl) => activeLabels.has(lbl));
+      const matchesPeople =
+        decisionPeople.length > 0
+          ? decisionPeople.some((p) => activePeople.has(p))
+          : allCandPeopleInActive;
+      const matchesDirectLink =
+        candidateLinksToActive ||
+        (activeExplicitlyLinksToCandidate &&
+          (decisionPeople.length === 0 || activePeople.size === 0)) ||
+        Boolean(activeTitleNorm && extractWikiLinkTitles(decisionRaw).includes(activeTitleNorm));
+
+      if (matchesLabel || matchesPeople || matchesDirectLink) {
+        priorDecisions.push(d);
+      }
     }
+
+    const snippetQueryTerms = [
+      ...(candidateLinksToActive && activeTitleNorm ? [activeTitleNorm] : []),
+      ...sharedLabels,
+      ...sharedPeople.map((p) => p.toLowerCase()),
+      ...matchedTerms,
+    ];
+
+    relatedNotes.push({
+      note: candidate,
+      score,
+      reasons,
+      snippet: buildSnippetAroundTerms(candidate.body, snippetQueryTerms),
+    });
   }
 
   relatedNotes.sort((a, b) => b.score - a.score || b.note.date.localeCompare(a.note.date));

@@ -200,7 +200,7 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
                 </div>
                 <span style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
                   {radar.carryForwardTasks.length} open task(s) and {radar.priorDecisions.length} prior decision(s)
-                  linked to this Client, Project, or Participants.
+                  matching this note&apos;s #labels, @people, or [[links]].
                 </span>
               </div>
             )}
@@ -344,7 +344,7 @@ export const ContextRadar: React.FC<ContextRadarProps> = ({
               </div>
               {radar.relatedNotes.length === 0 ? (
                 <div className="radar-card" style={{ color: 'var(--text-muted)', fontSize: 12 }}>
-                  Add a Client, Project, @Participant, #label, or topic keywords to surface relevant past notes.
+                  Add a #label, @person, or [[note link]] to surface related past notes.
                 </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>

@@ -90,6 +90,27 @@ export function extractInlineLabels(text: string): string[] {
 }
 
 /**
+ * Extracts normalized target note titles from inline [[Note Title]] or [[Note Title|Alias]] wiki-links,
+ * ignoring fenced code blocks and inline code spans.
+ */
+export function extractWikiLinkTitles(text: string): string[] {
+  if (!text) return [];
+  const cleaned = text.replace(/```[\s\S]*?```/g, ' ').replace(/`[^`\n]+`/g, ' ');
+  const found = new Set<string>();
+  const regex = /\[\[([^\]\n]+)\]\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(cleaned)) !== null) {
+    const inner = match[1].trim();
+    const pipeIdx = inner.indexOf('|');
+    const targetTitle = (pipeIdx === -1 ? inner : inner.slice(0, pipeIdx)).trim().toLowerCase();
+    if (targetTitle) {
+      found.add(targetTitle);
+    }
+  }
+  return Array.from(found);
+}
+
+/**
  * Extracts @[Full Name] and @SingleName mentions from text.
  */
 export function extractInlineMentions(text: string, knownPeople: Person[] = []): string[] {
