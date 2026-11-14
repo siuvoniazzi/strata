@@ -786,10 +786,16 @@ textarea {
 .editor-scroll {
   flex: 1;
   overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
   display: flex;
   flex-direction: column;
   padding: 0 24px 56px;
   background: var(--bg-app);
+}
+
+.editor-scroll::-webkit-scrollbar {
+  display: none;
 }
 
 /* Unified Sticky Formatting & Actions Ribbon */
