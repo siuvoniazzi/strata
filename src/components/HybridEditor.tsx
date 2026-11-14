@@ -122,6 +122,7 @@ type AutocompleteTrigger = {
   tokenStart: number;
   cursorPos: number;
   textNode: Text | null;
+  targetEl?: HTMLElement | null;
   rect: { top: number; left: number };
 };
 
@@ -2337,6 +2338,29 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
   const applyDateSelection = (isoDate: string) => {
     if (!autocomplete || autocomplete.kind !== 'date') return;
 
+    const root = docRef.current;
+    if (autocomplete.targetEl && root && root.contains(autocomplete.targetEl)) {
+      recordPreEditSelection();
+      const targetEl = autocomplete.targetEl;
+      const hadDuePrefix = (targetEl.textContent || '').trim().toLowerCase().startsWith('due:');
+      targetEl.textContent = hadDuePrefix ? `due:${isoDate}` : isoDate;
+      targetEl.setAttribute('contenteditable', 'false');
+
+      const sel = window.getSelection();
+      if (sel) {
+        const afterRange = document.createRange();
+        afterRange.setStartAfter(targetEl);
+        afterRange.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(afterRange);
+      }
+
+      setAutocomplete(null);
+      setActiveToken(null);
+      emitMarkdownFromDom({ label: 'Update date', coalesceKey: null });
+      return;
+    }
+
     if (rawMode && rawTextareaRef.current) {
       syncRawSelectionBefore();
       const full = note.body;
@@ -2352,7 +2376,6 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
-    const root = docRef.current;
     if (!root || !autocomplete.textNode || !root.contains(autocomplete.textNode)) {
       setAutocomplete(null);
       return;
@@ -2376,6 +2399,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     const span = document.createElement('span');
     span.className = 'doc-token doc-due';
+    span.setAttribute('contenteditable', 'false');
     span.textContent = tokenText;
 
     const endNode = delRange.endContainer;
@@ -3192,6 +3216,48 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       }
     }
 
+    // Atomic Backspace / Delete for date lozenge (.doc-due) so it erases as a single object
+    if ((e.key === 'Backspace' || e.key === 'Delete') && range.collapsed) {
+      let targetDue: HTMLElement | null = null;
+      const sc = range.startContainer;
+      const so = range.startOffset;
+      if (e.key === 'Backspace') {
+        if (sc.nodeType === Node.TEXT_NODE && so === 0) {
+          const prev = sc.previousSibling;
+          if (prev instanceof HTMLElement && prev.classList.contains('doc-due')) targetDue = prev;
+        } else if (sc.nodeType === Node.ELEMENT_NODE && so > 0) {
+          const prev = sc.childNodes[so - 1];
+          if (prev instanceof HTMLElement && prev.classList.contains('doc-due')) targetDue = prev;
+        }
+      } else {
+        if (sc.nodeType === Node.TEXT_NODE && so === (sc.nodeValue || '').length) {
+          const next = sc.nextSibling;
+          if (next instanceof HTMLElement && next.classList.contains('doc-due')) targetDue = next;
+        } else if (sc.nodeType === Node.ELEMENT_NODE && so < sc.childNodes.length) {
+          const next = sc.childNodes[so];
+          if (next instanceof HTMLElement && next.classList.contains('doc-due')) targetDue = next;
+        }
+      }
+      if (targetDue) {
+        e.preventDefault();
+        recordPreEditSelection();
+        const parent = targetDue.parentNode;
+        const idx = parent ? Array.from(parent.childNodes).indexOf(targetDue) : -1;
+        targetDue.remove();
+        if (parent && idx >= 0 && sel) {
+          const nextRange = document.createRange();
+          nextRange.setStart(parent, Math.min(idx, parent.childNodes.length));
+          nextRange.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(nextRange);
+        }
+        setAutocomplete(null);
+        emitMarkdownFromDom({ label: 'Remove date', coalesceKey: null });
+        refreshSelectionToolbarState();
+        return;
+      }
+    }
+
     // Smooth Backspace at start of indented item outdents first; at level 0 converts to normal Paragraph;
     // or removes an immediately preceding image block
     if (e.key === 'Backspace' && range.collapsed && blk && isCaretAtStartOfBlock(blk, range)) {
@@ -3440,6 +3506,32 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           };
         });
       }
+      return;
+    }
+
+    const dueEl = target.closest('.doc-due') as HTMLElement | null;
+    if (dueEl && docRef.current?.contains(dueEl)) {
+      e.preventDefault();
+      e.stopPropagation();
+      const rawText = (dueEl.textContent || '').trim();
+      const isoMatch = rawText.match(/(\d{4}-\d{2}-\d{2})/);
+      const currentIso = isoMatch ? isoMatch[1] : toLocalIsoDate(new Date());
+      const rd = new Date(`${currentIso}T12:00:00`);
+      const r = dueEl.getBoundingClientRect();
+      setDatePickerView({ year: rd.getFullYear(), month: rd.getMonth() });
+      setAutocomplete({
+        kind: 'date',
+        query: currentIso,
+        tokenStart: 0,
+        cursorPos: 0,
+        textNode: null,
+        targetEl: dueEl,
+        rect: {
+          top: Math.min(window.innerHeight - 310, r.bottom + 6),
+          left: Math.max(12, Math.min(window.innerWidth - 280, r.left)),
+        },
+      });
+      setActiveToken(null);
       return;
     }
 

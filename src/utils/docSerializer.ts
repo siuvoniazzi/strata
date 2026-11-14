@@ -235,8 +235,8 @@ export function inlineMarkdownToHtml(
       out.push(
         `<span class="doc-token doc-label" data-label="${escAttr(lbl)}">#${escHtml(lbl)}</span>`
       );
-    } else if (/^due:\d{4}-\d{2}-\d{2}$/i.test(raw)) {
-      out.push(`<span class="doc-token doc-due">${escHtml(raw)}</span>`);
+    } else if (/^(?:due:)?\d{4}-\d{2}-\d{2}$/i.test(raw)) {
+      out.push(`<span class="doc-token doc-due" contenteditable="false">${escHtml(raw)}</span>`);
     } else if (/^!(?:high|medium|med|low)$/i.test(raw)) {
       const norm = raw.slice(1).toLowerCase() === 'med' ? 'medium' : raw.slice(1).toLowerCase();
       out.push(`<span class="doc-token doc-prio doc-prio-${norm}">${escHtml(raw)}</span>`);
