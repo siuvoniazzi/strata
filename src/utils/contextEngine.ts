@@ -283,7 +283,7 @@ export function computeContextRadar(
   priorDecisions.sort((a, b) => b.noteDate.localeCompare(a.noteDate));
 
   return {
-    relatedNotes: relatedNotes.slice(0, 8),
+    relatedNotes: relatedNotes.slice(0, 15),
     carryForwardTasks: carryForwardTasks.slice(0, 12),
     priorDecisions: priorDecisions.slice(0, 10),
   };

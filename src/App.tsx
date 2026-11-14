@@ -5,11 +5,11 @@ import {
   ChevronLeft,
   ChevronRight,
   Cloud,
-  Compass,
   Download,
   FilePlus2,
   FolderSync,
   Gavel,
+  History,
   Inbox,
   KeyRound,
   Layers,
@@ -31,7 +31,7 @@ import {
 } from 'lucide-react';
 import { AiSettingsModal, AiStructureModal } from './components/AiStructureModal';
 import { CommandPalette } from './components/CommandPalette';
-import { ContextRadar } from './components/ContextRadar';
+import { ContextTimeline } from './components/ContextTimeline';
 import {
   DecisionsGlobalView,
   PeopleDirectoryView,
@@ -2927,10 +2927,10 @@ export function App() {
                       setSidebarOpen(false);
                       setRadarOpen((v) => !v);
                     }}
-                    title="Context Radar"
-                    aria-label="Toggle Context Radar"
+                    title="Timeline"
+                    aria-label="Toggle Timeline"
                   >
-                    <Compass size={16} />
+                    <History size={16} />
                   </button>
                 )}
 
@@ -3105,9 +3105,9 @@ export function App() {
                       type="button"
                       className={`btn btn-xs ${radarOpen ? 'btn-soft' : ''}`}
                       onClick={() => setRadarOpen((v) => !v)}
-                      title="Toggle Context Radar Sidebar"
+                      title="Toggle Related Notes Timeline"
                     >
-                      <Compass size={13} /> Context Radar
+                      <History size={13} /> Timeline
                     </button>
                   </>
                 )}
@@ -3480,9 +3480,9 @@ export function App() {
         </button>
       </nav>
 
-      {/* Right Sidebar: Live Context Radar */}
+      {/* Right Sidebar: Live Related Notes Timeline */}
       {mainView === 'notes' && radarOpen && (
-        <ContextRadar
+        <ContextTimeline
           activeNote={activeNote}
           allNotes={notes}
           directory={directory}
