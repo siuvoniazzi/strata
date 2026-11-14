@@ -3817,15 +3817,30 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                 className="inline-add-input"
                 placeholder="+ Add participant…"
                 value={participantInput}
-                onChange={(e) => setParticipantInput(e.target.value)}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  const nativeEvent = e.nativeEvent as InputEvent | Event;
+                  const inputType = 'inputType' in nativeEvent ? nativeEvent.inputType : undefined;
+                  const isDatalistSelection =
+                    inputType === 'insertReplacementText' || inputType === undefined || inputType === '';
+                  if (
+                    isDatalistSelection &&
+                    directory.people.some((p) => !note.participants.includes(p.name) && p.name === val)
+                  ) {
+                    e.target.value = '';
+                    handleAddParticipant(val);
+                    return;
+                  }
+                  setParticipantInput(val);
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ',') {
                     e.preventDefault();
-                    handleAddParticipant(participantInput);
+                    handleAddParticipant(e.currentTarget.value);
                   }
                 }}
-                onBlur={() => {
-                  if (participantInput.trim()) handleAddParticipant(participantInput);
+                onBlur={(e) => {
+                  if (e.currentTarget.value.trim()) handleAddParticipant(e.currentTarget.value);
                 }}
               />
               <datalist id="people-datalist">
