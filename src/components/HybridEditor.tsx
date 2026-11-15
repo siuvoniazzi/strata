@@ -586,6 +586,7 @@ function replaceBlockElement(target: HTMLElement, replacement: HTMLElement): HTM
 
 function findEditableBlock(node: Node | null, root: HTMLElement): HTMLElement | null {
   let curr: Node | null = node;
+  let firstMatch: HTMLElement | null = null;
   while (curr && curr !== root) {
     if (curr.nodeType === Node.ELEMENT_NODE) {
       const el = curr as HTMLElement;
@@ -593,21 +594,72 @@ function findEditableBlock(node: Node | null, root: HTMLElement): HTMLElement | 
         return null;
       }
       const tag = el.tagName.toUpperCase();
-      if (
-        tag === 'P' ||
-        tag === 'H1' ||
-        tag === 'H2' ||
-        tag === 'H3' ||
-        tag === 'LI' ||
-        tag === 'BLOCKQUOTE' ||
-        tag === 'DIV'
-      ) {
+      if (tag === 'BLOCKQUOTE') {
         return el;
+      }
+      if (
+        !firstMatch &&
+        (tag === 'P' ||
+          tag === 'H1' ||
+          tag === 'H2' ||
+          tag === 'H3' ||
+          tag === 'LI' ||
+          tag === 'DIV')
+      ) {
+        firstMatch = el;
       }
     }
     curr = curr.parentNode;
   }
-  return null;
+  return firstMatch;
+}
+
+function flattenBlockquoteNestedBlocks(bq: HTMLElement): void {
+  const nested = Array.from(bq.children).filter((child) => {
+    const t = child.tagName.toUpperCase();
+    return t === 'P' || t === 'DIV' || t === 'H1' || t === 'H2' || t === 'H3' || t === 'BLOCKQUOTE';
+  });
+  if (nested.length === 0) return;
+
+  const frag = document.createDocumentFragment();
+  const children = Array.from(bq.childNodes);
+  children.forEach((node, idx) => {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const el = node as HTMLElement;
+      const t = el.tagName.toUpperCase();
+      if (t === 'P' || t === 'DIV' || t === 'H1' || t === 'H2' || t === 'H3' || t === 'BLOCKQUOTE') {
+        if (frag.childNodes.length > 0) {
+          const prev = frag.lastChild;
+          if (!(prev instanceof HTMLElement && prev.tagName.toUpperCase() === 'BR')) {
+            frag.appendChild(document.createElement('br'));
+          }
+        }
+        while (el.firstChild) {
+          const child = el.firstChild;
+          // Skip trailing placeholder <br> inside an unwrapped block if there are more blocks after it
+          if (
+            idx < children.length - 1 &&
+            child === el.lastChild &&
+            child instanceof HTMLElement &&
+            child.tagName.toUpperCase() === 'BR' &&
+            el.childNodes.length > 1
+          ) {
+            el.removeChild(child);
+          } else {
+            frag.appendChild(child);
+          }
+        }
+        return;
+      }
+    }
+    frag.appendChild(node);
+  });
+
+  bq.innerHTML = '';
+  bq.appendChild(frag);
+  if (!bq.innerHTML.trim()) {
+    bq.innerHTML = '<br>';
+  }
 }
 
 function stripLeadingMarkerFromBlockDom(blk: HTMLElement, kind: 'decision' | 'task'): void {
@@ -797,6 +849,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
     isPdf: boolean;
   } | null>(null);
   const savedInsertRangeRef = useRef<Range | null>(null);
+  const savedBlockSelectRangeRef = useRef<Range | null>(null);
   const suppressImageClickUntilRef = useRef<number>(0);
   const lastSyncedNoteIdRef = useRef<string>('');
   const lastEmittedMarkdownRef = useRef<string>(note.body);
@@ -2096,10 +2149,20 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
   // Toolbar & Slash block conversion on continuous document page
   const applyBlockStyle = useCallback(
-    (targetStyle: 'p' | 'h1' | 'h2' | 'h3' | 'ul' | 'ol' | 'blockquote' | 'task' | 'decision' | 'proposed') => {
+    (
+      targetStyle: 'p' | 'h1' | 'h2' | 'h3' | 'ul' | 'ol' | 'blockquote' | 'task' | 'decision' | 'proposed',
+      explicitRange?: Range | null
+    ) => {
       const root = docRef.current;
       if (!root) return;
       root.focus();
+      if (explicitRange && root.contains(explicitRange.commonAncestorContainer)) {
+        const sel = window.getSelection();
+        if (sel) {
+          sel.removeAllRanges();
+          sel.addRange(explicitRange);
+        }
+      }
       recordPreEditSelection();
 
       if (targetStyle === 'ul' || targetStyle === 'ol') {
@@ -2144,6 +2207,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       let lastCreated: HTMLElement | null = null;
 
       blocks.forEach((blk) => {
+        if (blk.tagName.toUpperCase() === 'BLOCKQUOTE') {
+          flattenBlockquoteNestedBlocks(blk);
+        }
         const inner = blk.innerHTML || '<br>';
         const existingIndent = getBlockIndent(blk);
         let nextEl: HTMLElement;
@@ -3104,6 +3170,20 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
       return;
     }
 
+    // Fallback Enter when caret is directly in doc root (outside any block element)
+    if (e.key === 'Enter' && !e.shiftKey && range.collapsed && !blk && range.startContainer === root) {
+      e.preventDefault();
+      recordPreEditSelection();
+      const p = document.createElement('p');
+      p.innerHTML = '<br>';
+      const refNode = root.childNodes[range.startOffset] || null;
+      root.insertBefore(p, refNode);
+      placeCaretAtStart(p);
+      emitMarkdownFromDom({ label: 'New paragraph', coalesceKey: null });
+      refreshSelectionToolbarState();
+      return;
+    }
+
     // Smooth Enter behavior on List Items, Tasks, Decisions, Headings, and Blockquotes
     if (e.key === 'Enter' && !e.shiftKey && range.collapsed && blk) {
       const tag = blk.tagName.toUpperCase();
@@ -3191,6 +3271,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
         tailRange.setStart(range.startContainer, range.startOffset);
         const tailFrag = tailRange.extractContents();
 
+        if (isQuote) {
+          flattenBlockquoteNestedBlocks(blk);
+        }
         if (!blk.innerHTML.trim()) {
           blk.innerHTML = '<br>';
         }
@@ -3204,6 +3287,9 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           }
         }
         nextBlock.appendChild(tailFrag);
+        if (isQuote) {
+          flattenBlockquoteNestedBlocks(nextBlock);
+        }
         if (!nextBlock.innerHTML.trim()) {
           nextBlock.innerHTML = '<br>';
         }
@@ -3598,6 +3684,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
           );
           document.execCommand('insertHTML', false, htmlWithMarkers);
           upgradeInlineTaskAndDecisionBlocks(root);
+          root.querySelectorAll('blockquote').forEach((bq) => flattenBlockquoteNestedBlocks(bq as HTMLElement));
           emitMarkdownFromDom({ label: 'Paste shared Markdown', coalesceKey: null });
           refreshSelectionToolbarState();
         }
@@ -3628,6 +3715,7 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
 
     document.execCommand('insertHTML', false, htmlWithMarkers);
     upgradeInlineTaskAndDecisionBlocks(root);
+    root.querySelectorAll('blockquote').forEach((bq) => flattenBlockquoteNestedBlocks(bq as HTMLElement));
     emitMarkdownFromDom({ label: 'Paste', coalesceKey: null });
     refreshSelectionToolbarState();
   };
@@ -3766,9 +3854,24 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
                     ? activeFormat.block
                     : 'p'
                 }
-                onChange={(e) =>
-                  applyBlockStyle(e.target.value as 'p' | 'h1' | 'h2' | 'h3' | 'blockquote')
-                }
+                onMouseDown={() => {
+                  const captured = captureCurrentDocRange();
+                  if (captured) savedBlockSelectRangeRef.current = captured;
+                }}
+                onFocus={() => {
+                  if (!savedBlockSelectRangeRef.current) {
+                    const captured = captureCurrentDocRange();
+                    if (captured) savedBlockSelectRangeRef.current = captured;
+                  }
+                }}
+                onChange={(e) => {
+                  const savedRange = savedBlockSelectRangeRef.current;
+                  savedBlockSelectRangeRef.current = null;
+                  applyBlockStyle(
+                    e.target.value as 'p' | 'h1' | 'h2' | 'h3' | 'blockquote',
+                    savedRange
+                  );
+                }}
               >
                 <option value="p">Normal text</option>
                 <option value="h1">Heading 1</option>
