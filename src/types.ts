@@ -88,6 +88,8 @@ export interface WorkspaceDirectory {
 
 export type AiProviderType = 'local' | 'openai' | 'azure' | 'gemini' | 'anthropic';
 
+export type AiOutputLanguage = 'en' | 'de' | 'fr' | 'es' | 'it';
+
 export interface AiConfig {
   provider: AiProviderType;
   apiKey: string;
@@ -97,6 +99,8 @@ export interface AiConfig {
   azureApiVersion?: string;
   /** Defaults to true (enabled) when undefined so all external LLM calls are pseudonymized by default */
   pseudonymize?: boolean;
+  /** Output language for Daily Briefing & AI-generated summaries (defaults to 'en') */
+  language?: AiOutputLanguage;
 }
 
 export type AiPrivacyCategory =

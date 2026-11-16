@@ -27,7 +27,11 @@ import type {
   TaskStatus,
   WorkspaceDirectory,
 } from '../types';
-import { formatAiEngineLabel, generateExecutiveBriefWithAiOrFallback } from '../utils/aiProvider';
+import {
+  formatAiEngineLabel,
+  generateExecutiveBriefWithAiOrFallback,
+  getEffectiveAiLanguage,
+} from '../utils/aiProvider';
 import { buildDeterministicExecutiveBrief } from '../utils/contextEngine';
 import {
   buildDeterministicDailyBriefing,
@@ -171,6 +175,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const [copied, setCopied] = useState<'teams' | 'md' | null>(null);
 
   const todayDate = getTodayDateString();
+  const briefingLanguage = getEffectiveAiLanguage(aiConfig);
 
   // Compute Daily Briefing Data
   const dailyData = useMemo(
@@ -179,26 +184,28 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   );
 
   const deterministicDailyBriefing = useMemo(
-    () => buildDeterministicDailyBriefing(dailyData, directory),
-    [dailyData, directory]
+    () => buildDeterministicDailyBriefing(dailyData, directory, briefingLanguage),
+    [dailyData, directory, briefingLanguage]
   );
 
+  const hasMatchingDailyState =
+    Boolean(dailyBriefingState) &&
+    dailyBriefingState!.date === todayDate &&
+    (dailyBriefingState!.language || 'en') === briefingLanguage;
+
   const activeDailyOverviewMarkdown =
-    dailyBriefingState &&
-    dailyBriefingState.date === todayDate &&
-    dailyBriefingState.overviewMarkdown
-      ? dailyBriefingState.overviewMarkdown
+    hasMatchingDailyState && dailyBriefingState!.overviewMarkdown
+      ? dailyBriefingState!.overviewMarkdown
       : deterministicDailyBriefing.overviewMarkdown;
 
   const activeDailyProvider =
-    dailyBriefingState && dailyBriefingState.date === todayDate && dailyBriefingState.usedProvider
-      ? dailyBriefingState.usedProvider
+    hasMatchingDailyState && dailyBriefingState!.usedProvider
+      ? dailyBriefingState!.usedProvider
       : deterministicDailyBriefing.usedProvider;
 
-  const activeDailyPrivacyReport =
-    dailyBriefingState && dailyBriefingState.date === todayDate
-      ? dailyBriefingState.privacyReport
-      : undefined;
+  const activeDailyPrivacyReport = hasMatchingDailyState
+    ? dailyBriefingState!.privacyReport
+    : undefined;
 
   const dailyReportNote = useMemo(
     () => notes.find((n) => n.id === DAILY_BRIEFING_NOTE_ID || isDailyBriefingNote(n)),
@@ -332,10 +339,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   const handleCopyDailyDigest = async () => {
     const fullDigest =
-      dailyBriefingState &&
-      dailyBriefingState.date === todayDate &&
-      dailyBriefingState.fullNoteMarkdown
-        ? dailyBriefingState.fullNoteMarkdown
+      hasMatchingDailyState && dailyBriefingState!.fullNoteMarkdown
+        ? dailyBriefingState!.fullNoteMarkdown
         : deterministicDailyBriefing.fullNoteMarkdown;
     const formatted = fullDigest.replace(/\[\[([^\]]+)\]\]/g, '"$1"');
     await navigator.clipboard.writeText(formatted);
@@ -459,7 +464,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             <div className="page-header">
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  <h1 className="page-h1">Daily Briefing — {formatHumanDate(todayDate)}</h1>
+                  <h1 className="page-h1">Daily Briefing — {formatHumanDate(todayDate, briefingLanguage)}</h1>
                   <span className="daily-live-pill">
                     <CalendarCheck size={12} /> Auto-Updates Daily
                   </span>

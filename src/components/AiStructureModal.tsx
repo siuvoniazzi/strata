@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import type {
   AiConfig,
+  AiOutputLanguage,
   AiProviderType,
   AiStructureProposal,
   Note,
@@ -23,7 +24,13 @@ import type {
   WorkspacePreferences,
 } from '../types';
 import { normalizeSensitiveTerms } from '../utils/aiPrivacy';
-import { formatAiEngineLabel, generateStructureProposal, saveAiConfig } from '../utils/aiProvider';
+import {
+  AI_LANGUAGE_OPTIONS,
+  formatAiEngineLabel,
+  generateStructureProposal,
+  getEffectiveAiLanguage,
+  saveAiConfig,
+} from '../utils/aiProvider';
 import { normalizeStructuredMarkdown, serializeTaskLine } from '../utils/markdown';
 import { saveWorkspacePreferences } from '../utils/preferences';
 import { AiLoadingState } from './AiLoadingState';
@@ -386,6 +393,7 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
   const [draft, setDraft] = useState<AiConfig>({
     ...config,
     pseudonymize: config.pseudonymize !== false,
+    language: getEffectiveAiLanguage(config),
   });
   const [draftPrefs, setDraftPrefs] = useState<WorkspacePreferences>(preferences);
   const [draftTerms, setDraftTerms] = useState<string[]>(() =>
@@ -667,6 +675,29 @@ export const AiSettingsModal: React.FC<AiSettingsModalProps> = ({
                 <option value="gemini">Google Gemini API</option>
                 <option value="anthropic">Anthropic Claude API</option>
               </select>
+            </div>
+
+            <div className="form-field">
+              <label className="form-label" htmlFor="ai-output-language">
+                Daily Briefing Language
+              </label>
+              <select
+                id="ai-output-language"
+                className="form-input"
+                value={getEffectiveAiLanguage(draft)}
+                onChange={(e) =>
+                  setDraft({ ...draft, language: e.target.value as AiOutputLanguage })
+                }
+              >
+                {AI_LANGUAGE_OPTIONS.map((opt) => (
+                  <option key={opt.code} value={opt.code}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <span style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>
+                Controls the language used for the Daily Briefing overview, daily report sections, and AI synthesis.
+              </span>
             </div>
 
             {draft.provider !== 'local' && (

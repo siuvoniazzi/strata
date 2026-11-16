@@ -1,5 +1,6 @@
 import type {
   AiConfig,
+  AiOutputLanguage,
   AiPrivacyReport,
   AiStructureProposal,
   DecisionStatus,
@@ -31,6 +32,27 @@ import {
 
 const AI_CONFIG_KEY = 'strata.aiConfig.v1';
 
+export const AI_LANGUAGE_OPTIONS: ReadonlyArray<{
+  code: AiOutputLanguage;
+  label: string;
+  englishName: string;
+  locale: string;
+}> = [
+  { code: 'en', label: 'English (Default)', englishName: 'English', locale: 'en-US' },
+  { code: 'de', label: 'Deutsch (German)', englishName: 'German', locale: 'de-DE' },
+  { code: 'fr', label: 'Français (French)', englishName: 'French', locale: 'fr-FR' },
+  { code: 'es', label: 'Español (Spanish)', englishName: 'Spanish', locale: 'es-ES' },
+  { code: 'it', label: 'Italiano (Italian)', englishName: 'Italian', locale: 'it-IT' },
+];
+
+export function getEffectiveAiLanguage(config?: Pick<AiConfig, 'language'> | null): AiOutputLanguage {
+  const code = config?.language;
+  if (code && AI_LANGUAGE_OPTIONS.some((opt) => opt.code === code)) {
+    return code;
+  }
+  return 'en';
+}
+
 export function loadAiConfig(): AiConfig {
   try {
     const raw = localStorage.getItem(AI_CONFIG_KEY);
@@ -39,6 +61,7 @@ export function loadAiConfig(): AiConfig {
       return {
         ...parsed,
         pseudonymize: parsed.pseudonymize !== false,
+        language: getEffectiveAiLanguage(parsed),
       };
     }
   } catch {
@@ -51,6 +74,7 @@ export function loadAiConfig(): AiConfig {
     baseUrl: 'https://api.openai.com/v1',
     azureApiVersion: '2024-10-21',
     pseudonymize: true,
+    language: 'en',
   };
 }
 

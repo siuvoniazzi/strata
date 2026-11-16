@@ -64,6 +64,7 @@ import type {
 } from './types';
 import {
   getAiActivitySnapshot,
+  getEffectiveAiLanguage,
   loadAiConfig,
   subscribeAiActivity,
 } from './utils/aiProvider';
@@ -1327,6 +1328,7 @@ export function App() {
           overviewMarkdown: result.overviewMarkdown,
           fullNoteMarkdown: result.fullNoteMarkdown,
           usedProvider: result.usedProvider,
+          language: result.language,
           privacyReport: result.privacyReport,
         };
         saveDailyBriefingState(nextState);
@@ -1361,14 +1363,23 @@ export function App() {
     }
     const today = getTodayDateString();
     const currentDir = directoryRef.current;
+    const effectiveLanguage = getEffectiveAiLanguage(aiConfig);
     const data = computeDailyBriefingData(notesRef.current, currentDir, today, 7);
     const prev = dailyBriefingStateRef.current;
-    const deterministic = buildDeterministicDailyBriefing(data, currentDir);
+    const deterministic = buildDeterministicDailyBriefing(data, currentDir, effectiveLanguage);
     const overviewMd =
-      prev && prev.date === today && prev.overviewMarkdown.trim()
+      prev &&
+      prev.date === today &&
+      (prev.language || 'en') === effectiveLanguage &&
+      prev.overviewMarkdown.trim()
         ? prev.overviewMarkdown
         : deterministic.overviewMarkdown;
-    const fullMarkdown = composeFullDailyNoteMarkdown(overviewMd, data, currentDir);
+    const fullMarkdown = composeFullDailyNoteMarkdown(
+      overviewMd,
+      data,
+      currentDir,
+      effectiveLanguage
+    );
     const built = buildDailyBriefingNote({
       todayDate: today,
       fullNoteMarkdown: fullMarkdown,
@@ -1377,9 +1388,9 @@ export function App() {
     setNotes((prevNotes) => [built, ...prevNotes]);
     syncSingleNoteToDisk(built);
     openNoteEditor(built.id);
-  }, [openNoteEditor, syncSingleNoteToDisk]);
+  }, [aiConfig, openNoteEditor, syncSingleNoteToDisk]);
 
-  // Auto-update the Daily Briefing state & Daily Report Note whenever source notes or date change
+  // Auto-update the Daily Briefing state & Daily Report Note whenever source notes, date, or language change
   useEffect(() => {
     if (!hydrated) return;
     const sourceNotes = notes.filter((n) => !isDailyBriefingNote(n));
@@ -1390,13 +1401,20 @@ export function App() {
       const today = getTodayDateString();
       const currentNotes = notesRef.current;
       const currentDir = directoryRef.current;
+      const effectiveLanguage = getEffectiveAiLanguage(aiConfig);
       const data = computeDailyBriefingData(currentNotes, currentDir, today, 7);
       const prev = dailyBriefingStateRef.current;
-      const deterministic = buildDeterministicDailyBriefing(data, currentDir);
+      const prevLanguage = prev?.language || 'en';
+      const deterministic = buildDeterministicDailyBriefing(
+        data,
+        currentDir,
+        effectiveLanguage
+      );
 
       const preserveAiOverview =
         prev &&
         prev.date === today &&
+        prevLanguage === effectiveLanguage &&
         prev.usedProvider !== 'Local Smart Engine' &&
         Boolean(prev.overviewMarkdown.trim());
 
@@ -1404,9 +1422,17 @@ export function App() {
         ? prev.overviewMarkdown
         : deterministic.overviewMarkdown;
       const usedProvider = preserveAiOverview ? prev.usedProvider : deterministic.usedProvider;
-      const fullMarkdown = composeFullDailyNoteMarkdown(overviewMd, data, currentDir);
+      const fullMarkdown = composeFullDailyNoteMarkdown(
+        overviewMd,
+        data,
+        currentDir,
+        effectiveLanguage
+      );
       const stateNeedsUpdate =
-        !prev || prev.date !== today || prev.sourceSignature !== data.sourceSignature;
+        !prev ||
+        prev.date !== today ||
+        prev.sourceSignature !== data.sourceSignature ||
+        prevLanguage !== effectiveLanguage;
 
       const nowIso = stateNeedsUpdate ? new Date().toISOString() : prev.generatedAt;
 
@@ -1418,6 +1444,7 @@ export function App() {
           overviewMarkdown: overviewMd,
           fullNoteMarkdown: fullMarkdown,
           usedProvider,
+          language: effectiveLanguage,
         };
         saveDailyBriefingState(nextState);
         dailyBriefingStateRef.current = nextState;
@@ -1447,13 +1474,17 @@ export function App() {
         }
       }
 
-      // If an external AI provider is configured and we haven't generated today's AI briefing yet, trigger once
+      // If an external AI provider is configured and we haven't generated today's AI briefing in this language yet, trigger once
+      const autoGenKey = `${today}|${effectiveLanguage}`;
       if (
         aiConfig.provider !== 'local' &&
-        (!prev || prev.date !== today || prev.usedProvider === 'Local Smart Engine') &&
-        aiDailyAutoGenDateRef.current !== today
+        (!prev ||
+          prev.date !== today ||
+          prevLanguage !== effectiveLanguage ||
+          prev.usedProvider === 'Local Smart Engine') &&
+        aiDailyAutoGenDateRef.current !== autoGenKey
       ) {
-        aiDailyAutoGenDateRef.current = today;
+        aiDailyAutoGenDateRef.current = autoGenKey;
         void handleRefreshDailyBriefing(7);
       }
     }, 150);
@@ -1464,7 +1495,7 @@ export function App() {
     notes,
     directory,
     activeNoteId,
-    aiConfig.provider,
+    aiConfig,
     handleRefreshDailyBriefing,
     syncSingleNoteToDisk,
   ]);
