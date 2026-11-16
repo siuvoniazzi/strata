@@ -134,9 +134,41 @@ export function createImageBlockElement(params: {
   return tpl.content.firstElementChild as HTMLElement;
 }
 
+export function isSafeExternalUrl(href: string): boolean {
+  return /^(?:https?:\/\/|mailto:)/i.test(href.trim());
+}
+
+export function splitTrailingUrlPunctuation(rawUrl: string): { url: string; trailing: string } {
+  let url = rawUrl;
+  let trailing = '';
+  while (url.length > 0) {
+    const last = url[url.length - 1];
+    if ('.,;:!?'.includes(last) || last === '"' || last === "'" || last === ']') {
+      trailing = last + trailing;
+      url = url.slice(0, -1);
+      continue;
+    }
+    if (last === ')') {
+      const openCount = (url.match(/\(/g) || []).length;
+      const closeCount = (url.match(/\)/g) || []).length;
+      if (closeCount > openCount) {
+        trailing = last + trailing;
+        url = url.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  return { url, trailing };
+}
+
+function buildExternalLinkHtml(href: string, labelHtml: string): string {
+  const cleanHref = href.trim();
+  return `<a class="doc-ext-link" href="${escAttr(cleanHref)}" target="_blank" rel="noopener noreferrer">${labelHtml}</a>`;
+}
+
 /**
- * Converts inline Markdown (bold, italic, strike, code, @[Person], #label, [[Note]], [file](assets/...), due:, !prio)
- * into clean semantic HTML spans for the continuous Word-like document surface.
+ * Converts inline Strata Markdown syntax into rich contentEditable HTML.
  */
 export function inlineMarkdownToHtml(
   text: string,
@@ -157,14 +189,16 @@ export function inlineMarkdownToHtml(
   const patternParts = [
     '`([^`]+)`', // inline code
     '!\\[([^\\]]*)\\]\\(([^)\\n]+)\\)', // inline image ![alt|width](src)
-    '\\[([^\\]]+)\\]\\(((?:\\./|\\.\\./)*assets/[^)\\n]+)\\)', // local attachment [name](assets/...)
+    '\\[([^\\]]+)\\]\\(((?:\\./|\\.\\.\\/)*assets/[^)\\n]+)\\)', // local attachment [name](assets/...)
+    '\\[([^\\]]+)\\]\\(((?:https?:\\/\\/|mailto:)[^)\\n]+)\\)', // external link [label](https://...)
+    'https?:\\/\\/[^\\s<>"\'`]+', // bare http(s):// URL
     '\\[\\[([^\\]]+)\\]\\]', // [[Note Link]]
     '@\\[([^\\]]+)\\]', // @[Full Name]
     ...(multiWordPersonAlternation
       ? [`(?<=^|[\\s(])@(${multiWordPersonAlternation})(?=$|[\\s,.;:!?)])`] // @Known Multiword
       : []),
     '(?<=^|[\\s(])@([\\p{L}][\\p{L}\\p{N}._-]{0,30})', // @SingleWord
-    '(?<=^|[\\s(])#([\\p{L}][\\p{L}\\p{N}_-]{1,38})', // #label
+    '(?<=^|[\\s([{"\'])#([\\p{L}][\\p{L}\\p{N}_-]{1,38})', // #label
     '\\bdue:(\\d{4}-\\d{2}-\\d{2})\\b', // due:YYYY-MM-DD
     '(?<=^|\\s)!(high|medium|med|low)\\b', // !priority
     '\\*\\*\\*(.+?)\\*\\*\\*', // ***bold italic***
@@ -205,9 +239,21 @@ export function inlineMarkdownToHtml(
         out.push(escHtml(raw));
       }
     } else if (raw.startsWith('[') && !raw.startsWith('[[') && raw.endsWith(')')) {
-      const attMatch = raw.match(/^\[([^\]]+)\]\(([^)\n]+)\)$/);
-      if (attMatch) {
-        out.push(buildAttachmentChipHtml(attMatch[1], attMatch[2]));
+      const linkMatch = raw.match(/^\[([^\]]+)\]\(([^)\n]+)\)$/);
+      if (linkMatch) {
+        const href = linkMatch[2].trim();
+        if (isSafeExternalUrl(href)) {
+          out.push(buildExternalLinkHtml(href, escHtml(linkMatch[1])));
+        } else {
+          out.push(buildAttachmentChipHtml(linkMatch[1], href));
+        }
+      } else {
+        out.push(escHtml(raw));
+      }
+    } else if (/^https?:\/\//i.test(raw)) {
+      const { url, trailing } = splitTrailingUrlPunctuation(raw);
+      if (url.length > 'https://'.length) {
+        out.push(buildExternalLinkHtml(url, escHtml(url)) + escHtml(trailing));
       } else {
         out.push(escHtml(raw));
       }
@@ -537,6 +583,17 @@ function serializeInlineNode(node: Node): string {
   if (tag === 'S' || tag === 'STRIKE' || tag === 'DEL') {
     return wrapMarkdownMark(childrenText, '~~');
   }
+  if (tag === 'A') {
+    const href = (el.getAttribute('href') || '').trim();
+    const label = childrenText.trim();
+    if (isSafeExternalUrl(href)) {
+      if (!label || label === href) {
+        return href;
+      }
+      return `[${label}](${href})`;
+    }
+    return childrenText;
+  }
   if (tag === 'CODE') {
     return childrenText ? `\`${childrenText}\`` : '';
   }
@@ -826,6 +883,14 @@ export function sanitizePastedHtml(rawHtml: string, knownPeople: Person[] = []):
       inner += cleanInline(c);
     });
 
+    if (tag === 'A') {
+      const href = (el.getAttribute('href') || '').trim();
+      if (isSafeExternalUrl(href)) {
+        const labelHtml = inner || escHtml(href);
+        return buildExternalLinkHtml(href, labelHtml);
+      }
+      return inner;
+    }
     if (tag === 'STRONG' || tag === 'B') return inner ? `<strong>${inner}</strong>` : '';
     if (tag === 'EM' || tag === 'I') return inner ? `<em>${inner}</em>` : '';
     if (tag === 'S' || tag === 'STRIKE' || tag === 'DEL') return inner ? `<s>${inner}</s>` : '';

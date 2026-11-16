@@ -2938,13 +2938,16 @@ textarea {
   color: var(--text-secondary);
 }
 
-.rich-md-ext-link {
+.rich-md-ext-link,
+.word-doc-body a.doc-ext-link {
   color: var(--accent-text);
   text-decoration: underline;
   text-underline-offset: 2px;
+  cursor: pointer;
 }
 
-.rich-md-ext-link:hover {
+.rich-md-ext-link:hover,
+.word-doc-body a.doc-ext-link:hover {
   color: var(--accent-primary-hover);
 }
 

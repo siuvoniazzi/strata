@@ -1,6 +1,6 @@
 import React, { useMemo } from 'react';
 import type { Client, Note, Person } from '../types';
-import { parseAltAndWidth } from '../utils/docSerializer';
+import { parseAltAndWidth, splitTrailingUrlPunctuation } from '../utils/docSerializer';
 import { createAssetObjectUrl, resolveImageSrc } from '../utils/imageStore';
 
 export interface RichInlineTextProps {
@@ -38,6 +38,7 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
       '!\\[[^\\]]*\\]\\([^)\\n]+\\)', // ![alt|width](src)
       '\\[\\[[^\\]]+\\]\\]', // [[Note Title]] or [[Note Title|Alias]]
       '\\[[^\\]]+\\]\\((?:https?:\\/\\/|mailto:|(?:\\.\\/|\\.\\.\\/)*assets\\/)[^)\\n]+\\)', // [label](https://... or assets/...)
+      'https?:\\/\\/[^\\s<>"\'`]+', // bare http(s):// URL
       '@\\[[^\\]]+\\]', // @[Full Name]
       ...(multiWordAlternation
         ? [`(?<=^|[\\s([{"'])@(?:${multiWordAlternation})(?=$|[\\s,.;:!?)\\]}"'])`]
@@ -218,6 +219,27 @@ export const RichInlineText: React.FC<RichInlineTextProps> = ({
               <span>{label}</span>
             </button>
           );
+        }
+      } else {
+        parts.push(raw);
+      }
+    } else if (/^https?:\/\//i.test(raw)) {
+      const { url, trailing } = splitTrailingUrlPunctuation(raw);
+      if (url.length > 'https://'.length) {
+        parts.push(
+          <a
+            key={key}
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="rich-md-ext-link"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {url}
+          </a>
+        );
+        if (trailing) {
+          parts.push(trailing);
         }
       } else {
         parts.push(raw);

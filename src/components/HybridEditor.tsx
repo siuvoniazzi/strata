@@ -60,6 +60,7 @@ import {
   createAttachmentChipElement,
   createImageBlockElement,
   domToMarkdown,
+  isSafeExternalUrl,
   markdownToHtml,
   sanitizePastedHtml,
 } from '../utils/docSerializer';
@@ -3591,6 +3592,17 @@ export const HybridEditor: React.FC<HybridEditorProps> = ({
             isPdf: name.toLowerCase().endsWith('.pdf'),
           };
         });
+      }
+      return;
+    }
+
+    const extLinkEl = target.closest('a.doc-ext-link') as HTMLAnchorElement | null;
+    if (extLinkEl && docRef.current?.contains(extLinkEl)) {
+      const href = extLinkEl.getAttribute('href') || '';
+      if (isSafeExternalUrl(href)) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.open(href, '_blank', 'noopener,noreferrer');
       }
       return;
     }
