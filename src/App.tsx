@@ -236,6 +236,7 @@ export function App() {
     mode?: ReportsHubMode;
     label?: string;
     clientId?: string;
+    projectId?: string;
     person?: string;
   }>({});
   const [dailyBriefingState, setDailyBriefingState] =
@@ -1215,7 +1216,7 @@ export function App() {
         (x) => x.title.toLowerCase() === targetTitle.toLowerCase()
       );
       if (found) {
-        if (found.id === activeNote.id) {
+        if (mainView === 'notes' && !showDailyRetro && found.id === activeNote.id) {
           setOverlayStack([]);
         } else {
           const entry: OverlayEntry = { kind: 'note', noteId: found.id };
@@ -1244,6 +1245,8 @@ export function App() {
     },
     [
       notes,
+      mainView,
+      showDailyRetro,
       activeNote.id,
       activeNote.scope,
       activeNote.clientId,
@@ -2329,7 +2332,7 @@ export function App() {
     !sidebarOpen ? 'sidebar-collapsed' : '',
     mainView !== 'notes' || !radarOpen ? 'radar-collapsed' : '',
     isFocusMode ? 'focus-mode' : '',
-    mainView === 'notes' && overlayStack.length > 0 ? 'has-workspace-overlay' : '',
+    overlayStack.length > 0 ? 'has-workspace-overlay' : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -3496,7 +3499,7 @@ export function App() {
 
         {mainView === 'reports' && (
           <ReportsView
-            key={`${reportInitialFilter.mode || 'daily'}-${reportInitialFilter.label || ''}-${reportInitialFilter.clientId || ''}-${reportInitialFilter.person || ''}`}
+            key={`${reportInitialFilter.mode || 'daily'}-${reportInitialFilter.label || ''}-${reportInitialFilter.clientId || ''}-${reportInitialFilter.projectId || ''}-${reportInitialFilter.person || ''}`}
             notes={notes}
             directory={directory}
             allLabels={allWorkspaceLabels}
@@ -3504,6 +3507,7 @@ export function App() {
             initialMode={reportInitialFilter.mode}
             initialLabelFilter={reportInitialFilter.label}
             initialClientFilter={reportInitialFilter.clientId}
+            initialProjectFilter={reportInitialFilter.projectId}
             initialPersonFilter={reportInitialFilter.person}
             dailyBriefingState={dailyBriefingState}
             isRefreshingDailyBriefing={isRefreshingDailyBriefing}
@@ -3518,6 +3522,9 @@ export function App() {
             }}
             onOpenNote={openNoteEditor}
             onOpenNoteByTitle={handleOpenOrCreateNoteByTitle}
+            onPreviewNote={(noteId) => openOverlay({ kind: 'note', noteId })}
+            onPreviewNoteByTitle={handlePeekOrCreateNoteByTitle}
+            onPreviewReport={(filter) => openOverlay({ kind: 'report', ...filter })}
             onUpdateTaskStatus={handleUpdateRemoteTaskStatus}
             onDeleteTask={handleDeleteRemoteTask}
             onUpdateDecisionStatus={handleUpdateRemoteDecisionStatus}
@@ -3738,12 +3745,27 @@ export function App() {
         />
       )}
 
-      {/* Dismissible Note Context Overlay (#topic reports, @person dossiers/notes, [[Note]] previews) */}
-      {mainView === 'notes' && overlayStack.length > 0 && (
+      {/* Dismissible Context Overlay / Mobile Bottom Sheet (#topic reports, @person dossiers, [[Note]] previews) */}
+      {overlayStack.length > 0 && (
         <WorkspaceOverlay
           stack={overlayStack}
-          originNoteId={activeNote.id}
+          originNoteId={mainView === 'notes' && !showDailyRetro ? activeNote.id : ''}
           originNoteTitle={activeNote.title}
+          returnLabel={
+            showDailyRetro
+              ? 'Daily Retro'
+              : mainView === 'reports'
+              ? reportInitialFilter.mode === 'explorer'
+                ? 'Reports Hub'
+                : 'Daily Brief'
+              : mainView === 'tasks'
+              ? 'Tasks'
+              : mainView === 'decisions'
+              ? 'Decisions'
+              : mainView === 'people'
+              ? 'Directory'
+              : undefined
+          }
           notes={notes}
           directory={directory}
           allLabels={allWorkspaceLabels}
@@ -3752,16 +3774,19 @@ export function App() {
             showCommandPalette ||
             showAiStructure ||
             showAiSettings ||
-            showSyncModal ||
-            showDailyRetro
+            showSyncModal
           }
           onNotify={(msg) => showToastMessage(msg, null)}
           onBack={popOverlay}
           onClose={closeOverlay}
           onPushEntry={pushOverlay}
-          onOpenNoteInEditor={openNoteEditor}
+          onOpenNoteInEditor={(noteId) => {
+            setShowDailyRetro(false);
+            openNoteEditor(noteId);
+          }}
           onOpenOrPeekNoteByTitle={handlePeekOrCreateNoteByTitle}
           onOpenFullReportsView={(filter) => {
+            setShowDailyRetro(false);
             setReportInitialFilter({ ...filter, mode: 'explorer' });
             switchPrimaryView('reports');
           }}
@@ -4017,8 +4042,17 @@ export function App() {
           directory={directory}
           todayDate={getTodayDateString()}
           isRefreshingBriefing={isRefreshingDailyBriefing}
+          suspendKeyboard={overlayStack.length > 0 || showCommandPalette}
           onClose={() => setShowDailyRetro(false)}
-          onOpenNote={openNoteEditor}
+          onPreviewNote={(noteId) => openOverlay({ kind: 'note', noteId })}
+          onPreviewNoteByTitle={handlePeekOrCreateNoteByTitle}
+          onPreviewProject={(cId, pId) =>
+            openOverlay({
+              kind: 'report',
+              clientId: cId || undefined,
+              projectId: pId || undefined,
+            })
+          }
           onRateNote={handleRateNoteRetro}
           onTriageTask={handleTriageTaskRetro}
           onReviewDecision={handleReviewDecisionRetro}

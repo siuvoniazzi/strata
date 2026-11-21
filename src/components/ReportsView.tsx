@@ -11,6 +11,7 @@ import {
   FilePlus2,
   FileText,
   Filter,
+  FolderKanban,
   Gavel,
   Loader2,
   MoreHorizontal,
@@ -27,6 +28,7 @@ import type {
   AiPrivacyReport,
   DecisionStatus,
   Note,
+  NoteScope,
   ParsedDecision,
   ParsedTask,
   TaskHorizonBucket,
@@ -54,6 +56,7 @@ import {
   getTaskRetroPlan,
   isTaskActivelyOverdue,
   resolveEffectiveTaskHorizon,
+  resolveItemProjectContext,
 } from '../utils/dailyRetro';
 import {
   extractInlineMentions,
@@ -77,6 +80,7 @@ interface ReportsViewProps {
   initialMode?: ReportsHubMode;
   initialLabelFilter?: string;
   initialClientFilter?: string;
+  initialProjectFilter?: string;
   initialPersonFilter?: string;
   embeddedInOverlay?: boolean;
   activeEditorNoteId?: string;
@@ -93,6 +97,16 @@ interface ReportsViewProps {
   onModeChange?: (mode: ReportsHubMode) => void;
   onOpenNote: (noteId: string) => void;
   onOpenNoteByTitle?: (noteTitle: string) => void;
+  /** Opens note in a popup modal / mobile bottom-sheet overlay without leaving Daily Brief */
+  onPreviewNote?: (noteId: string) => void;
+  onPreviewNoteByTitle?: (noteTitle: string) => void;
+  /** Opens a project, client, topic, or person rollup in the popup / bottom-sheet overlay */
+  onPreviewReport?: (filter: {
+    label?: string;
+    person?: string;
+    clientId?: string;
+    projectId?: string;
+  }) => void;
   onUpdateTaskStatus: (task: ParsedTask, status: TaskStatus) => void;
   onDeleteTask: (task: ParsedTask) => void;
   onUpdateDecisionStatus: (decision: ParsedDecision, status: DecisionStatus) => void;
@@ -118,6 +132,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   initialMode,
   initialLabelFilter = '',
   initialClientFilter = '',
+  initialProjectFilter = '',
   initialPersonFilter = '',
   embeddedInOverlay = false,
   activeEditorNoteId,
@@ -130,6 +145,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   onModeChange,
   onOpenNote,
   onOpenNoteByTitle,
+  onPreviewNote,
+  onPreviewNoteByTitle,
+  onPreviewReport,
   onUpdateTaskStatus,
   onDeleteTask,
   onUpdateDecisionStatus,
@@ -137,7 +155,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   onSaveBriefAsNote,
 }) => {
   const hasSpecificInitialFilter = Boolean(
-    initialLabelFilter || initialClientFilter || initialPersonFilter
+    initialLabelFilter || initialClientFilter || initialProjectFilter || initialPersonFilter
   );
 
   const [hubMode, setHubMode] = useState<ReportsHubMode>(() => {
@@ -156,6 +174,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const [dailyTaskTab, setDailyTaskTab] = useState<
     'today' | 'tomorrow' | 'this-week' | 'sometime' | 'done'
   >('today');
+  const [groupTasksByProject, setGroupTasksByProject] = useState(false);
   const [showAllTodayFocus, setShowAllTodayFocus] = useState(false);
   const [showAgreedDecisions, setShowAgreedDecisions] = useState(false);
   const [showAllRecentNotes, setShowAllRecentNotes] = useState(false);
@@ -182,7 +201,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   }, [directory.people, notes]);
 
   const [clientId, setClientId] = useState(initialClientFilter);
-  const [projectId, setProjectId] = useState('');
+  const [projectId, setProjectId] = useState(initialProjectFilter);
   const [labelFilter, setLabelFilter] = useState(initialLabelFilter);
   const [personFilter, setPersonFilter] = useState(() => {
     if (!initialPersonFilter) return '';
@@ -380,12 +399,53 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const doneTasks = filteredData.matchingTasks.filter((t) => t.status === 'done');
 
   const handleOpenNoteLink = (targetTitle: string) => {
+    if (hubMode === 'daily' && onPreviewNoteByTitle) {
+      onPreviewNoteByTitle(targetTitle);
+      return;
+    }
     if (onOpenNoteByTitle) {
       onOpenNoteByTitle(targetTitle);
       return;
     }
     const found = notes.find((n) => n.title.toLowerCase() === targetTitle.toLowerCase());
-    if (found) onOpenNote(found.id);
+    if (found) {
+      if (hubMode === 'daily' && onPreviewNote) onPreviewNote(found.id);
+      else onOpenNote(found.id);
+    }
+  };
+
+  const openNoteFromBrief = (noteId: string) => {
+    if (onPreviewNote) {
+      onPreviewNote(noteId);
+    } else {
+      onOpenNote(noteId);
+    }
+  };
+
+  const openStreamRollup = (params: {
+    clientId?: string | null;
+    projectId?: string | null;
+    scope?: NoteScope;
+  }) => {
+    const resolvedClient =
+      params.clientId ||
+      (params.scope === 'internal'
+        ? '__internal__'
+        : params.scope === 'inbox'
+        ? '__inbox__'
+        : '');
+
+    if (hubMode === 'daily' && !embeddedInOverlay && onPreviewReport) {
+      onPreviewReport({
+        clientId: resolvedClient || undefined,
+        projectId: params.projectId || undefined,
+      });
+      return;
+    }
+
+    setClientId(resolvedClient);
+    setProjectId(params.projectId || '');
+    switchHubMode('explorer');
   };
 
   const applyPersonFilter = (rawName: string) => {
@@ -397,13 +457,75 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     const canonical = allPeopleNames.find(
       (name) => name.toLowerCase() === trimmed.toLowerCase()
     );
-    setPersonFilter(canonical || trimmed);
+    const resolved = canonical || trimmed;
+    if (hubMode === 'daily' && !embeddedInOverlay && onPreviewReport) {
+      onPreviewReport({ person: resolved });
+      return;
+    }
+    setPersonFilter(resolved);
     switchHubMode('explorer');
   };
 
   const applyLabelFilterFromPill = (lbl: string) => {
+    if (hubMode === 'daily' && !embeddedInOverlay && onPreviewReport) {
+      onPreviewReport({ label: lbl });
+      return;
+    }
     setLabelFilter(lbl);
     switchHubMode('explorer');
+  };
+
+  const renderProjectStreamPill = (
+    item: {
+      clientId?: string | null;
+      projectId?: string | null;
+      scope?: NoteScope;
+      noteId?: string;
+    },
+    stopProp = false
+  ) => {
+    const ctx = resolveItemProjectContext(item, directory, notes);
+    const isInteractive = Boolean(ctx.project || ctx.client || ctx.scope === 'internal');
+
+    const inner = (
+      <>
+        {ctx.color ? (
+          <span className="client-dot" style={{ background: ctx.color }} />
+        ) : (
+          <FolderKanban size={11} style={{ flexShrink: 0, opacity: 0.8 }} />
+        )}
+        {ctx.spacePrefix ? (
+          <>
+            <span className="project-stream-prefix">{ctx.spacePrefix} ›</span>
+            <strong>{ctx.primaryLabel}</strong>
+          </>
+        ) : (
+          <strong>{ctx.primaryLabel}</strong>
+        )}
+      </>
+    );
+
+    if (!isInteractive) {
+      return <span className="project-stream-pill">{inner}</span>;
+    }
+
+    return (
+      <button
+        type="button"
+        className="project-stream-pill is-interactive"
+        onClick={(e) => {
+          if (stopProp) e.stopPropagation();
+          openStreamRollup({
+            clientId: ctx.client?.id || null,
+            projectId: ctx.project?.id || null,
+            scope: ctx.scope,
+          });
+        }}
+        title={`Open ${ctx.fullLabel} rollup`}
+      >
+        {inner}
+      </button>
+    );
   };
 
   const labelOptions = useMemo(() => {
@@ -438,10 +560,43 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     if (dailyTaskTab === 'this-week') return dailyData.thisWeekTasks;
     if (dailyTaskTab === 'sometime') return dailyData.sometimeTasks;
     if (dailyTaskTab === 'done') return dailyData.recentlyCompletedTasks;
-    return showAllTodayFocus
+    return showAllTodayFocus || groupTasksByProject
       ? dailyData.focusTodayTasks
       : dailyData.focusTodayTasks.slice(0, 6);
-  }, [dailyData, dailyTaskTab, showAllTodayFocus]);
+  }, [dailyData, dailyTaskTab, showAllTodayFocus, groupTasksByProject]);
+
+  const groupedDisplayedTasks = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        key: string;
+        label: string;
+        color: string | null;
+        clientId: string | null;
+        projectId: string | null;
+        scope: NoteScope;
+        tasks: ParsedTask[];
+      }
+    >();
+    for (const t of displayedDailyTasks) {
+      const ctx = resolveItemProjectContext(t, directory, notes);
+      let g = map.get(ctx.groupKey);
+      if (!g) {
+        g = {
+          key: ctx.groupKey,
+          label: ctx.fullLabel,
+          color: ctx.color,
+          clientId: ctx.client?.id || null,
+          projectId: ctx.project?.id || null,
+          scope: ctx.scope,
+          tasks: [],
+        };
+        map.set(ctx.groupKey, g);
+      }
+      g.tasks.push(t);
+    }
+    return Array.from(map.values());
+  }, [displayedDailyTasks, directory, notes]);
 
   const driftCount =
     dailyData.signals.staleItems.length + dailyData.signals.silentProjects.length;
@@ -454,6 +609,135 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   const visibleNotesSlice = showAllRecentNotes
     ? dailyData.visibleRecentNotes
     : dailyData.visibleRecentNotes.slice(0, 4);
+
+  const renderDailyTaskCard = (t: ParsedTask, hideProjectPill = false) => {
+    const nextStatus =
+      TASK_CYCLE[(TASK_CYCLE.indexOf(t.status) + 1) % TASK_CYCLE.length];
+    const inlineMentions = extractInlineMentions(t.text, directory.people);
+    const ownerAlreadyInline = Boolean(
+      t.owner &&
+        inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase())
+    );
+    const isOverdue = isTaskActivelyOverdue(
+      t,
+      directory.dailyRetro,
+      todayDate
+    );
+    const isDueToday = Boolean(
+      t.status !== 'done' && t.dueDate === todayDate
+    );
+    const plan = getTaskRetroPlan(directory.dailyRetro, t);
+    const effectiveHorizon = resolveEffectiveTaskHorizon(
+      t,
+      directory.dailyRetro,
+      todayDate
+    );
+
+    return (
+      <div
+        key={t.id}
+        className={`task-inline-card ${t.status === 'done' ? 'is-done' : ''} ${
+          isOverdue ? 'task-card-overdue' : isDueToday ? 'task-card-due-today' : ''
+        }`}
+      >
+        <div
+          className="task-left"
+          style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className={`status-badge status-${t.status}`}
+              onClick={() => onUpdateTaskStatus(t, nextStatus)}
+              title="Click to update task status directly in source .md note"
+            >
+              {t.status}
+            </button>
+
+            {!hideProjectPill && renderProjectStreamPill(t)}
+
+            {plan?.starred && (
+              <span className="retro-star-chip" title="Top Focus from Daily Retro">
+                <Star size={10} fill="currentColor" /> Focus
+              </span>
+            )}
+
+            {isOverdue && (
+              <span className="priority-high" title={`Overdue since ${t.dueDate}`}>
+                <AlertTriangle size={10} style={{ marginRight: 3, verticalAlign: '-1px' }} />
+                {t.dueDate}
+              </span>
+            )}
+            {isDueToday && <span className="daily-due-today-badge">TODAY</span>}
+
+            <span className="task-text">{renderInline(t.text)}</span>
+
+            {t.owner && !ownerAlreadyInline && (
+              <button
+                type="button"
+                className="pill pill-person"
+                onClick={() => applyPersonFilter(t.owner!)}
+              >
+                @{t.owner}
+              </button>
+            )}
+          </div>
+
+          {plan?.comment && (
+            <div className="retro-inline-comment">
+              <span>Retro note: {plan.comment}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="task-right">
+          {t.priority === 'high' && <span className="priority-high">!HIGH</span>}
+          {t.dueDate && !isOverdue && !isDueToday && (
+            <span className="due-chip">due {t.dueDate}</span>
+          )}
+          {onTriageTaskHorizon && t.status !== 'done' && (
+            <select
+              className="task-horizon-select no-print"
+              aria-label="Task horizon"
+              value={plan?.bucket === 'date' ? 'date' : effectiveHorizon}
+              onChange={(e) => {
+                const val = e.target.value as TaskHorizonBucket;
+                if (val === 'tomorrow') {
+                  onTriageTaskHorizon(t, 'tomorrow', addDaysIso(todayDate, 1));
+                } else {
+                  onTriageTaskHorizon(t, val);
+                }
+              }}
+            >
+              <option value="today">Today</option>
+              <option value="tomorrow">Tomorrow</option>
+              <option value="this-week">This Week</option>
+              <option value="sometime">Sometime</option>
+              {plan?.bucket === 'date' && plan.targetDate && (
+                <option value="date">{plan.targetDate}</option>
+              )}
+            </select>
+          )}
+          <button
+            type="button"
+            className="pill pill-link"
+            onClick={() => openNoteFromBrief(t.noteId)}
+            title="Preview source note in popup / bottom sheet"
+          >
+            ↗ {t.noteTitle}
+          </button>
+          <button
+            type="button"
+            className="mini-icon-btn danger"
+            title="Delete task from source note"
+            onClick={() => onDeleteTask(t)}
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className={embeddedInOverlay ? 'overlay-report-view' : 'page-scroll'}>
@@ -516,10 +800,10 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     type="button"
                     className="inline-note-jump-btn"
                     onClick={() => {
-                      if (onOpenDailyReportNote) {
+                      if (dailyReportNote) {
+                        openNoteFromBrief(dailyReportNote.id);
+                      } else if (onOpenDailyReportNote) {
                         onOpenDailyReportNote();
-                      } else if (dailyReportNote) {
-                        onOpenNote(dailyReportNote.id);
                       }
                     }}
                   >
@@ -617,7 +901,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                             onOpenDailyReportNote();
                           }}
                         >
-                          <FileText size={13} /> Open Daily Report .md
+                          <FileText size={13} /> Edit Daily Report .md
                         </button>
                       )}
 
@@ -649,7 +933,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               </div>
             </div>
 
-            {/* Compact Signal Pulse Strip (Replaces bulky 5-card KPI grid) */}
+            {/* Compact Signal Pulse Strip */}
             <div className="daily-signal-strip no-print" role="region" aria-label="Daily Signals">
               <button
                 type="button"
@@ -710,10 +994,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                 <button
                   type="button"
                   className="signal-pill"
-                  onClick={() => {
-                    setClientId('__inbox__');
-                    switchHubMode('explorer');
-                  }}
+                  onClick={() => openStreamRollup({ scope: 'inbox' })}
                 >
                   <strong>{dailyData.signals.untriagedInboxCount}</strong>
                   <span>Inbox</span>
@@ -793,7 +1074,18 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
             {/* Horizon-Driven Tasks Panel */}
             <div className="surface-panel">
               <div className="daily-panel-header">
-                <strong style={{ fontSize: 14.5 }}>Action Horizons</strong>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <strong style={{ fontSize: 14.5 }}>Action Horizons</strong>
+                  <button
+                    type="button"
+                    className={`btn btn-xs no-print ${groupTasksByProject ? 'btn-soft' : 'btn-ghost'}`}
+                    onClick={() => setGroupTasksByProject((v) => !v)}
+                    title="Group tasks by Project & Client"
+                  >
+                    <FolderKanban size={12} />
+                    <span>By Project</span>
+                  </button>
+                </div>
 
                 <div className="no-print daily-horizon-tabs">
                   <button
@@ -848,150 +1140,40 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       : 'No completed tasks in the selected window yet.'}
                   </span>
                 </div>
+              ) : groupTasksByProject ? (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {groupedDisplayedTasks.map((group) => (
+                    <div key={group.key} className="project-task-group">
+                      <div className="project-task-group-header">
+                        <button
+                          type="button"
+                          className="project-stream-pill is-prominent is-interactive"
+                          onClick={() =>
+                            openStreamRollup({
+                              clientId: group.clientId,
+                              projectId: group.projectId,
+                              scope: group.scope,
+                            })
+                          }
+                        >
+                          {group.color ? (
+                            <span className="client-dot" style={{ background: group.color }} />
+                          ) : (
+                            <FolderKanban size={12} />
+                          )}
+                          <strong>{group.label}</strong>
+                          <span className="due-chip">{group.tasks.length}</span>
+                        </button>
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        {group.tasks.map((t) => renderDailyTaskCard(t, true))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {displayedDailyTasks.map((t) => {
-                    const nextStatus =
-                      TASK_CYCLE[(TASK_CYCLE.indexOf(t.status) + 1) % TASK_CYCLE.length];
-                    const inlineMentions = extractInlineMentions(t.text, directory.people);
-                    const ownerAlreadyInline = Boolean(
-                      t.owner &&
-                        inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase())
-                    );
-                    const isOverdue = isTaskActivelyOverdue(
-                      t,
-                      directory.dailyRetro,
-                      todayDate
-                    );
-                    const isDueToday = Boolean(
-                      t.status !== 'done' && t.dueDate === todayDate
-                    );
-                    const taskClient = t.clientId
-                      ? directory.clients.find((c) => c.id === t.clientId)
-                      : null;
-                    const plan = getTaskRetroPlan(directory.dailyRetro, t);
-                    const effectiveHorizon = resolveEffectiveTaskHorizon(
-                      t,
-                      directory.dailyRetro,
-                      todayDate
-                    );
-
-                    return (
-                      <div
-                        key={t.id}
-                        className={`task-inline-card ${t.status === 'done' ? 'is-done' : ''} ${
-                          isOverdue ? 'task-card-overdue' : isDueToday ? 'task-card-due-today' : ''
-                        }`}
-                      >
-                        <div className="task-left" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
-                            <button
-                              type="button"
-                              className={`status-badge status-${t.status}`}
-                              onClick={() => onUpdateTaskStatus(t, nextStatus)}
-                              title="Click to update task status directly in source .md note"
-                            >
-                              {t.status}
-                            </button>
-
-                            {plan?.starred && (
-                              <span className="retro-star-chip" title="Top Focus from Daily Retro">
-                                <Star size={10} fill="currentColor" /> Focus
-                              </span>
-                            )}
-
-                            {isOverdue && (
-                              <span className="priority-high" title={`Overdue since ${t.dueDate}`}>
-                                <AlertTriangle size={10} style={{ marginRight: 3, verticalAlign: '-1px' }} />
-                                {t.dueDate}
-                              </span>
-                            )}
-                            {isDueToday && (
-                              <span className="daily-due-today-badge">TODAY</span>
-                            )}
-
-                            <span className="task-text">{renderInline(t.text)}</span>
-
-                            {t.owner && !ownerAlreadyInline && (
-                              <button
-                                type="button"
-                                className="pill pill-person"
-                                onClick={() => applyPersonFilter(t.owner!)}
-                              >
-                                @{t.owner}
-                              </button>
-                            )}
-                          </div>
-
-                          {plan?.comment && (
-                            <div className="retro-inline-comment">
-                              <span>Retro note: {plan.comment}</span>
-                            </div>
-                          )}
-                        </div>
-
-                        <div className="task-right">
-                          {t.priority === 'high' && <span className="priority-high">!HIGH</span>}
-                          {t.dueDate && !isOverdue && !isDueToday && (
-                            <span className="due-chip">due {t.dueDate}</span>
-                          )}
-                          {onTriageTaskHorizon && t.status !== 'done' && (
-                            <select
-                              className="task-horizon-select no-print"
-                              aria-label="Task horizon"
-                              value={plan?.bucket === 'date' ? 'date' : effectiveHorizon}
-                              onChange={(e) => {
-                                const val = e.target.value as TaskHorizonBucket;
-                                if (val === 'tomorrow') {
-                                  onTriageTaskHorizon(t, 'tomorrow', addDaysIso(todayDate, 1));
-                                } else {
-                                  onTriageTaskHorizon(t, val);
-                                }
-                              }}
-                            >
-                              <option value="today">Today</option>
-                              <option value="tomorrow">Tomorrow</option>
-                              <option value="this-week">This Week</option>
-                              <option value="sometime">Sometime</option>
-                              {plan?.bucket === 'date' && plan.targetDate && (
-                                <option value="date">{plan.targetDate}</option>
-                              )}
-                            </select>
-                          )}
-                          {taskClient && (
-                            <span
-                              className="context-chip"
-                              onClick={() => {
-                                setClientId(taskClient.id);
-                                setHubMode('explorer');
-                              }}
-                            >
-                              <span
-                                className="client-dot"
-                                style={{ background: taskClient.color }}
-                              />
-                              {taskClient.name}
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            className="pill pill-link"
-                            onClick={() => onOpenNote(t.noteId)}
-                          >
-                            ↗ {t.noteTitle}
-                          </button>
-                          <button
-                            type="button"
-                            className="mini-icon-btn danger"
-                            title="Delete task from source note"
-                            onClick={() => onDeleteTask(t)}
-                          >
-                            <Trash2 size={13} />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
+                  {displayedDailyTasks.map((t) => renderDailyTaskCard(t, false))}
 
                   {dailyTaskTab === 'today' && dailyData.focusTodayTasks.length > 6 && (
                     <button
@@ -1047,28 +1229,36 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                             </span>
                           </div>
                           <ul className="signal-mini-list">
-                            {group.tasks.slice(0, 2).map((t) => (
-                              <li key={t.id}>
-                                <button
-                                  type="button"
-                                  className="signal-item-link"
-                                  onClick={() => onOpenNote(t.noteId)}
-                                >
-                                  {t.text}
-                                </button>
-                              </li>
-                            ))}
-                            {group.decisions.slice(0, 1).map((d) => (
-                              <li key={d.id}>
-                                <button
-                                  type="button"
-                                  className="signal-item-link"
-                                  onClick={() => onOpenNote(d.noteId)}
-                                >
-                                  [Sign-off] {d.text}
-                                </button>
-                              </li>
-                            ))}
+                            {group.tasks.slice(0, 2).map((t) => {
+                              const ctx = resolveItemProjectContext(t, directory, notes);
+                              return (
+                                <li key={t.id}>
+                                  <button
+                                    type="button"
+                                    className="signal-item-link"
+                                    onClick={() => openNoteFromBrief(t.noteId)}
+                                  >
+                                    <span className="signal-inline-proj">[{ctx.primaryLabel}]</span>{' '}
+                                    {t.text}
+                                  </button>
+                                </li>
+                              );
+                            })}
+                            {group.decisions.slice(0, 1).map((d) => {
+                              const ctx = resolveItemProjectContext(d, directory, notes);
+                              return (
+                                <li key={d.id}>
+                                  <button
+                                    type="button"
+                                    className="signal-item-link"
+                                    onClick={() => openNoteFromBrief(d.noteId)}
+                                  >
+                                    <span className="signal-inline-proj">[{ctx.primaryLabel}]</span>{' '}
+                                    [Sign-off] {d.text}
+                                  </button>
+                                </li>
+                              );
+                            })}
                           </ul>
                         </div>
                       ))}
@@ -1083,42 +1273,48 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       </div>
                       {dailyData.signals.staleItems.slice(0, 4).map((item) => (
                         <div key={item.id} className="signal-drift-row">
-                          <div style={{ minWidth: 0 }}>
-                            <span className="signal-drift-tag">
-                              {item.kind === 'unassigned-urgent'
-                                ? 'No Owner'
-                                : `${item.ageDays}d waiting`}
-                            </span>{' '}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                              <span className="signal-drift-tag">
+                                {item.kind === 'unassigned-urgent'
+                                  ? 'No Owner'
+                                  : `${item.ageDays}d waiting`}
+                              </span>
+                              {renderProjectStreamPill({
+                                clientId: item.clientId,
+                                projectId: item.projectId,
+                                noteId: item.noteId,
+                              })}
+                            </div>
                             <button
                               type="button"
                               className="signal-item-link"
-                              onClick={() => onOpenNote(item.noteId)}
+                              onClick={() => openNoteFromBrief(item.noteId)}
                             >
                               {item.title}
                             </button>
                           </div>
-                          <span className="due-chip">{item.noteTitle}</span>
+                          <button
+                            type="button"
+                            className="pill pill-link"
+                            onClick={() => openNoteFromBrief(item.noteId)}
+                          >
+                            ↗ {item.noteTitle}
+                          </button>
                         </div>
                       ))}
 
                       {dailyData.signals.silentProjects.map((sp) => (
                         <div key={sp.project.id} className="signal-drift-row">
-                          <div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                             <span className="signal-drift-tag">
                               Quiet {sp.daysSinceLastNote}d
-                            </span>{' '}
-                            <button
-                              type="button"
-                              className="signal-item-link"
-                              onClick={() => {
-                                setClientId(sp.project.clientId || '__internal__');
-                                setProjectId(sp.project.id);
-                                switchHubMode('explorer');
-                              }}
-                            >
-                              {sp.project.name}
-                              {sp.clientName ? ` (${sp.clientName})` : ''}
-                            </button>
+                            </span>
+                            {renderProjectStreamPill({
+                              clientId: sp.project.clientId,
+                              projectId: sp.project.id,
+                              scope: sp.project.scope,
+                            })}
                           </div>
                           <span className="due-chip">Active project</span>
                         </div>
@@ -1159,9 +1355,6 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   ].map((d) => {
                     const nextStatus =
                       DEC_CYCLE[(DEC_CYCLE.indexOf(d.status) + 1) % DEC_CYCLE.length];
-                    const decClient = d.clientId
-                      ? directory.clients.find((c) => c.id === d.clientId)
-                      : null;
                     const fb = getDecisionRetroFeedback(directory.dailyRetro, d);
 
                     return (
@@ -1188,6 +1381,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                             >
                               <Gavel size={11} /> {d.status}
                             </button>
+
+                            {renderProjectStreamPill(d)}
+
                             {fb?.rating === 'high' && (
                               <span className="retro-star-chip">
                                 <Star size={10} fill="currentColor" /> Key
@@ -1200,25 +1396,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           </div>
 
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            {decClient && (
-                              <span
-                                className="context-chip"
-                                onClick={() => {
-                                  setClientId(decClient.id);
-                                  setHubMode('explorer');
-                                }}
-                              >
-                                <span
-                                  className="client-dot"
-                                  style={{ background: decClient.color }}
-                                />
-                                {decClient.name}
-                              </span>
-                            )}
                             <button
                               type="button"
                               className="pill pill-link"
-                              onClick={() => onOpenNote(d.noteId)}
+                              onClick={() => openNoteFromBrief(d.noteId)}
+                              title="Preview source note in popup / bottom sheet"
                             >
                               ↗ {d.noteTitle} ({d.noteDate})
                             </button>
@@ -1279,12 +1461,6 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
                 <div className="report-notes-grid">
                   {visibleNotesSlice.map((n) => {
-                    const noteClient = n.clientId
-                      ? directory.clients.find((c) => c.id === n.clientId)
-                      : undefined;
-                    const noteProject = n.projectId
-                      ? directory.projects.find((p) => p.id === n.projectId)
-                      : undefined;
                     const noteLabels = getAllNoteLabels(n);
                     const notePeople = Array.from(
                       new Set([
@@ -1311,11 +1487,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                         className="report-note-card"
                         role="button"
                         tabIndex={0}
-                        onClick={() => onOpenNote(n.id)}
+                        onClick={() => openNoteFromBrief(n.id)}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' || e.key === ' ') {
                             e.preventDefault();
-                            onOpenNote(n.id);
+                            openNoteFromBrief(n.id);
                           }
                         }}
                       >
@@ -1334,34 +1510,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           </div>
 
                           <div className="report-note-card-meta">
-                            {noteClient ? (
-                              <span
-                                className="context-chip"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setClientId(noteClient.id);
-                                  setHubMode('explorer');
-                                }}
-                              >
-                                <span
-                                  className="client-dot"
-                                  style={{ background: noteClient.color }}
-                                />
-                                {noteClient.name}
-                                {noteProject ? ` · ${noteProject.name}` : ''}
-                              </span>
-                            ) : n.scope === 'internal' ? (
-                              <span
-                                className="context-chip"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setClientId('__internal__');
-                                  setHubMode('explorer');
-                                }}
-                              >
-                                Internal{noteProject ? ` · ${noteProject.name}` : ''}
-                              </span>
-                            ) : null}
+                            {renderProjectStreamPill(n, true)}
 
                             {noteOpenTasks > 0 && (
                               <span className="due-chip">{noteOpenTasks} open</span>

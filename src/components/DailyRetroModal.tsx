@@ -10,6 +10,7 @@ import {
   Clock,
   EyeOff,
   FileText,
+  FolderKanban,
   Gavel,
   ListChecks,
   MessageSquarePlus,
@@ -22,6 +23,7 @@ import {
 import type {
   DecisionStatus,
   Note,
+  NoteScope,
   ParsedDecision,
   ParsedTask,
   RetroSignalRating,
@@ -36,6 +38,7 @@ import {
   getNoteRetroFeedback,
   getTaskRetroPlan,
   resolveEffectiveTaskHorizon,
+  resolveItemProjectContext,
 } from '../utils/dailyRetro';
 import {
   getAllNoteLabels,
@@ -51,8 +54,11 @@ interface DailyRetroModalProps {
   directory: WorkspaceDirectory;
   todayDate: string;
   isRefreshingBriefing?: boolean;
+  suspendKeyboard?: boolean;
   onClose: () => void;
-  onOpenNote: (noteId: string) => void;
+  onPreviewNote: (noteId: string) => void;
+  onPreviewNoteByTitle?: (noteTitle: string) => void;
+  onPreviewProject?: (clientId: string | null, projectId: string | null) => void;
   onRateNote: (noteId: string, rating: RetroSignalRating, comment?: string) => void;
   onTriageTask: (
     task: ParsedTask,
@@ -108,8 +114,11 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
   directory,
   todayDate,
   isRefreshingBriefing = false,
+  suspendKeyboard = false,
   onClose,
-  onOpenNote,
+  onPreviewNote,
+  onPreviewNoteByTitle,
+  onPreviewProject,
   onRateNote,
   onTriageTask,
   onReviewDecision,
@@ -421,6 +430,7 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
   // Desktop keyboard shortcuts for rapid triage
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (suspendKeyboard) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         onClose();
@@ -539,6 +549,55 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
   };
 
   const tomorrowIso = addDaysIso(todayDate, 1);
+
+  const renderProjectBanner = (item: {
+    clientId?: string | null;
+    projectId?: string | null;
+    scope?: NoteScope;
+    noteId?: string;
+  }) => {
+    const ctx = resolveItemProjectContext(item, directory, notes);
+    const canClick =
+      Boolean(onPreviewProject) && Boolean(ctx.project || ctx.client);
+
+    const content = (
+      <>
+        {ctx.color ? (
+          <span className="client-dot" style={{ background: ctx.color }} />
+        ) : (
+          <FolderKanban size={12} style={{ flexShrink: 0 }} />
+        )}
+        {ctx.spacePrefix ? (
+          <>
+            <span className="project-stream-prefix">{ctx.spacePrefix} ›</span>
+            <strong>{ctx.primaryLabel}</strong>
+          </>
+        ) : (
+          <strong>{ctx.primaryLabel}</strong>
+        )}
+      </>
+    );
+
+    if (canClick) {
+      return (
+        <button
+          type="button"
+          className="project-stream-pill is-prominent is-interactive"
+          onClick={() =>
+            onPreviewProject?.(
+              ctx.client ? ctx.client.id : ctx.scope === 'internal' ? '__internal__' : null,
+              ctx.project ? ctx.project.id : null
+            )
+          }
+          title={`Preview ${ctx.fullLabel} rollup`}
+        >
+          {content}
+        </button>
+      );
+    }
+
+    return <span className="project-stream-pill is-prominent">{content}</span>;
+  };
 
   return (
     <div
@@ -665,6 +724,7 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
               ) : (
                 deckNotes.map((n, idx) => {
                   const fb = getNoteRetroFeedback(retroStore, n.id);
+                  const ctx = resolveItemProjectContext(n, directory);
                   return (
                     <button
                       key={n.id}
@@ -675,7 +735,9 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                         setShowJumpList(false);
                       }}
                     >
-                      <span className="retro-jump-title">{n.title || 'Untitled Note'}</span>
+                      <span className="retro-jump-title">
+                        <strong>[{ctx.primaryLabel}]</strong> {n.title || 'Untitled Note'}
+                      </span>
                       <span className="retro-jump-tag">
                         {fb?.reviewedDate === todayDate ? fb.rating.toUpperCase() : 'Pending'}
                       </span>
@@ -690,6 +752,7 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
               ) : (
                 deckTasks.map((t, idx) => {
                   const plan = getTaskRetroPlan(retroStore, t);
+                  const ctx = resolveItemProjectContext(t, directory, notes);
                   return (
                     <button
                       key={t.id}
@@ -700,7 +763,9 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                         setShowJumpList(false);
                       }}
                     >
-                      <span className="retro-jump-title">{t.text}</span>
+                      <span className="retro-jump-title">
+                        <strong>[{ctx.primaryLabel}]</strong> {t.text}
+                      </span>
                       <span className="retro-jump-tag">
                         {t.status === 'done'
                           ? 'DONE'
@@ -719,6 +784,7 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
               ) : (
                 deckDecisions.map((d, idx) => {
                   const fb = getDecisionRetroFeedback(retroStore, d);
+                  const ctx = resolveItemProjectContext(d, directory, notes);
                   return (
                     <button
                       key={d.id}
@@ -729,7 +795,9 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                         setShowJumpList(false);
                       }}
                     >
-                      <span className="retro-jump-title">{d.text}</span>
+                      <span className="retro-jump-title">
+                        <strong>[{ctx.primaryLabel}]</strong> {d.text}
+                      </span>
                       <span className="retro-jump-tag">
                         {fb ? `${d.status} · ${fb.rating}` : d.status}
                       </span>
@@ -801,33 +869,17 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                     </div>
                   </div>
 
+                  {/* Prominent Project & Space Header */}
+                  <div className="retro-project-row">
+                    {renderProjectBanner(activeNote)}
+                    <span className="due-chip">{activeNote.date}</span>
+                  </div>
+
                   <h2 className="retro-card-headline">
                     {activeNote.title || 'Untitled Note'}
                   </h2>
 
                   <div className="retro-card-meta">
-                    {(() => {
-                      const c = activeNote.clientId
-                        ? directory.clients.find((x) => x.id === activeNote.clientId)
-                        : null;
-                      const p = activeNote.projectId
-                        ? directory.projects.find((x) => x.id === activeNote.projectId)
-                        : null;
-                      return c ? (
-                        <span className="context-chip">
-                          <span className="client-dot" style={{ background: c.color }} />
-                          {c.name}
-                          {p ? ` · ${p.name}` : ''}
-                        </span>
-                      ) : (
-                        <span className="due-chip">
-                          {activeNote.scope === 'internal'
-                            ? `Internal${p ? ` · ${p.name}` : ''}`
-                            : 'Inbox'}
-                        </span>
-                      );
-                    })()}
-                    <span className="due-chip">{activeNote.date}</span>
                     {getAllNoteLabels(activeNote)
                       .slice(0, 3)
                       .map((lbl) => (
@@ -837,13 +889,10 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                       ))}
                     <button
                       type="button"
-                      className="retro-link-btn"
-                      onClick={() => {
-                        onOpenNote(activeNote.id);
-                        onClose();
-                      }}
+                      className="pill pill-link"
+                      onClick={() => onPreviewNote(activeNote.id)}
                     >
-                      Open in Editor ↗
+                      <FileText size={11} /> Preview Full Note
                     </button>
                   </div>
 
@@ -964,27 +1013,30 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                     </div>
                   </div>
 
+                  {/* Prominent Project & Space Header */}
+                  <div className="retro-project-row">
+                    {renderProjectBanner(activeTask)}
+                    <button
+                      type="button"
+                      className="pill pill-link"
+                      onClick={() => onPreviewNote(activeTask.noteId)}
+                      title="Preview source note in popup / bottom sheet"
+                    >
+                      ↗ {activeTask.noteTitle}
+                    </button>
+                  </div>
+
                   <div className="retro-task-headline">
                     <RichInlineText
                       text={activeTask.text}
                       people={directory.people}
                       clients={directory.clients}
                       notes={notes}
+                      onClickNoteLink={onPreviewNoteByTitle}
                     />
                   </div>
 
                   <div className="retro-card-meta">
-                    {(() => {
-                      const c = activeTask.clientId
-                        ? directory.clients.find((x) => x.id === activeTask.clientId)
-                        : null;
-                      return c ? (
-                        <span className="context-chip">
-                          <span className="client-dot" style={{ background: c.color }} />
-                          {c.name}
-                        </span>
-                      ) : null;
-                    })()}
                     {activeTask.owner && (
                       <span className="pill pill-person">@{activeTask.owner}</span>
                     )}
@@ -1002,16 +1054,6 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                     {activeTask.priority === 'high' && (
                       <span className="priority-high">!HIGH</span>
                     )}
-                    <button
-                      type="button"
-                      className="pill pill-link"
-                      onClick={() => {
-                        onOpenNote(activeTask.noteId);
-                        onClose();
-                      }}
-                    >
-                      ↗ {activeTask.noteTitle}
-                    </button>
                   </div>
 
                   {/* Quick Status & Star Strip */}
@@ -1152,18 +1194,39 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                     )}
                   </div>
 
+                  {/* Prominent Project & Space Header */}
+                  <div className="retro-project-row">
+                    {renderProjectBanner(activeDecision)}
+                    <button
+                      type="button"
+                      className="pill pill-link"
+                      onClick={() => onPreviewNote(activeDecision.noteId)}
+                      title="Preview source note in popup / bottom sheet"
+                    >
+                      ↗ {activeDecision.noteTitle}
+                    </button>
+                  </div>
+
                   <div className="retro-task-headline">
                     <RichInlineText
                       text={activeDecision.text}
                       people={directory.people}
                       clients={directory.clients}
                       notes={notes}
+                      onClickNoteLink={onPreviewNoteByTitle}
                     />
                   </div>
 
                   {activeDecision.rationale && (
                     <div className="decision-rationale">
-                      Rationale: {activeDecision.rationale}
+                      Rationale:{' '}
+                      <RichInlineText
+                        text={activeDecision.rationale}
+                        people={directory.people}
+                        clients={directory.clients}
+                        notes={notes}
+                        onClickNoteLink={onPreviewNoteByTitle}
+                      />
                     </div>
                   )}
 
@@ -1172,16 +1235,6 @@ export const DailyRetroModal: React.FC<DailyRetroModalProps> = ({
                       <Gavel size={11} /> {activeDecision.status}
                     </span>
                     <span className="due-chip">{activeDecision.noteDate}</span>
-                    <button
-                      type="button"
-                      className="pill pill-link"
-                      onClick={() => {
-                        onOpenNote(activeDecision.noteId);
-                        onClose();
-                      }}
-                    >
-                      ↗ {activeDecision.noteTitle}
-                    </button>
                   </div>
 
                   {/* Quick Status Switcher */}

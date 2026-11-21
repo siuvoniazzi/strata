@@ -6,6 +6,7 @@ import {
   CornerUpLeft,
   ExternalLink,
   FileText,
+  FolderKanban,
   Hash,
   Printer,
   User,
@@ -31,6 +32,7 @@ export type OverlayEntry =
       label?: string;
       person?: string;
       clientId?: string;
+      projectId?: string;
     }
   | {
       kind: 'note';
@@ -46,7 +48,8 @@ export function isSameOverlayEntry(a: OverlayEntry | undefined, b: OverlayEntry)
     return (
       (a.label || '').toLowerCase() === (b.label || '').toLowerCase() &&
       (a.person || '').toLowerCase() === (b.person || '').toLowerCase() &&
-      (a.clientId || '') === (b.clientId || '')
+      (a.clientId || '') === (b.clientId || '') &&
+      (a.projectId || '') === (b.projectId || '')
     );
   }
   return false;
@@ -56,6 +59,8 @@ export interface WorkspaceOverlayProps {
   stack: OverlayEntry[];
   originNoteId: string;
   originNoteTitle: string;
+  /** Optional explicit return destination label (e.g. "Daily Retro" or "Daily Brief") */
+  returnLabel?: string;
   notes: Note[];
   directory: WorkspaceDirectory;
   allLabels: string[];
@@ -71,6 +76,7 @@ export interface WorkspaceOverlayProps {
     label?: string;
     person?: string;
     clientId?: string;
+    projectId?: string;
   }) => void;
   onUpdateTaskStatus: (task: ParsedTask, status: TaskStatus) => void;
   onDeleteTask: (task: ParsedTask) => void;
@@ -88,6 +94,7 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
   stack,
   originNoteId,
   originNoteTitle,
+  returnLabel,
   notes,
   directory,
   allLabels,
@@ -132,6 +139,9 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
     cleanOriginTitle.length > 28
       ? `${cleanOriginTitle.slice(0, 28).trimEnd()}…`
       : cleanOriginTitle;
+  const effectiveReturnText = returnLabel
+    ? `Back to ${returnLabel}`
+    : `Back to “${shortOriginTitle}”`;
 
   const targetNote =
     currentEntry.kind === 'note'
@@ -152,7 +162,7 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
         <span className="workspace-overlay-badge">
           <User size={13} />
           <span>
-            Stakeholder Dossier &amp; Notes · <strong>@{currentEntry.person}</strong>
+            Stakeholder Dossier · <strong>@{currentEntry.person}</strong>
           </span>
         </span>
       );
@@ -167,14 +177,36 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
         </span>
       );
     }
+    if (currentEntry.projectId) {
+      const proj = directory.projects.find((p) => p.id === currentEntry.projectId);
+      const client = proj?.clientId
+        ? directory.clients.find((c) => c.id === proj.clientId)
+        : null;
+      return (
+        <span className="workspace-overlay-badge">
+          <FolderKanban size={13} />
+          <span>
+            Project ·{' '}
+            <strong>
+              {client ? `${client.name} › ` : ''}
+              {proj?.name || 'Project'}
+            </strong>
+          </span>
+        </span>
+      );
+    }
     if (currentEntry.clientId) {
       const cName =
-        directory.clients.find((c) => c.id === currentEntry.clientId)?.name || 'Client';
+        currentEntry.clientId === '__internal__'
+          ? 'Internal Workspace'
+          : currentEntry.clientId === '__inbox__'
+          ? 'Inbox'
+          : directory.clients.find((c) => c.id === currentEntry.clientId)?.name || 'Client';
       return (
         <span className="workspace-overlay-badge">
           <BarChart3 size={13} />
           <span>
-            Client Report · <strong>{cName}</strong>
+            Report · <strong>{cName}</strong>
           </span>
         </span>
       );
@@ -199,6 +231,10 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
         className="workspace-overlay-panel"
         onClick={(e) => e.stopPropagation()}
       >
+        <div className="overlay-mobile-grabber no-print" aria-hidden="true">
+          <span />
+        </div>
+
         {/* Sticky Overlay Navigation Header */}
         <header className="workspace-overlay-header no-print">
           <div className="workspace-overlay-header-left">
@@ -222,12 +258,12 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
                 {targetNote.id !== originNoteId && (
                   <button
                     type="button"
-                    className="btn btn-xs btn-primary"
+                    className="btn btn-xs btn-soft"
                     onClick={() => onOpenNoteInEditor(targetNote.id)}
-                    title="Switch the main editor to this note and close overlay"
+                    title="Switch to full note editor and leave current view"
                   >
                     <ExternalLink size={12} />
-                    Open in Editor
+                    Edit Note
                   </button>
                 )}
                 <ShareNoteMenu
@@ -256,9 +292,10 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
                     label: currentEntry.label,
                     person: currentEntry.person,
                     clientId: currentEntry.clientId,
+                    projectId: currentEntry.projectId,
                   })
                 }
-                title="Leave current note and open full-page Reports Hub"
+                title="Open full-page Reports Hub"
               >
                 <ExternalLink size={12} />
                 Full Reports Hub
@@ -270,10 +307,10 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
               type="button"
               className="btn btn-xs overlay-return-btn"
               onClick={onClose}
-              title={`Close overlay and return to "${cleanOriginTitle}" (Esc)`}
+              title={`Close preview (${effectiveReturnText})`}
             >
               <CornerUpLeft size={13} />
-              <span>Back to “{shortOriginTitle}”</span>
+              <span>{effectiveReturnText}</span>
               <span className="kbd desktop-only">ESC</span>
             </button>
 
@@ -293,24 +330,33 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
         <div ref={bodyRef} className="workspace-overlay-body">
           {currentEntry.kind === 'report' ? (
             <ReportsView
-              key={`overlay-report-${stack.length}-${currentEntry.label || ''}-${currentEntry.person || ''}-${currentEntry.clientId || ''}`}
+              key={`overlay-report-${stack.length}-${currentEntry.label || ''}-${currentEntry.person || ''}-${currentEntry.clientId || ''}-${currentEntry.projectId || ''}`}
               notes={notes}
               directory={directory}
               allLabels={allLabels}
               aiConfig={aiConfig}
               initialLabelFilter={currentEntry.label}
               initialClientFilter={currentEntry.clientId}
+              initialProjectFilter={currentEntry.projectId}
               initialPersonFilter={currentEntry.person}
               embeddedInOverlay
               activeEditorNoteId={originNoteId}
               onOpenNote={(noteId) => {
-                if (noteId === originNoteId) {
+                if (originNoteId && noteId === originNoteId) {
+                  onClose();
+                } else {
+                  onPushEntry({ kind: 'note', noteId });
+                }
+              }}
+              onPreviewNote={(noteId) => {
+                if (originNoteId && noteId === originNoteId) {
                   onClose();
                 } else {
                   onPushEntry({ kind: 'note', noteId });
                 }
               }}
               onOpenNoteByTitle={onOpenOrPeekNoteByTitle}
+              onPreviewNoteByTitle={onOpenOrPeekNoteByTitle}
               onUpdateTaskStatus={onUpdateTaskStatus}
               onDeleteTask={onDeleteTask}
               onUpdateDecisionStatus={onUpdateDecisionStatus}
@@ -325,7 +371,7 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
                   This note may have been deleted from the workspace.
                 </span>
                 <button type="button" className="btn btn-xs btn-soft" onClick={onClose}>
-                  Return to “{shortOriginTitle}”
+                  {effectiveReturnText}
                 </button>
               </div>
             </div>
@@ -360,26 +406,55 @@ export const WorkspaceOverlay: React.FC<WorkspaceOverlayProps> = ({
                       {noteClient ? (
                         <button
                           type="button"
-                          className="context-chip"
+                          className="project-stream-pill is-interactive"
                           onClick={() =>
-                            onPushEntry({ kind: 'report', clientId: noteClient.id })
+                            onPushEntry({
+                              kind: 'report',
+                              clientId: noteClient.id,
+                              projectId: noteProject?.id,
+                            })
                           }
-                          title={`Open ${noteClient.name} report in overlay`}
+                          title={`Open ${noteProject ? `${noteClient.name} › ${noteProject.name}` : noteClient.name} report in overlay`}
                         >
                           <span
                             className="client-dot"
                             style={{ background: noteClient.color }}
                           />
-                          {noteClient.name}
-                          {noteProject ? ` · ${noteProject.name}` : ''}
+                          {noteProject ? (
+                            <>
+                              <span className="project-stream-prefix">{noteClient.name} ›</span>
+                              <strong>{noteProject.name}</strong>
+                            </>
+                          ) : (
+                            <strong>{noteClient.name}</strong>
+                          )}
                         </button>
                       ) : targetNote.scope === 'internal' ? (
-                        <span className="context-chip" style={{ cursor: 'default' }}>
-                          Internal Workspace{noteProject ? ` · ${noteProject.name}` : ''}
-                        </span>
+                        noteProject ? (
+                          <button
+                            type="button"
+                            className="project-stream-pill is-interactive"
+                            onClick={() =>
+                              onPushEntry({
+                                kind: 'report',
+                                clientId: '__internal__',
+                                projectId: noteProject.id,
+                              })
+                            }
+                            title={`Open Internal › ${noteProject.name} report in overlay`}
+                          >
+                            <FolderKanban size={11} />
+                            <span className="project-stream-prefix">Internal ›</span>
+                            <strong>{noteProject.name}</strong>
+                          </button>
+                        ) : (
+                          <span className="project-stream-pill">
+                            <span>Internal Workspace</span>
+                          </span>
+                        )
                       ) : (
-                        <span className="context-chip" style={{ cursor: 'default' }}>
-                          Inbox
+                        <span className="project-stream-pill">
+                          <span>Inbox</span>
                         </span>
                       )}
 

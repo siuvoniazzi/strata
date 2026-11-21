@@ -27,6 +27,7 @@ import {
   getTaskRetroPlan,
   isTaskActivelyOverdue,
   resolveEffectiveTaskHorizon,
+  resolveItemProjectContext,
   scoreTaskForFocus,
   type WorkspaceSignals,
 } from './dailyRetro';
@@ -689,6 +690,7 @@ function formatTaskRollupBullet(
   const copy = BRIEFING_COPY[language];
   const badges: string[] = [];
   const plan = getTaskRetroPlan(directory.dailyRetro, t);
+  const projCtx = resolveItemProjectContext(t, directory);
   if (plan?.starred) {
     badges.push('★ FOCUS');
   }
@@ -704,6 +706,8 @@ function formatTaskRollupBullet(
   }
   badges.push(copy.statusLabels[t.status] || t.status.toUpperCase());
 
+  const streamPrefix =
+    projCtx.projectName || projCtx.clientName ? `**${projCtx.fullLabel}:** ` : '';
   const ownerMention = t.owner ? formatPersonMention(t.owner) : null;
   const alreadyHasOwner =
     ownerMention && t.text.toLowerCase().includes(t.owner!.toLowerCase());
@@ -719,7 +723,7 @@ function formatTaskRollupBullet(
     ? `\n  > *${copy.retroNoteLabel}: ${plan.comment}*`
     : '';
 
-  return `- **[${badges.join(' · ')}]** ${t.text}${ownerSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${t.noteTitle}]]*${commentSuffix}`;
+  return `- **[${badges.join(' · ')}]** ${streamPrefix}${t.text}${ownerSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${t.noteTitle}]]*${commentSuffix}`;
 }
 
 function formatDecisionRollupBullet(
@@ -729,6 +733,9 @@ function formatDecisionRollupBullet(
 ): string {
   const copy = BRIEFING_COPY[language];
   const fb = getDecisionRetroFeedback(directory.dailyRetro, d);
+  const projCtx = resolveItemProjectContext(d, directory);
+  const streamPrefix =
+    projCtx.projectName || projCtx.clientName ? `**${projCtx.fullLabel}:** ` : '';
   const statusTag =
     d.status === 'proposed'
       ? copy.proposedNeedsSignoff
@@ -744,7 +751,7 @@ function formatDecisionRollupBullet(
   const commentSuffix = fb?.comment
     ? `\n  > *${copy.retroNoteLabel}: ${fb.comment}*`
     : '';
-  return `- **[${statusTag}]** ${d.text}${rationaleSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${d.noteTitle}]] (${d.noteDate})*${commentSuffix}`;
+  return `- **[${statusTag}]** ${streamPrefix}${d.text}${rationaleSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${d.noteTitle}]] (${d.noteDate})*${commentSuffix}`;
 }
 
 function sanitizeRollupMarkdown(md: string, language: AiOutputLanguage = 'en'): string {
@@ -812,12 +819,9 @@ export function buildDeterministicDailyBriefing(
 
   const activeStreamNames = new Set<string>();
   for (const n of data.visibleRecentNotes) {
-    if (n.clientId) {
-      const c = directory.clients.find((x) => x.id === n.clientId);
-      if (c) activeStreamNames.add(c.name);
-    } else if (n.projectId) {
-      const p = directory.projects.find((x) => x.id === n.projectId);
-      if (p) activeStreamNames.add(p.name);
+    const ctx = resolveItemProjectContext(n, directory);
+    if (ctx.projectName || ctx.clientName) {
+      activeStreamNames.add(ctx.fullLabel);
     }
   }
   const activeStreamsStr = Array.from(activeStreamNames).slice(0, 4).join(', ');
@@ -850,12 +854,13 @@ export function buildDeterministicDailyBriefing(
   const contextBullets: string[] = [];
   for (const hn of data.highSignalNotes.slice(0, 3)) {
     const fb = getNoteRetroFeedback(directory.dailyRetro, hn.id);
+    const ctx = resolveItemProjectContext(hn, directory);
     const title = hn.title || copy.untitledNote;
     const summaryText = fb?.comment
       ? fb.comment
       : stripMarkdownFormatting(hn.body).slice(0, 120).trimEnd();
     contextBullets.push(
-      `- **★ [[${title}]]** (${hn.date})${summaryText ? ` — ${summaryText}${summaryText.length >= 120 && !fb?.comment ? '…' : ''}` : ''}`
+      `- **★ [${ctx.fullLabel}] [[${title}]]** (${hn.date})${summaryText ? ` — ${summaryText}${summaryText.length >= 120 && !fb?.comment ? '…' : ''}` : ''}`
     );
   }
 
@@ -909,7 +914,7 @@ export function buildDeterministicDailyBriefing(
   if (data.signals.staleItems.length > 0 || data.signals.silentProjects.length > 0) {
     const silentNames = data.signals.silentProjects
       .slice(0, 2)
-      .map((sp) => `${sp.project.name} (${sp.daysSinceLastNote}d)`)
+      .map((sp) => `${sp.clientName ? `${sp.clientName} › ` : ''}${sp.project.name} (${sp.daysSinceLastNote}d)`)
       .join(', ');
     watchBullets.push(copy.driftSignalLine(data.signals.staleItems.length, silentNames));
   }
@@ -920,7 +925,10 @@ export function buildDeterministicDailyBriefing(
     .slice(0, 2);
   for (const ct of commentedFocusTasks) {
     const comment = getTaskRetroPlan(directory.dailyRetro, ct)?.comment;
-    watchBullets.push(`- **${ct.text}** ([[${ct.noteTitle}]]) — *${comment}*`);
+    const ctx = resolveItemProjectContext(ct, directory, data.sourceNotes);
+    watchBullets.push(
+      `- **[${ctx.fullLabel}] ${ct.text}** ([[${ct.noteTitle}]]) — *${comment}*`
+    );
   }
 
   if (watchBullets.length > 0) {
@@ -1118,9 +1126,10 @@ export async function generateDailyBriefingWithAiOrFallback(
 
       const formatTaskForPrompt = (t: ParsedTask, horizonLabel: string) => {
         const plan = getTaskRetroPlan(retroStore, t);
+        const ctx = resolveItemProjectContext(t, directory, data.sourceNotes);
         const commentPart = plan?.comment ? ` | User Retro Comment: "${plan.comment}"` : '';
         const starPart = plan?.starred ? ' [★ USER STARRED]' : '';
-        return `- [${horizonLabel} · ${t.status.toUpperCase()}]${starPart} ${t.text} (Owner: ${
+        return `- [${horizonLabel} · ${t.status.toUpperCase()}] [Project/Stream: ${ctx.fullLabel}]${starPart} ${t.text} (Owner: ${
           t.owner ? formatPersonMention(t.owner) : 'Unassigned'
         }, Due: ${t.dueDate || 'None'}, Priority: ${t.priority || 'normal'}, Source: [[${
           t.noteTitle
@@ -1139,9 +1148,10 @@ export async function generateDailyBriefingWithAiOrFallback(
       ]
         .map((d) => {
           const fb = getDecisionRetroFeedback(retroStore, d);
+          const ctx = resolveItemProjectContext(d, directory, data.sourceNotes);
           const ratingTag = fb?.rating === 'high' ? ' [★ KEY DECISION]' : '';
           const commentPart = fb?.comment ? ` | User Retro Comment: "${fb.comment}"` : '';
-          return `- [${d.status.toUpperCase()}]${ratingTag} ${d.text}${
+          return `- [${d.status.toUpperCase()}] [Project/Stream: ${ctx.fullLabel}]${ratingTag} ${d.text}${
             d.rationale ? ` (Rationale: ${d.rationale})` : ''
           } (Source: [[${d.noteTitle}]], ${d.noteDate})${commentPart}`;
         })
@@ -1150,14 +1160,12 @@ export async function generateDailyBriefingWithAiOrFallback(
       const notesContext = data.visibleRecentNotes
         .slice(0, 7)
         .map((n) => {
-          const client = n.clientId
-            ? directory.clients.find((c) => c.id === n.clientId)?.name
-            : null;
+          const ctx = resolveItemProjectContext(n, directory);
           const fb = getNoteRetroFeedback(retroStore, n.id);
           const signalTag = fb?.rating === 'high' ? ' [★ HIGH SIGNAL]' : '';
           const commentLine = fb?.comment ? `\nUser Retro Takeaway: "${fb.comment}"` : '';
           const title = n.title || 'Untitled Note';
-          return `[[${title}]]${signalTag} (${n.date}${client ? ` · ${client}` : ''}):${commentLine}\n${n.body.slice(
+          return `[[${title}]]${signalTag} (${n.date} · Project/Stream: ${ctx.fullLabel}):${commentLine}\n${n.body.slice(
             0,
             750
           )}`;
@@ -1172,11 +1180,19 @@ export async function generateDailyBriefingWithAiOrFallback(
         .join('\n');
 
       const driftContext = [
-        ...data.signals.staleItems.slice(0, 5).map(
-          (s) => `- [${s.kind.toUpperCase()} · ${s.ageDays}d] ${s.title} ([[${s.noteTitle}]])`
-        ),
+        ...data.signals.staleItems.slice(0, 5).map((s) => {
+          const stream = s.projectName
+            ? s.clientName
+              ? `${s.clientName} › ${s.projectName}`
+              : s.projectName
+            : s.clientName || 'Workspace';
+          return `- [${s.kind.toUpperCase()} · ${s.ageDays}d] [${stream}] ${s.title} ([[${s.noteTitle}]])`;
+        }),
         ...data.signals.silentProjects.map(
-          (sp) => `- [SILENT_PROJECT · ${sp.daysSinceLastNote}d] ${sp.project.name}`
+          (sp) =>
+            `- [SILENT_PROJECT · ${sp.daysSinceLastNote}d] ${
+              sp.clientName ? `${sp.clientName} › ` : ''
+            }${sp.project.name}`
         ),
       ].join('\n');
 
@@ -1211,6 +1227,7 @@ Instead, keep your entire response under 170 words using ONLY these concise sect
 
 IMPORTANT RULES:
 - Treat User Retro Steering Notes, ★ ratings, horizon buckets, and per-item User Retro Comments as ground-truth executive intent.
+- Always name the specific **Project** (e.g. **[Project Name]** or **Client › Project Name**) when referencing takeaways, risks, or follow-ups so the reader immediately knows which project each point belongs to.
 - Cite source notes inline using [[Exact Note Title]], people using @[Full Name], and themes using #label.
 - Never use raw "- [ ]" or "- [D:...]" checkbox syntax.`;
 

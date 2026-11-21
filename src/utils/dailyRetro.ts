@@ -1,9 +1,11 @@
 import type {
+  Client,
   DailyRetroDayEntry,
   DailyRetroStore,
   DecisionRetroFeedback,
   Note,
   NoteRetroFeedback,
+  NoteScope,
   ParsedDecision,
   ParsedTask,
   Project,
@@ -20,6 +22,126 @@ import {
 } from './markdown';
 
 export type EffectiveTaskHorizon = 'today' | 'tomorrow' | 'this-week' | 'sometime';
+
+export interface ItemProjectContext {
+  client: Client | null;
+  project: Project | null;
+  scope: NoteScope;
+  clientName: string | null;
+  projectName: string | null;
+  color: string | null;
+  /** Primary display label emphasizing the project (e.g. "SSO Cutover" or "Northstar Wealth") */
+  primaryLabel: string;
+  /** Parent space/client prefix when a project is present (e.g. "Northstar Wealth" or "Internal") */
+  spacePrefix: string | null;
+  /** Combined human-readable label (e.g. "Northstar Wealth › SSO Cutover" or "Internal › Platform Ops") */
+  fullLabel: string;
+  /** Stable key for grouping items by project/stream */
+  groupKey: string;
+}
+
+export function resolveItemProjectContext(
+  item: {
+    clientId?: string | null;
+    projectId?: string | null;
+    scope?: NoteScope;
+    noteId?: string;
+  },
+  directory: WorkspaceDirectory,
+  notes?: Note[]
+): ItemProjectContext {
+  const client = item.clientId
+    ? directory.clients.find((c) => c.id === item.clientId) || null
+    : null;
+  const project = item.projectId
+    ? directory.projects.find((p) => p.id === item.projectId) || null
+    : null;
+
+  let resolvedScope: NoteScope = item.scope || 'inbox';
+  if (!item.scope) {
+    if (client || project?.scope === 'client') {
+      resolvedScope = 'client';
+    } else if (project?.scope === 'internal') {
+      resolvedScope = 'internal';
+    } else if (item.noteId && notes) {
+      const srcNote = notes.find((n) => n.id === item.noteId);
+      if (srcNote) resolvedScope = srcNote.scope;
+    }
+  }
+
+  if (project && client) {
+    return {
+      client,
+      project,
+      scope: 'client',
+      clientName: client.name,
+      projectName: project.name,
+      color: client.color,
+      primaryLabel: project.name,
+      spacePrefix: client.name,
+      fullLabel: `${client.name} › ${project.name}`,
+      groupKey: `proj:${project.id}`,
+    };
+  }
+
+  if (project) {
+    return {
+      client: null,
+      project,
+      scope: 'internal',
+      clientName: null,
+      projectName: project.name,
+      color: null,
+      primaryLabel: project.name,
+      spacePrefix: 'Internal',
+      fullLabel: `Internal › ${project.name}`,
+      groupKey: `proj:${project.id}`,
+    };
+  }
+
+  if (client) {
+    return {
+      client,
+      project: null,
+      scope: 'client',
+      clientName: client.name,
+      projectName: null,
+      color: client.color,
+      primaryLabel: client.name,
+      spacePrefix: null,
+      fullLabel: client.name,
+      groupKey: `client:${client.id}`,
+    };
+  }
+
+  if (resolvedScope === 'internal') {
+    return {
+      client: null,
+      project: null,
+      scope: 'internal',
+      clientName: null,
+      projectName: null,
+      color: null,
+      primaryLabel: 'Internal',
+      spacePrefix: null,
+      fullLabel: 'Internal',
+      groupKey: 'space:internal',
+    };
+  }
+
+  return {
+    client: null,
+    project: null,
+    scope: 'inbox',
+    clientName: null,
+    projectName: null,
+    color: null,
+    primaryLabel: 'Inbox',
+    spacePrefix: null,
+    fullLabel: 'Inbox',
+    groupKey: 'space:inbox',
+  };
+}
 
 export interface WaitingOnPersonGroup {
   personName: string;
@@ -38,7 +160,10 @@ export interface StaleSignalItem {
   noteTitle: string;
   ageDays: number;
   personName?: string | null;
+  clientId?: string | null;
+  projectId?: string | null;
   clientName?: string | null;
+  projectName?: string | null;
 }
 
 export interface SilentProjectSignal {
@@ -635,6 +760,9 @@ export function computeWorkspaceSignals(
     const clientName = t.clientId
       ? directory.clients.find((c) => c.id === t.clientId)?.name || null
       : null;
+    const projectName = t.projectId
+      ? directory.projects.find((p) => p.id === t.projectId)?.name || null
+      : null;
 
     if (t.status === 'waiting' && ageDays >= 5) {
       staleItems.push({
@@ -645,7 +773,10 @@ export function computeWorkspaceSignals(
         noteTitle: t.noteTitle,
         ageDays,
         personName: t.owner,
+        clientId: t.clientId,
+        projectId: t.projectId,
         clientName,
+        projectName,
       });
     } else if (
       !t.owner &&
@@ -659,7 +790,10 @@ export function computeWorkspaceSignals(
         noteTitle: t.noteTitle,
         ageDays: Math.max(0, ageDays),
         personName: null,
+        clientId: t.clientId,
+        projectId: t.projectId,
         clientName,
+        projectName,
       });
     }
   }
@@ -673,6 +807,9 @@ export function computeWorkspaceSignals(
       const clientName = d.clientId
         ? directory.clients.find((c) => c.id === d.clientId)?.name || null
         : null;
+      const projectName = d.projectId
+        ? directory.projects.find((p) => p.id === d.projectId)?.name || null
+        : null;
       staleItems.push({
         id: `stale-d-${d.id}`,
         kind: 'proposed-decision',
@@ -681,7 +818,10 @@ export function computeWorkspaceSignals(
         noteTitle: d.noteTitle,
         ageDays,
         personName: d.stakeholders[0] || null,
+        clientId: d.clientId,
+        projectId: d.projectId,
         clientName,
+        projectName,
       });
     }
   }
