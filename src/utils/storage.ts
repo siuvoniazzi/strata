@@ -1,6 +1,7 @@
 import JSZip from 'jszip';
 import type { Client, Note, Person, Project, SyncTombstones, WorkspaceDirectory } from '../types';
 import { normalizeSensitiveTerms } from './aiPrivacy';
+import { mergeDailyRetroStores } from './dailyRetro';
 import {
   dataUrlToBlob,
   extractReferencedAssetPaths,
@@ -511,6 +512,7 @@ export async function writeDirectoryMetadata(
     people: directory.people,
     customLabels: directory.customLabels,
     sensitiveTerms: normalizeSensitiveTerms(directory.sensitiveTerms),
+    dailyRetro: directory.dailyRetro,
     tombstones: extra?.tombstones,
     syncedNoteIds: extra?.syncedNoteIds,
     lastSyncedAt: new Date().toISOString(),
@@ -525,6 +527,7 @@ export async function writeDirectoryMetadata(
         people: prev.people || [],
         customLabels: prev.customLabels || [],
         sensitiveTerms: normalizeSensitiveTerms(prev.sensitiveTerms),
+        dailyRetro: prev.dailyRetro || {},
         tombstones: prev.tombstones || {},
         syncedNoteIds: prev.syncedNoteIds || [],
       });
@@ -534,6 +537,7 @@ export async function writeDirectoryMetadata(
         people: payload.people,
         customLabels: payload.customLabels,
         sensitiveTerms: payload.sensitiveTerms || [],
+        dailyRetro: payload.dailyRetro || {},
         tombstones: payload.tombstones || {},
         syncedNoteIds: payload.syncedNoteIds || [],
       });
@@ -779,12 +783,20 @@ export async function syncWorkspaceWithFolder(
       ...(currentDirectory.sensitiveTerms || []),
     ]);
 
+    let mergedDailyRetro = currentDirectory.dailyRetro;
+    for (const cfg of diskConfigs) {
+      if (cfg.dailyRetro) {
+        mergedDailyRetro = mergeDailyRetroStores(cfg.dailyRetro, mergedDailyRetro);
+      }
+    }
+
     let mergedDirectory: WorkspaceDirectory = {
       clients: canonicalClients,
       projects: canonicalProjects,
       people: canonicalPeople,
       customLabels: Array.from(customLabelSet),
       sensitiveTerms: mergedSensitiveTerms,
+      dailyRetro: mergedDailyRetro,
     };
 
     // 5. Hydrate image assets from root/assets/ (and any assets (1)/ conflict folders)
@@ -828,6 +840,7 @@ export async function syncWorkspaceWithFolder(
         people: canonicalPeople,
         customLabels: mergedDirectory.customLabels,
         sensitiveTerms: mergedDirectory.sensitiveTerms,
+        dailyRetro: mergedDirectory.dailyRetro,
       };
 
       const mappedClientId = parsed.note.clientId
@@ -1045,6 +1058,7 @@ export async function importFilesIntoWorkspace(
     people: [...currentDirectory.people],
     customLabels: [...currentDirectory.customLabels],
     sensitiveTerms: normalizeSensitiveTerms(currentDirectory.sensitiveTerms),
+    dailyRetro: currentDirectory.dailyRetro,
   };
   const byId = new Map(currentNotes.map((n) => [n.id, n]));
   let importedCount = 0;
@@ -1087,6 +1101,9 @@ export async function importFilesIntoWorkspace(
               ...(directory.sensitiveTerms || []),
               ...parsedDir.sensitiveTerms,
             ]);
+          }
+          if (parsedDir.dailyRetro) {
+            directory.dailyRetro = mergeDailyRetroStores(directory.dailyRetro, parsedDir.dailyRetro);
           }
         } catch {
           // Ignore malformed metadata

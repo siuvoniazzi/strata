@@ -16,6 +16,21 @@ import {
   withAiActivity,
 } from './aiProvider';
 import {
+  addDaysIso,
+  computeDailyRetroQueue,
+  computeDailyRetroSignature,
+  computeWorkspaceSignals,
+  type DailyRetroQueueSummary,
+  getDailyRetroDayEntry,
+  getDecisionRetroFeedback,
+  getNoteRetroFeedback,
+  getTaskRetroPlan,
+  isTaskActivelyOverdue,
+  resolveEffectiveTaskHorizon,
+  scoreTaskForFocus,
+  type WorkspaceSignals,
+} from './dailyRetro';
+import {
   computeNoteFilePath,
   extractInlineMentions,
   formatPersonMention,
@@ -46,19 +61,31 @@ export interface DailyBriefingData {
   sourceNotes: Note[];
   todayNotes: Note[];
   recentNotes: Note[];
+  visibleRecentNotes: Note[];
+  highSignalNotes: Note[];
+  hiddenLowSignalNotesCount: number;
   overdueTasks: ParsedTask[];
   dueTodayTasks: ParsedTask[];
   upcomingTasks: ParsedTask[];
   highPriorityOpenTasks: ParsedTask[];
   inProgressTasks: ParsedTask[];
   waitingTasks: ParsedTask[];
+  focusTodayTasks: ParsedTask[];
+  tomorrowTasks: ParsedTask[];
+  thisWeekTasks: ParsedTask[];
+  sometimeTasks: ParsedTask[];
   urgentAndFocusTasks: ParsedTask[];
   otherOpenTasks: ParsedTask[];
   allOpenTasks: ParsedTask[];
   recentlyCompletedTasks: ParsedTask[];
   proposedDecisions: ParsedDecision[];
+  activeProposedDecisions: ParsedDecision[];
   recentAgreedDecisions: ParsedDecision[];
   allDecisions: ParsedDecision[];
+  retroQueue: DailyRetroQueueSummary;
+  signals: WorkspaceSignals;
+  todaySteeringNote: string;
+  carryoverSteeringNote: string;
   sourceSignature: string;
 }
 
@@ -81,13 +108,6 @@ export function formatHumanDate(dateStr: string, language: AiOutputLanguage = 'e
   } catch {
     return dateStr;
   }
-}
-
-function addDaysToIsoDate(baseDateStr: string, days: number): string {
-  const d = new Date(`${baseDateStr}T12:00:00`);
-  if (Number.isNaN(d.getTime())) return baseDateStr;
-  d.setDate(d.getDate() + days);
-  return d.toISOString().slice(0, 10);
 }
 
 export function loadDailyBriefingState(): PersistedDailyBriefingState | null {
@@ -134,21 +154,53 @@ export function computeDailyBriefingData(
   todayDate: string = getTodayDateString(),
   recentDaysWindow = 7
 ): DailyBriefingData {
+  const retroStore = directory.dailyRetro;
   const sourceNotes = notes
     .filter((n) => !isDailyBriefingNote(n))
     .sort((a, b) => b.date.localeCompare(a.date) || b.updatedAt.localeCompare(a.updatedAt));
 
-  const minWindowDate = addDaysToIsoDate(todayDate, -recentDaysWindow);
-  const plus7Date = addDaysToIsoDate(todayDate, 7);
+  const minWindowDate = addDaysIso(todayDate, -recentDaysWindow);
+  const plus7Date = addDaysIso(todayDate, 7);
+  const yesterdayDate = addDaysIso(todayDate, -1);
 
   const todayNotes = sourceNotes.filter(
     (n) => n.date === todayDate || n.updatedAt.slice(0, 10) === todayDate
   );
 
+  const activeTodayClientIds = new Set<string>();
+  const activeTodayProjectIds = new Set<string>();
+  for (const n of todayNotes) {
+    if (n.clientId) activeTodayClientIds.add(n.clientId);
+    if (n.projectId) activeTodayProjectIds.add(n.projectId);
+  }
+
   const notesInWindow = sourceNotes.filter(
     (n) => n.date >= minWindowDate || n.updatedAt.slice(0, 10) >= minWindowDate
   );
   const recentNotes = notesInWindow.length > 0 ? notesInWindow : sourceNotes.slice(0, 6);
+
+  let hiddenLowSignalNotesCount = 0;
+  const visibleRecentNotes = recentNotes
+    .filter((n) => {
+      const fb = getNoteRetroFeedback(retroStore, n.id);
+      if (fb?.rating === 'low') {
+        hiddenLowSignalNotesCount++;
+        return false;
+      }
+      return true;
+    })
+    .sort((a, b) => {
+      const ra = getNoteRetroFeedback(retroStore, a.id)?.rating === 'high' ? 0 : 1;
+      const rb = getNoteRetroFeedback(retroStore, b.id)?.rating === 'high' ? 0 : 1;
+      if (ra !== rb) return ra - rb;
+      return b.date.localeCompare(a.date) || b.updatedAt.localeCompare(a.updatedAt);
+    });
+
+  const highSignalNotes = sourceNotes.filter(
+    (n) =>
+      getNoteRetroFeedback(retroStore, n.id)?.rating === 'high' &&
+      (n.date >= minWindowDate || n.updatedAt.slice(0, 10) >= minWindowDate)
+  );
 
   const allTasks: ParsedTask[] = [];
   const allDecisions: ParsedDecision[] = [];
@@ -164,31 +216,67 @@ export function computeDailyBriefingData(
     todayDate
   );
 
-  const overdueTasks = allOpenTasks.filter((t) => Boolean(t.dueDate && t.dueDate < todayDate));
-  const dueTodayTasks = allOpenTasks.filter((t) => t.dueDate === todayDate);
-  const upcomingTasks = allOpenTasks.filter(
-    (t) => Boolean(t.dueDate && t.dueDate > todayDate && t.dueDate <= plus7Date)
-  );
-  const highPriorityOpenTasks = allOpenTasks.filter((t) => t.priority === 'high');
-  const inProgressTasks = allOpenTasks.filter((t) => t.status === 'doing');
-  const waitingTasks = allOpenTasks.filter((t) => t.status === 'waiting');
+  const focusContext = {
+    clientIds: activeTodayClientIds,
+    projectIds: activeTodayProjectIds,
+  };
 
-  const focusIds = new Set<string>();
-  const urgentAndFocusTasks: ParsedTask[] = [];
-  for (const t of [
-    ...overdueTasks,
-    ...dueTodayTasks,
-    ...highPriorityOpenTasks,
-    ...inProgressTasks,
-    ...waitingTasks,
-    ...upcomingTasks,
-  ]) {
-    if (!focusIds.has(t.id)) {
-      focusIds.add(t.id);
-      urgentAndFocusTasks.push(t);
+  const focusTodayTasks: ParsedTask[] = [];
+  const tomorrowTasks: ParsedTask[] = [];
+  const thisWeekTasks: ParsedTask[] = [];
+  const sometimeTasks: ParsedTask[] = [];
+
+  for (const t of allOpenTasks) {
+    const horizon = resolveEffectiveTaskHorizon(t, retroStore, todayDate);
+    if (horizon === 'today') {
+      focusTodayTasks.push(t);
+    } else if (horizon === 'tomorrow') {
+      tomorrowTasks.push(t);
+    } else if (horizon === 'this-week') {
+      thisWeekTasks.push(t);
+    } else {
+      sometimeTasks.push(t);
     }
   }
 
+  focusTodayTasks.sort(
+    (a, b) =>
+      scoreTaskForFocus(b, retroStore, todayDate, focusContext) -
+      scoreTaskForFocus(a, retroStore, todayDate, focusContext)
+  );
+
+  const overdueTasks = allOpenTasks.filter((t) =>
+    isTaskActivelyOverdue(t, retroStore, todayDate)
+  );
+  const dueTodayTasks = allOpenTasks.filter(
+    (t) =>
+      t.dueDate === todayDate &&
+      resolveEffectiveTaskHorizon(t, retroStore, todayDate) === 'today'
+  );
+  const upcomingTasks = allOpenTasks.filter(
+    (t) =>
+      Boolean(t.dueDate && t.dueDate > todayDate && t.dueDate <= plus7Date) &&
+      resolveEffectiveTaskHorizon(t, retroStore, todayDate) !== 'sometime'
+  );
+  const highPriorityOpenTasks = allOpenTasks.filter(
+    (t) =>
+      t.priority === 'high' &&
+      resolveEffectiveTaskHorizon(t, retroStore, todayDate) !== 'sometime'
+  );
+  const inProgressTasks = allOpenTasks.filter(
+    (t) =>
+      t.status === 'doing' &&
+      resolveEffectiveTaskHorizon(t, retroStore, todayDate) !== 'sometime'
+  );
+  const waitingTasks = allOpenTasks.filter(
+    (t) =>
+      t.status === 'waiting' &&
+      resolveEffectiveTaskHorizon(t, retroStore, todayDate) !== 'sometime'
+  );
+
+  // Capped, high-signal Today Focus list (instead of an unbounded union of 6 buckets)
+  const urgentAndFocusTasks = focusTodayTasks.slice(0, 8);
+  const focusIds = new Set(urgentAndFocusTasks.map((t) => t.id));
   const otherOpenTasks = allOpenTasks.filter((t) => !focusIds.has(t.id));
 
   const recentlyCompletedTasks = allTasks.filter(
@@ -199,21 +287,49 @@ export function computeDailyBriefingData(
     .filter((d) => d.status === 'proposed')
     .sort((a, b) => b.noteDate.localeCompare(a.noteDate));
 
+  const activeProposedDecisions = proposedDecisions
+    .filter((d) => getDecisionRetroFeedback(retroStore, d)?.rating !== 'low')
+    .sort((a, b) => {
+      const ra = getDecisionRetroFeedback(retroStore, a)?.rating === 'high' ? 0 : 1;
+      const rb = getDecisionRetroFeedback(retroStore, b)?.rating === 'high' ? 0 : 1;
+      if (ra !== rb) return ra - rb;
+      return b.noteDate.localeCompare(a.noteDate);
+    });
+
   const agreedInWindow = allDecisions
-    .filter((d) => d.status === 'agreed' && d.noteDate >= minWindowDate)
+    .filter(
+      (d) =>
+        d.status === 'agreed' &&
+        d.noteDate >= minWindowDate &&
+        getDecisionRetroFeedback(retroStore, d)?.rating !== 'low'
+    )
     .sort((a, b) => b.noteDate.localeCompare(a.noteDate));
+
   const recentAgreedDecisions =
     agreedInWindow.length > 0
       ? agreedInWindow
       : allDecisions
-          .filter((d) => d.status === 'agreed')
+          .filter(
+            (d) =>
+              d.status === 'agreed' &&
+              getDecisionRetroFeedback(retroStore, d)?.rating !== 'low'
+          )
           .sort((a, b) => b.noteDate.localeCompare(a.noteDate))
-          .slice(0, 6);
+          .slice(0, 5);
+
+  const retroQueue = computeDailyRetroQueue(notes, directory, todayDate);
+  const signals = computeWorkspaceSignals(notes, directory, todayDate);
+
+  const todaySteeringNote = getDailyRetroDayEntry(retroStore, todayDate)?.steeringNote || '';
+  const carryoverSteeringNote =
+    getDailyRetroDayEntry(retroStore, yesterdayDate)?.steeringNote || '';
 
   const sigParts = sourceNotes.map(
     (n) => `${n.id}:${n.date}:${n.updatedAt}:${n.title}:${n.body.length}`
   );
-  const sourceSignature = `${todayDate}|w${recentDaysWindow}|${sigParts.join(';')}`;
+  const retroSig = computeDailyRetroSignature(retroStore, todayDate);
+  const yesterdayRetroSig = getDailyRetroDayEntry(retroStore, yesterdayDate)?.updatedAt || '';
+  const sourceSignature = `${todayDate}|w${recentDaysWindow}|r(${retroSig}|y:${yesterdayRetroSig})|${sigParts.join(';')}`;
 
   return {
     todayDate,
@@ -221,19 +337,31 @@ export function computeDailyBriefingData(
     sourceNotes,
     todayNotes,
     recentNotes,
+    visibleRecentNotes,
+    highSignalNotes,
+    hiddenLowSignalNotesCount,
     overdueTasks,
     dueTodayTasks,
     upcomingTasks,
     highPriorityOpenTasks,
     inProgressTasks,
     waitingTasks,
+    focusTodayTasks,
+    tomorrowTasks,
+    thisWeekTasks,
+    sometimeTasks,
     urgentAndFocusTasks,
     otherOpenTasks,
     allOpenTasks,
     recentlyCompletedTasks,
     proposedDecisions,
+    activeProposedDecisions,
     recentAgreedDecisions,
     allDecisions,
+    retroQueue,
+    signals,
+    todaySteeringNote,
+    carryoverSteeringNote,
     sourceSignature,
   };
 }
@@ -245,6 +373,7 @@ interface BriefingCopy {
   fromPrefix: string;
   proposedNeedsSignoff: string;
   rationaleLabel: string;
+  retroNoteLabel: string;
   statusLabels: {
     todo: string;
     doing: string;
@@ -257,18 +386,32 @@ interface BriefingCopy {
   emptyOverviewBody: string;
   emptyBanner: (humanDate: string, isoDate: string) => string;
   executivePulseHeading: string;
-  todaysAttentionLine: (overdue: number, dueToday: number, highPrio: number, inProgress: number, totalOpen: number) => string;
-  decisionAlignmentLine: (proposed: number, agreed: number) => string;
-  activeWorkstreamsLine: (recentCount: number, clientsStr: string, projectsStr: string) => string;
-  topPrioritiesHeading: string;
-  nextOpenActionsHeading: string;
-  blockersHeading: string;
-  autoUpdatedBanner: (humanDate: string, isoDate: string, notesCount: number, openTasksCount: number, decisionsCount: number) => string;
+  focusPulseLine: (
+    focusCount: number,
+    overdueCount: number,
+    tomorrowCount: number,
+    parkedCount: number
+  ) => string;
+  steeringCalloutLine: (note: string) => string;
+  highSignalTakeawaysHeading: string;
+  watchlistSignalsHeading: string;
+  waitingOnLine: (peopleSummary: string) => string;
+  driftSignalLine: (staleCount: number, silentProjectNames: string) => string;
+  decisionPendingLine: (proposedCount: number, agreedCount: number) => string;
+  calmWorkspaceLine: (completedCount: number, activeStreams: string) => string;
+  autoUpdatedBanner: (
+    humanDate: string,
+    isoDate: string,
+    focusCount: number,
+    tomorrowCount: number,
+    decisionsCount: number
+  ) => string;
+  retroSectionHeading: string;
   actionItemsRollupHeading: string;
-  dueTodayAndOverdueHeading: string;
-  highPriorityAndInProgressHeading: string;
-  waitingBlockedHeading: string;
-  otherOpenTasksHeading: string;
+  todaysFocusHeading: string;
+  tomorrowHorizonHeading: string;
+  thisWeekHorizonHeading: string;
+  sometimeParkedHeading: (count: number) => string;
   recentlyCompletedHeading: (count: number) => string;
   decisionsRegisterHeading: string;
   pendingDecisionsHeading: string;
@@ -287,6 +430,7 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
     fromPrefix: 'from',
     proposedNeedsSignoff: 'PROPOSED · Needs Sign-off',
     rationaleLabel: 'Rationale',
+    retroNoteLabel: 'Note',
     statusLabels: {
       todo: 'TODO',
       doing: 'DOING',
@@ -295,33 +439,37 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
       proposed: 'PROPOSED',
       agreed: 'AGREED',
     },
-    emptyOverviewHeading: 'Daily Executive Overview',
+    emptyOverviewHeading: 'Daily Executive Brief',
     emptyOverviewBody:
-      'Your workspace does not have any source notes yet. Spin up a note (`Alt+N`) and add tasks (`- [ ] Task @Owner due:YYYY-MM-DD !high`) or decisions (`- [D:agreed] Decision`) — your Daily Briefing and this Daily Report note will automatically synthesize your priorities, deadlines, and decisions here.',
+      'Your workspace does not have any source notes yet. Spin up a note (`Alt+N`) and capture tasks (`- [ ] Task @Owner due:YYYY-MM-DD !high`) or decisions (`- [D:agreed] Decision`). Use **Daily Retro** at the end of the day to rate signal and slot tasks into Today, Tomorrow, This Week, or Sometime.',
     emptyBanner: (humanDate, isoDate) =>
-      `> **Daily Workspace Briefing** for **${humanDate}** (${isoDate}). Automatically updates as you capture notes, action items, and decisions.`,
-    executivePulseHeading: 'Executive Pulse',
-    todaysAttentionLine: (overdue, dueToday, highPrio, inProgress, totalOpen) =>
-      `- **Today's Attention:** **${overdue}** overdue, **${dueToday}** due today, **${highPrio}** high-priority (!high), and **${inProgress}** in-progress action item(s) across **${totalOpen}** total open task(s).`,
-    decisionAlignmentLine: (proposed, agreed) =>
-      `- **Decision Alignment:** **${proposed}** pending/proposed decision(s) awaiting final agreement and **${agreed}** recently agreed decision(s).`,
-    activeWorkstreamsLine: (recentCount, clientsStr, projectsStr) =>
-      `- **Active Workstreams:** **${recentCount}** recent note(s)${clientsStr ? ` spanning **${clientsStr}**` : ''}${projectsStr ? ` (${projectsStr})` : ''}.`,
-    topPrioritiesHeading: 'Top Priorities for Today',
-    nextOpenActionsHeading: 'Next Open Action Items',
-    blockersHeading: 'Blockers & Decisions Needing Resolution',
-    autoUpdatedBanner: (humanDate, isoDate, notesCount, openTasksCount, decisionsCount) =>
-      `> **Auto-Updated Daily Report** for **${humanDate}** (${isoDate}) · Coverage: ${notesCount} workspace note(s), ${openTasksCount} open task(s), ${decisionsCount} decision(s).`,
-    actionItemsRollupHeading: 'Action Items & Deadlines Rollup',
-    dueTodayAndOverdueHeading: 'Due Today & Overdue',
-    highPriorityAndInProgressHeading: 'High Priority & In Progress',
-    waitingBlockedHeading: 'Waiting / Blocked',
-    otherOpenTasksHeading: 'Other Open Tasks',
+      `> **Daily Workspace Briefing** for **${humanDate}** (${isoDate}). Powered by your notes and Daily Retro signals.`,
+    executivePulseHeading: 'Chief-of-Staff Synthesis',
+    focusPulseLine: (focusCount, overdueCount, tomorrowCount, parkedCount) =>
+      `- **Today's Horizon:** **${focusCount}** item(s) in Today's Focus${overdueCount > 0 ? ` (**${overdueCount}** overdue)` : ''}${tomorrowCount > 0 ? ` · **${tomorrowCount}** queued for Tomorrow` : ''}${parkedCount > 0 ? ` · **${parkedCount}** parked in This Week / Sometime` : ''}.`,
+    steeringCalloutLine: (note) => `- **Your Retro Steering:** *"${note}"*`,
+    highSignalTakeawaysHeading: 'Key Context & Momentum',
+    watchlistSignalsHeading: 'Watchlist & Follow-ups',
+    waitingOnLine: (peopleSummary) => `- **Batch Follow-ups:** Waiting on ${peopleSummary}.`,
+    driftSignalLine: (staleCount, silentProjectNames) =>
+      `- **Drift Radar:** ${staleCount > 0 ? `**${staleCount}** stalled/unassigned item(s) needing a nudge` : ''}${staleCount > 0 && silentProjectNames ? ' · ' : ''}${silentProjectNames ? `Quiet active project(s): **${silentProjectNames}**` : ''}.`,
+    decisionPendingLine: (proposedCount, agreedCount) =>
+      `- **Decision Alignment:** **${proposedCount}** proposed decision(s) awaiting sign-off${agreedCount > 0 ? ` · **${agreedCount}** recently agreed` : ''}.`,
+    calmWorkspaceLine: (completedCount, activeStreams) =>
+      `- **Momentum:** ${completedCount > 0 ? `**${completedCount}** task(s) completed recently` : 'Clear immediate horizon'}${activeStreams ? ` across **${activeStreams}**` : ''}.`,
+    autoUpdatedBanner: (humanDate, isoDate, focusCount, tomorrowCount, decisionsCount) =>
+      `> **Daily Briefing** · **${humanDate}** (${isoDate}) · **${focusCount}** Today · **${tomorrowCount}** Tomorrow · **${decisionsCount}** Pending Decision(s).`,
+    retroSectionHeading: 'Daily Retro & Steering Signals',
+    actionItemsRollupHeading: 'Action Horizons',
+    todaysFocusHeading: "Today's Focus",
+    tomorrowHorizonHeading: 'Tomorrow',
+    thisWeekHorizonHeading: 'This Week',
+    sometimeParkedHeading: (count) => `Sometime / Parked (${count})`,
     recentlyCompletedHeading: (count) => `Recently Completed (${count})`,
-    decisionsRegisterHeading: 'Decisions Register',
-    pendingDecisionsHeading: 'Pending / Proposed Decisions',
-    recentAgreedDecisionsHeading: 'Recent Agreed Decisions',
-    recentNotesHeading: 'Recent Notes & Summaries',
+    decisionsRegisterHeading: 'Decisions Radar',
+    pendingDecisionsHeading: 'Needs Sign-off',
+    recentAgreedDecisionsHeading: 'Recently Agreed',
+    recentNotesHeading: 'High-Signal & Recent Notes',
     untitledNote: 'Untitled Note',
     internalLabel: 'Internal',
     inboxLabel: 'Inbox',
@@ -331,8 +479,9 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
     dueToday: 'HEUTE FÄLLIG',
     duePrefix: 'fällig',
     fromPrefix: 'aus',
-    proposedNeedsSignoff: 'VORGESCHLAGEN · Freigabe erforderlich',
+    proposedNeedsSignoff: 'VORGESCHLAGEN · Freigabe nötig',
     rationaleLabel: 'Begründung',
+    retroNoteLabel: 'Kommentar',
     statusLabels: {
       todo: 'OFFEN',
       doing: 'IN ARBEIT',
@@ -341,44 +490,49 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
       proposed: 'VORGESCHLAGEN',
       agreed: 'BESCHLOSSEN',
     },
-    emptyOverviewHeading: 'Täglicher Executive-Überblick',
+    emptyOverviewHeading: 'Tägliches Executive-Briefing',
     emptyOverviewBody:
-      'Dein Arbeitsbereich enthält noch keine Quellnotizen. Erstelle eine Notiz (`Alt+N`) und füge Aufgaben (`- [ ] Aufgabe @Verantwortlich due:YYYY-MM-DD !high`) oder Entscheidungen (`- [D:agreed] Entscheidung`) hinzu — dein Tagesbriefing und diese Tagesberichts-Notiz fassen deine Prioritäten, Fristen und Entscheidungen hier automatisch zusammen.',
+      'Dein Arbeitsbereich enthält noch keine Quellnotizen. Erstelle eine Notiz (`Alt+N`) mit Aufgaben oder Entscheidungen und nutze das **Tages-Retro**, um Wichtiges zu bewerten und Aufgaben für Heute, Morgen, Diese Woche oder Irgendwann einzuplanen.',
     emptyBanner: (humanDate, isoDate) =>
-      `> **Tägliches Workspace-Briefing** für **${humanDate}** (${isoDate}). Wird automatisch aktualisiert, sobald du Notizen, Aufgaben und Entscheidungen erfasst.`,
-    executivePulseHeading: 'Tagespuls',
-    todaysAttentionLine: (overdue, dueToday, highPrio, inProgress, totalOpen) =>
-      `- **Heutiger Fokus:** **${overdue}** überfällig, **${dueToday}** heute fällig, **${highPrio}** mit hoher Priorität (!high) und **${inProgress}** in Bearbeitung bei insgesamt **${totalOpen}** offenen Aufgabe(n).`,
-    decisionAlignmentLine: (proposed, agreed) =>
-      `- **Entscheidungsstand:** **${proposed}** offene/vorgeschlagene Entscheidung(en) zur finalen Abstimmung und **${agreed}** kürzlich beschlossene Entscheidung(en).`,
-    activeWorkstreamsLine: (recentCount, clientsStr, projectsStr) =>
-      `- **Aktive Workstreams:** **${recentCount}** aktuelle Notiz(en)${clientsStr ? ` über **${clientsStr}**` : ''}${projectsStr ? ` (${projectsStr})` : ''}.`,
-    topPrioritiesHeading: 'Top-Prioritäten für heute',
-    nextOpenActionsHeading: 'Nächste offene Aufgaben',
-    blockersHeading: 'Blocker & offene Entscheidungen',
-    autoUpdatedBanner: (humanDate, isoDate, notesCount, openTasksCount, decisionsCount) =>
-      `> **Automatisch aktualisierter Tagesbericht** für **${humanDate}** (${isoDate}) · Abdeckung: ${notesCount} Notiz(en), ${openTasksCount} offene Aufgabe(n), ${decisionsCount} Entscheidung(en).`,
-    actionItemsRollupHeading: 'Aufgaben & Fristen im Überblick',
-    dueTodayAndOverdueHeading: 'Heute fällig & überfällig',
-    highPriorityAndInProgressHeading: 'Hohe Priorität & in Bearbeitung',
-    waitingBlockedHeading: 'Wartend / Blockiert',
-    otherOpenTasksHeading: 'Weitere offene Aufgaben',
+      `> **Tägliches Workspace-Briefing** für **${humanDate}** (${isoDate}). Gesteuert durch deine Notizen und Tages-Retro-Signale.`,
+    executivePulseHeading: 'Chief-of-Staff-Synthese',
+    focusPulseLine: (focusCount, overdueCount, tomorrowCount, parkedCount) =>
+      `- **Heutiger Horizont:** **${focusCount}** Punkt(e) im Fokus heute${overdueCount > 0 ? ` (**${overdueCount}** überfällig)` : ''}${tomorrowCount > 0 ? ` · **${tomorrowCount}** für morgen geplant` : ''}${parkedCount > 0 ? ` · **${parkedCount}** in Diese Woche / Später geparkt` : ''}.`,
+    steeringCalloutLine: (note) => `- **Dein Retro-Fokus:** *"${note}"*`,
+    highSignalTakeawaysHeading: 'Wichtiger Kontext & Dynamik',
+    watchlistSignalsHeading: 'Watchlist & Follow-ups',
+    waitingOnLine: (peopleSummary) => `- **Gebündelte Follow-ups:** Wartend auf ${peopleSummary}.`,
+    driftSignalLine: (staleCount, silentProjectNames) =>
+      `- **Drift-Radar:** ${staleCount > 0 ? `**${staleCount}** blockierte/unzugewiesene Punkte` : ''}${staleCount > 0 && silentProjectNames ? ' · ' : ''}${silentProjectNames ? `Ruhige aktive Projekte: **${silentProjectNames}**` : ''}.`,
+    decisionPendingLine: (proposedCount, agreedCount) =>
+      `- **Entscheidungen:** **${proposedCount}** offene Entscheidung(en) zur Freigabe${agreedCount > 0 ? ` · **${agreedCount}** kürzlich beschlossen` : ''}.`,
+    calmWorkspaceLine: (completedCount, activeStreams) =>
+      `- **Dynamik:** ${completedCount > 0 ? `**${completedCount}** Aufgabe(n) kürzlich erledigt` : 'Klarer Fokus für heute'}${activeStreams ? ` über **${activeStreams}**` : ''}.`,
+    autoUpdatedBanner: (humanDate, isoDate, focusCount, tomorrowCount, decisionsCount) =>
+      `> **Tagesbriefing** · **${humanDate}** (${isoDate}) · **${focusCount}** Heute · **${tomorrowCount}** Morgen · **${decisionsCount}** offene Entscheidung(en).`,
+    retroSectionHeading: 'Tages-Retro & Steuerungssignale',
+    actionItemsRollupHeading: 'Aufgaben nach Horizont',
+    todaysFocusHeading: 'Fokus heute',
+    tomorrowHorizonHeading: 'Morgen',
+    thisWeekHorizonHeading: 'Diese Woche',
+    sometimeParkedHeading: (count) => `Irgendwann / Geparkt (${count})`,
     recentlyCompletedHeading: (count) => `Kürzlich erledigt (${count})`,
-    decisionsRegisterHeading: 'Entscheidungsregister',
-    pendingDecisionsHeading: 'Offene / vorgeschlagene Entscheidungen',
-    recentAgreedDecisionsHeading: 'Kürzlich beschlossene Entscheidungen',
-    recentNotesHeading: 'Aktuelle Notizen & Zusammenfassungen',
+    decisionsRegisterHeading: 'Entscheidungs-Radar',
+    pendingDecisionsHeading: 'Freigabe erforderlich',
+    recentAgreedDecisionsHeading: 'Kürzlich beschlossen',
+    recentNotesHeading: 'Wichtige & aktuelle Notizen',
     untitledNote: 'Unbenannte Notiz',
     internalLabel: 'Intern',
     inboxLabel: 'Eingang',
   },
   fr: {
     overdueDuePrefix: 'EN RETARD · échéance',
-    dueToday: 'ÉCHÉANCE AUJOURD’HUI',
+    dueToday: 'AUJOURD’HUI',
     duePrefix: 'échéance',
     fromPrefix: 'de',
     proposedNeedsSignoff: 'PROPOSÉE · Validation requise',
     rationaleLabel: 'Justification',
+    retroNoteLabel: 'Note',
     statusLabels: {
       todo: 'À FAIRE',
       doing: 'EN COURS',
@@ -389,31 +543,35 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
     },
     emptyOverviewHeading: 'Synthèse quotidienne',
     emptyOverviewBody:
-      'Votre espace de travail ne contient pas encore de notes sources. Créez une note (`Alt+N`) et ajoutez des tâches (`- [ ] Tâche @Responsable due:YYYY-MM-DD !high`) ou des décisions (`- [D:agreed] Décision`) — votre briefing quotidien les synthétisera automatiquement ici.',
+      'Votre espace ne contient pas encore de notes sources. Créez une note (`Alt+N`) et utilisez la **Rétro quotidienne** pour évaluer vos notes et planifier vos tâches.',
     emptyBanner: (humanDate, isoDate) =>
-      `> **Briefing quotidien de l’espace** pour **${humanDate}** (${isoDate}). Mis à jour automatiquement au fil de vos notes, tâches et décisions.`,
-    executivePulseHeading: 'Pouls exécutif',
-    todaysAttentionLine: (overdue, dueToday, highPrio, inProgress, totalOpen) =>
-      `- **Priorités du jour :** **${overdue}** en retard, **${dueToday}** à échéance aujourd’hui, **${highPrio}** haute priorité (!high) et **${inProgress}** en cours sur **${totalOpen}** tâche(s) ouverte(s).`,
-    decisionAlignmentLine: (proposed, agreed) =>
-      `- **Décisions :** **${proposed}** décision(s) en attente de validation et **${agreed}** décision(s) récemment validée(s).`,
-    activeWorkstreamsLine: (recentCount, clientsStr, projectsStr) =>
-      `- **Flux actifs :** **${recentCount}** note(s) récente(s)${clientsStr ? ` concernant **${clientsStr}**` : ''}${projectsStr ? ` (${projectsStr})` : ''}.`,
-    topPrioritiesHeading: 'Priorités principales du jour',
-    nextOpenActionsHeading: 'Prochaines actions ouvertes',
-    blockersHeading: 'Blocages & décisions en attente',
-    autoUpdatedBanner: (humanDate, isoDate, notesCount, openTasksCount, decisionsCount) =>
-      `> **Rapport quotidien automatique** pour **${humanDate}** (${isoDate}) · Couverture : ${notesCount} note(s), ${openTasksCount} tâche(s) ouverte(s), ${decisionsCount} décision(s).`,
-    actionItemsRollupHeading: 'Suivi des actions & échéances',
-    dueTodayAndOverdueHeading: 'Échéance aujourd’hui & en retard',
-    highPriorityAndInProgressHeading: 'Haute priorité & en cours',
-    waitingBlockedHeading: 'En attente / Bloqué',
-    otherOpenTasksHeading: 'Autres tâches ouvertes',
+      `> **Briefing quotidien** pour **${humanDate}** (${isoDate}).`,
+    executivePulseHeading: 'Synthèse Chief-of-Staff',
+    focusPulseLine: (focusCount, overdueCount, tomorrowCount, parkedCount) =>
+      `- **Horizon du jour :** **${focusCount}** action(s) prioritaires aujourd’hui${overdueCount > 0 ? ` (**${overdueCount}** en retard)` : ''}${tomorrowCount > 0 ? ` · **${tomorrowCount}** pour demain` : ''}${parkedCount > 0 ? ` · **${parkedCount}** planifiée(s) plus tard` : ''}.`,
+    steeringCalloutLine: (note) => `- **Consigne Rétro :** *"${note}"*`,
+    highSignalTakeawaysHeading: 'Contexte clé & dynamique',
+    watchlistSignalsHeading: 'Suivis & points d’attention',
+    waitingOnLine: (peopleSummary) => `- **Relances groupées :** En attente de ${peopleSummary}.`,
+    driftSignalLine: (staleCount, silentProjectNames) =>
+      `- **Radar de dérive :** ${staleCount > 0 ? `**${staleCount}** élément(s) bloqués ou sans responsable` : ''}${staleCount > 0 && silentProjectNames ? ' · ' : ''}${silentProjectNames ? `Projets silencieux : **${silentProjectNames}**` : ''}.`,
+    decisionPendingLine: (proposedCount, agreedCount) =>
+      `- **Décisions :** **${proposedCount}** en attente de validation${agreedCount > 0 ? ` · **${agreedCount}** validée(s) récemment` : ''}.`,
+    calmWorkspaceLine: (completedCount, activeStreams) =>
+      `- **Dynamique :** ${completedCount > 0 ? `**${completedCount}** tâche(s) terminée(s) récemment` : 'Horizon dégagé'}${activeStreams ? ` sur **${activeStreams}**` : ''}.`,
+    autoUpdatedBanner: (humanDate, isoDate, focusCount, tomorrowCount, decisionsCount) =>
+      `> **Rapport quotidien** · **${humanDate}** (${isoDate}) · **${focusCount}** Aujourd’hui · **${tomorrowCount}** Demain · **${decisionsCount}** Décision(s) en attente.`,
+    retroSectionHeading: 'Rétro quotidienne & consignes',
+    actionItemsRollupHeading: 'Horizons d’action',
+    todaysFocusHeading: 'Focus du jour',
+    tomorrowHorizonHeading: 'Demain',
+    thisWeekHorizonHeading: 'Cette semaine',
+    sometimeParkedHeading: (count) => `Plus tard / En réserve (${count})`,
     recentlyCompletedHeading: (count) => `Terminées récemment (${count})`,
-    decisionsRegisterHeading: 'Registre des décisions',
-    pendingDecisionsHeading: 'Décisions en attente / proposées',
-    recentAgreedDecisionsHeading: 'Décisions récemment validées',
-    recentNotesHeading: 'Notes récentes & résumés',
+    decisionsRegisterHeading: 'Radar des décisions',
+    pendingDecisionsHeading: 'En attente de validation',
+    recentAgreedDecisionsHeading: 'Validées récemment',
+    recentNotesHeading: 'Notes clés & récentes',
     untitledNote: 'Note sans titre',
     internalLabel: 'Interne',
     inboxLabel: 'Boîte de réception',
@@ -425,6 +583,7 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
     fromPrefix: 'de',
     proposedNeedsSignoff: 'PROPUESTA · Requiere aprobación',
     rationaleLabel: 'Justificación',
+    retroNoteLabel: 'Comentario',
     statusLabels: {
       todo: 'PENDIENTE',
       doing: 'EN CURSO',
@@ -435,42 +594,47 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
     },
     emptyOverviewHeading: 'Resumen ejecutivo diario',
     emptyOverviewBody:
-      'Tu espacio de trabajo aún no tiene notas fuente. Crea una nota (`Alt+N`) y añade tareas (`- [ ] Tarea @Responsable due:YYYY-MM-DD !high`) o decisiones (`- [D:agreed] Decisión`) — tu resumen diario se sintetizará aquí automáticamente.',
+      'Tu espacio aún no tiene notas fuente. Crea una nota (`Alt+N`) y usa la **Retro diaria** para priorizar notas y ubicar tareas en Hoy, Mañana, Esta semana o Algún día.',
     emptyBanner: (humanDate, isoDate) =>
-      `> **Resumen diario del espacio** para **${humanDate}** (${isoDate}). Se actualiza automáticamente con tus notas, tareas y decisiones.`,
-    executivePulseHeading: 'Pulso ejecutivo',
-    todaysAttentionLine: (overdue, dueToday, highPrio, inProgress, totalOpen) =>
-      `- **Atención de hoy:** **${overdue}** vencida(s), **${dueToday}** para hoy, **${highPrio}** de alta prioridad (!high) y **${inProgress}** en curso de un total de **${totalOpen}** tarea(s) abierta(s).`,
-    decisionAlignmentLine: (proposed, agreed) =>
-      `- **Estado de decisiones:** **${proposed}** decisión(es) propuesta(s) pendiente(s) de aprobación y **${agreed}** acordada(s) recientemente.`,
-    activeWorkstreamsLine: (recentCount, clientsStr, projectsStr) =>
-      `- **Frentes activos:** **${recentCount}** nota(s) reciente(s)${clientsStr ? ` sobre **${clientsStr}**` : ''}${projectsStr ? ` (${projectsStr})` : ''}.`,
-    topPrioritiesHeading: 'Prioridades principales para hoy',
-    nextOpenActionsHeading: 'Próximas tareas abiertas',
-    blockersHeading: 'Bloqueos y decisiones pendientes',
-    autoUpdatedBanner: (humanDate, isoDate, notesCount, openTasksCount, decisionsCount) =>
-      `> **Informe diario automático** para **${humanDate}** (${isoDate}) · Cobertura: ${notesCount} nota(s), ${openTasksCount} tarea(s) abierta(s), ${decisionsCount} decisión(es).`,
-    actionItemsRollupHeading: 'Resumen de tareas y plazos',
-    dueTodayAndOverdueHeading: 'Para hoy y vencidas',
-    highPriorityAndInProgressHeading: 'Alta prioridad y en curso',
-    waitingBlockedHeading: 'En espera / Bloqueadas',
-    otherOpenTasksHeading: 'Otras tareas abiertas',
+      `> **Resumen diario** para **${humanDate}** (${isoDate}).`,
+    executivePulseHeading: 'Síntesis Chief-of-Staff',
+    focusPulseLine: (focusCount, overdueCount, tomorrowCount, parkedCount) =>
+      `- **Horizonte de hoy:** **${focusCount}** tarea(s) en foco hoy${overdueCount > 0 ? ` (**${overdueCount}** vencida(s))` : ''}${tomorrowCount > 0 ? ` · **${tomorrowCount}** para mañana` : ''}${parkedCount > 0 ? ` · **${parkedCount}** aparcada(s) para después` : ''}.`,
+    steeringCalloutLine: (note) => `- **Nota de Retro:** *"${note}"*`,
+    highSignalTakeawaysHeading: 'Contexto clave e impulso',
+    watchlistSignalsHeading: 'Seguimientos y alertas',
+    waitingOnLine: (peopleSummary) => `- **Seguimientos agrupados:** Esperando a ${peopleSummary}.`,
+    driftSignalLine: (staleCount, silentProjectNames) =>
+      `- **Radar de bloqueo:** ${staleCount > 0 ? `**${staleCount}** elemento(s) estancados o sin responsable` : ''}${staleCount > 0 && silentProjectNames ? ' · ' : ''}${silentProjectNames ? `Proyectos sin actividad reciente: **${silentProjectNames}**` : ''}.`,
+    decisionPendingLine: (proposedCount, agreedCount) =>
+      `- **Decisiones:** **${proposedCount}** pendiente(s) de aprobación${agreedCount > 0 ? ` · **${agreedCount}** acordada(s) recientemente` : ''}.`,
+    calmWorkspaceLine: (completedCount, activeStreams) =>
+      `- **Impulso:** ${completedCount > 0 ? `**${completedCount}** tarea(s) completada(s) recientemente` : 'Horizonte despejado'}${activeStreams ? ` en **${activeStreams}**` : ''}.`,
+    autoUpdatedBanner: (humanDate, isoDate, focusCount, tomorrowCount, decisionsCount) =>
+      `> **Informe diario** · **${humanDate}** (${isoDate}) · **${focusCount}** Hoy · **${tomorrowCount}** Mañana · **${decisionsCount}** Decisión(es) pendiente(s).`,
+    retroSectionHeading: 'Retro diaria y señales',
+    actionItemsRollupHeading: 'Horizontes de acción',
+    todaysFocusHeading: 'Foco de hoy',
+    tomorrowHorizonHeading: 'Mañana',
+    thisWeekHorizonHeading: 'Esta semana',
+    sometimeParkedHeading: (count) => `Algún día / Aparcadas (${count})`,
     recentlyCompletedHeading: (count) => `Completadas recientemente (${count})`,
-    decisionsRegisterHeading: 'Registro de decisiones',
-    pendingDecisionsHeading: 'Decisiones pendientes / propuestas',
-    recentAgreedDecisionsHeading: 'Decisiones acordadas recientemente',
-    recentNotesHeading: 'Notas recientes y resúmenes',
+    decisionsRegisterHeading: 'Radar de decisiones',
+    pendingDecisionsHeading: 'Pendientes de aprobación',
+    recentAgreedDecisionsHeading: 'Acordadas recientemente',
+    recentNotesHeading: 'Notas clave y recientes',
     untitledNote: 'Nota sin título',
     internalLabel: 'Interno',
     inboxLabel: 'Entrada',
   },
   it: {
     overdueDuePrefix: 'SCADUTA · scadenza',
-    dueToday: 'IN SCADENZA OGGI',
+    dueToday: 'OGGI',
     duePrefix: 'scadenza',
     fromPrefix: 'da',
     proposedNeedsSignoff: 'PROPOSTA · Richiede approvazione',
     rationaleLabel: 'Motivazione',
+    retroNoteLabel: 'Nota',
     statusLabels: {
       todo: 'DA FARE',
       doing: 'IN CORSO',
@@ -481,31 +645,35 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
     },
     emptyOverviewHeading: 'Panoramica esecutiva giornaliera',
     emptyOverviewBody:
-      'Il tuo spazio di lavoro non contiene ancora note sorgente. Crea una nota (`Alt+N`) e aggiungi attività (`- [ ] Attività @Responsabile due:YYYY-MM-DD !high`) o decisioni (`- [D:agreed] Decisione`) — il briefing giornaliero verrà sintetizzato automaticamente qui.',
+      'Il tuo spazio non contiene ancora note sorgente. Crea una nota (`Alt+N`) e usa la **Retro giornaliera** per valutare le note e pianificare le attività.',
     emptyBanner: (humanDate, isoDate) =>
-      `> **Briefing giornaliero dell’area di lavoro** per **${humanDate}** (${isoDate}). Si aggiorna automaticamente con note, attività e decisioni.`,
-    executivePulseHeading: 'Sintesi esecutiva',
-    todaysAttentionLine: (overdue, dueToday, highPrio, inProgress, totalOpen) =>
-      `- **Attenzione oggi:** **${overdue}** scaduta/e, **${dueToday}** in scadenza oggi, **${highPrio}** ad alta priorità (!high) e **${inProgress}** in corso su **${totalOpen}** attività aperte.`,
-    decisionAlignmentLine: (proposed, agreed) =>
-      `- **Allineamento decisioni:** **${proposed}** decisione/i proposta/e in attesa di approvazione e **${agreed}** approvata/e di recente.`,
-    activeWorkstreamsLine: (recentCount, clientsStr, projectsStr) =>
-      `- **Flussi attivi:** **${recentCount}** nota/e recente/i${clientsStr ? ` su **${clientsStr}**` : ''}${projectsStr ? ` (${projectsStr})` : ''}.`,
-    topPrioritiesHeading: 'Priorità principali di oggi',
-    nextOpenActionsHeading: 'Prossime attività aperte',
-    blockersHeading: 'Blocchi e decisioni da risolvere',
-    autoUpdatedBanner: (humanDate, isoDate, notesCount, openTasksCount, decisionsCount) =>
-      `> **Report giornaliero automatico** per **${humanDate}** (${isoDate}) · Copertura: ${notesCount} nota/e, ${openTasksCount} attività aperte, ${decisionsCount} decisione/i.`,
-    actionItemsRollupHeading: 'Riepilogo attività e scadenze',
-    dueTodayAndOverdueHeading: 'In scadenza oggi e scadute',
-    highPriorityAndInProgressHeading: 'Alta priorità e in corso',
-    waitingBlockedHeading: 'In attesa / Bloccate',
-    otherOpenTasksHeading: 'Altre attività aperte',
+      `> **Briefing giornaliero** per **${humanDate}** (${isoDate}).`,
+    executivePulseHeading: 'Sintesi Chief-of-Staff',
+    focusPulseLine: (focusCount, overdueCount, tomorrowCount, parkedCount) =>
+      `- **Orizzonte di oggi:** **${focusCount}** attività in focus oggi${overdueCount > 0 ? ` (**${overdueCount}** scaduta/e)` : ''}${tomorrowCount > 0 ? ` · **${tomorrowCount}** per domani` : ''}${parkedCount > 0 ? ` · **${parkedCount}** pianificata/e più avanti` : ''}.`,
+    steeringCalloutLine: (note) => `- **Indicazione Retro:** *"${note}"*`,
+    highSignalTakeawaysHeading: 'Contesto chiave e slancio',
+    watchlistSignalsHeading: 'Follow-up e attenzione',
+    waitingOnLine: (peopleSummary) => `- **Follow-up raggruppati:** In attesa di ${peopleSummary}.`,
+    driftSignalLine: (staleCount, silentProjectNames) =>
+      `- **Radar di stallo:** ${staleCount > 0 ? `**${staleCount}** elemento/i in stallo o senza responsabile` : ''}${staleCount > 0 && silentProjectNames ? ' · ' : ''}${silentProjectNames ? `Progetti silenziosi: **${silentProjectNames}**` : ''}.`,
+    decisionPendingLine: (proposedCount, agreedCount) =>
+      `- **Decisioni:** **${proposedCount}** in attesa di approvazione${agreedCount > 0 ? ` · **${agreedCount}** approvata/e di recente` : ''}.`,
+    calmWorkspaceLine: (completedCount, activeStreams) =>
+      `- **Slancio:** ${completedCount > 0 ? `**${completedCount}** attività completata/e di recente` : 'Orizzonte libero'}${activeStreams ? ` su **${activeStreams}**` : ''}.`,
+    autoUpdatedBanner: (humanDate, isoDate, focusCount, tomorrowCount, decisionsCount) =>
+      `> **Report giornaliero** · **${humanDate}** (${isoDate}) · **${focusCount}** Oggi · **${tomorrowCount}** Domani · **${decisionsCount}** Decisione/i in sospeso.`,
+    retroSectionHeading: 'Retro giornaliera e segnali',
+    actionItemsRollupHeading: 'Orizzonti operativi',
+    todaysFocusHeading: 'Focus di oggi',
+    tomorrowHorizonHeading: 'Domani',
+    thisWeekHorizonHeading: 'Questa settimana',
+    sometimeParkedHeading: (count) => `Prima o poi / In parcheggio (${count})`,
     recentlyCompletedHeading: (count) => `Completate di recente (${count})`,
-    decisionsRegisterHeading: 'Registro delle decisioni',
-    pendingDecisionsHeading: 'Decisioni in sospeso / proposte',
-    recentAgreedDecisionsHeading: 'Decisioni approvate di recente',
-    recentNotesHeading: 'Note recenti e riepiloghi',
+    decisionsRegisterHeading: 'Radar delle decisioni',
+    pendingDecisionsHeading: 'In attesa di approvazione',
+    recentAgreedDecisionsHeading: 'Approvate di recente',
+    recentNotesHeading: 'Note chiave e recenti',
     untitledNote: 'Nota senza titolo',
     internalLabel: 'Interno',
     inboxLabel: 'In arrivo',
@@ -515,10 +683,15 @@ const BRIEFING_COPY: Record<AiOutputLanguage, BriefingCopy> = {
 function formatTaskRollupBullet(
   t: ParsedTask,
   todayDate: string,
+  directory: WorkspaceDirectory,
   language: AiOutputLanguage = 'en'
 ): string {
   const copy = BRIEFING_COPY[language];
   const badges: string[] = [];
+  const plan = getTaskRetroPlan(directory.dailyRetro, t);
+  if (plan?.starred) {
+    badges.push('★ FOCUS');
+  }
   if (t.dueDate && t.dueDate < todayDate) {
     badges.push(`${copy.overdueDuePrefix} ${t.dueDate}`);
   } else if (t.dueDate === todayDate) {
@@ -542,15 +715,20 @@ function formatTaskRollupBullet(
           .map((l) => `#${l}`)
           .join(' ')}`
       : '';
+  const commentSuffix = plan?.comment
+    ? `\n  > *${copy.retroNoteLabel}: ${plan.comment}*`
+    : '';
 
-  return `- **[${badges.join(' · ')}]** ${t.text}${ownerSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${t.noteTitle}]]*`;
+  return `- **[${badges.join(' · ')}]** ${t.text}${ownerSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${t.noteTitle}]]*${commentSuffix}`;
 }
 
 function formatDecisionRollupBullet(
   d: ParsedDecision,
+  directory: WorkspaceDirectory,
   language: AiOutputLanguage = 'en'
 ): string {
   const copy = BRIEFING_COPY[language];
+  const fb = getDecisionRetroFeedback(directory.dailyRetro, d);
   const statusTag =
     d.status === 'proposed'
       ? copy.proposedNeedsSignoff
@@ -563,12 +741,14 @@ function formatDecisionRollupBullet(
           .map((l) => `#${l}`)
           .join(' ')}`
       : '';
-  return `- **[${statusTag}]** ${d.text}${rationaleSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${d.noteTitle}]] (${d.noteDate})*`;
+  const commentSuffix = fb?.comment
+    ? `\n  > *${copy.retroNoteLabel}: ${fb.comment}*`
+    : '';
+  return `- **[${statusTag}]** ${d.text}${rationaleSuffix}${labelsSuffix} — *${copy.fromPrefix} [[${d.noteTitle}]] (${d.noteDate})*${commentSuffix}`;
 }
 
 function sanitizeRollupMarkdown(md: string, language: AiOutputLanguage = 'en'): string {
   const copy = BRIEFING_COPY[language];
-  // Ensure AI-generated overview bullets don't use raw `- [ ]` or `- [D:...]` task/decision syntax
   return md
     .replace(/^(\s*[-*+•]\s*)\[([ /?xX])\]\s+/gm, (_, prefix: string, ch: string) => {
       const label =
@@ -593,6 +773,13 @@ function sanitizeRollupMarkdown(md: string, language: AiOutputLanguage = 'en'): 
     });
 }
 
+/**
+ * Builds a high-signal, non-duplicative Chief-of-Staff synthesis.
+ * Instead of repeating the interactive task inventory below, it synthesizes:
+ * - Your Retro steering note & horizon balance
+ * - High-signal note takeaways & today's active client/project context
+ * - Follow-up batches (@Person), drift/staleness signals, and pending decisions
+ */
 export function buildDeterministicDailyBriefing(
   data: DailyBriefingData,
   directory: WorkspaceDirectory,
@@ -623,62 +810,121 @@ export function buildDeterministicDailyBriefing(
     };
   }
 
-  // Active clients & projects touched recently
-  const activeClientNames = new Set<string>();
-  const activeProjectNames = new Set<string>();
-  for (const n of data.recentNotes) {
+  const activeStreamNames = new Set<string>();
+  for (const n of data.visibleRecentNotes) {
     if (n.clientId) {
       const c = directory.clients.find((x) => x.id === n.clientId);
-      if (c) activeClientNames.add(c.name);
-    }
-    if (n.projectId) {
+      if (c) activeStreamNames.add(c.name);
+    } else if (n.projectId) {
       const p = directory.projects.find((x) => x.id === n.projectId);
-      if (p) activeProjectNames.add(p.name);
+      if (p) activeStreamNames.add(p.name);
     }
   }
+  const activeStreamsStr = Array.from(activeStreamNames).slice(0, 4).join(', ');
 
-  const clientsStr = Array.from(activeClientNames).slice(0, 4).join(', ');
-  const projectsStr = Array.from(activeProjectNames).slice(0, 4).join(', ');
+  const effectiveSteering = data.todaySteeringNote || data.carryoverSteeringNote;
+  const parkedCount = data.thisWeekTasks.length + data.sometimeTasks.length;
 
   const overviewLines: string[] = [
     `### ${copy.executivePulseHeading} — ${humanDate}`,
-    copy.todaysAttentionLine(
-      data.overdueTasks.length,
-      data.dueTodayTasks.length,
-      data.highPriorityOpenTasks.length,
-      data.inProgressTasks.length,
-      data.allOpenTasks.length
-    ),
-    copy.decisionAlignmentLine(
-      data.proposedDecisions.length,
-      data.recentAgreedDecisions.length
-    ),
-    copy.activeWorkstreamsLine(data.recentNotes.length, clientsStr, projectsStr),
   ];
 
-  // Top Priorities for Today
-  const topFocus = data.urgentAndFocusTasks.slice(0, 5);
-  if (topFocus.length > 0) {
-    overviewLines.push('', `### ${copy.topPrioritiesHeading}`);
-    for (const t of topFocus) {
-      overviewLines.push(formatTaskRollupBullet(t, data.todayDate, language));
-    }
-  } else if (data.allOpenTasks.length > 0) {
-    overviewLines.push('', `### ${copy.nextOpenActionsHeading}`);
-    for (const t of data.allOpenTasks.slice(0, 5)) {
-      overviewLines.push(formatTaskRollupBullet(t, data.todayDate, language));
-    }
+  if (effectiveSteering) {
+    overviewLines.push(copy.steeringCalloutLine(effectiveSteering));
   }
 
-  // Blockers & Pending Decisions to Resolve
-  if (data.waitingTasks.length > 0 || data.proposedDecisions.length > 0) {
-    overviewLines.push('', `### ${copy.blockersHeading}`);
-    for (const d of data.proposedDecisions.slice(0, 4)) {
-      overviewLines.push(formatDecisionRollupBullet(d, language));
-    }
-    for (const w of data.waitingTasks.slice(0, 4)) {
-      overviewLines.push(formatTaskRollupBullet(w, data.todayDate, language));
-    }
+  overviewLines.push(
+    copy.focusPulseLine(
+      data.focusTodayTasks.length,
+      data.overdueTasks.length,
+      data.tomorrowTasks.length,
+      parkedCount
+    )
+  );
+
+  overviewLines.push(
+    copy.calmWorkspaceLine(data.recentlyCompletedTasks.length, activeStreamsStr)
+  );
+
+  // High-Signal Takeaways & Context Prep
+  const contextBullets: string[] = [];
+  for (const hn of data.highSignalNotes.slice(0, 3)) {
+    const fb = getNoteRetroFeedback(directory.dailyRetro, hn.id);
+    const title = hn.title || copy.untitledNote;
+    const summaryText = fb?.comment
+      ? fb.comment
+      : stripMarkdownFormatting(hn.body).slice(0, 120).trimEnd();
+    contextBullets.push(
+      `- **★ [[${title}]]** (${hn.date})${summaryText ? ` — ${summaryText}${summaryText.length >= 120 && !fb?.comment ? '…' : ''}` : ''}`
+    );
+  }
+
+  for (const prep of data.signals.todayContextPrep.slice(0, 2)) {
+    const noteLinks = prep.todayNoteTitles
+      .slice(0, 2)
+      .map((t) => `[[${t}]]`)
+      .join(', ');
+    contextBullets.push(
+      `- **${prep.label}** (${noteLinks || data.todayDate}): **${prep.openTaskCount}** open task(s)${
+        prep.pendingDecisionCount > 0 ? `, **${prep.pendingDecisionCount}** pending decision(s)` : ''
+      }.`
+    );
+  }
+
+  if (data.signals.emergingLabels.length > 0 && contextBullets.length < 3) {
+    const topThemes = data.signals.emergingLabels
+      .slice(0, 3)
+      .map((item) => `#${item.label} (${item.count})`)
+      .join(' · ');
+    contextBullets.push(`- **Active Themes:** ${topThemes}`);
+  }
+
+  if (contextBullets.length > 0) {
+    overviewLines.push('', `### ${copy.highSignalTakeawaysHeading}`, ...contextBullets);
+  }
+
+  // Watchlist & Follow-ups (People batches, Drift/Stale items, Pending Decisions)
+  const watchBullets: string[] = [];
+
+  if (data.signals.waitingByPerson.length > 0) {
+    const peopleSummary = data.signals.waitingByPerson
+      .slice(0, 4)
+      .map(
+        (g) =>
+          `${formatPersonMention(g.personName)} (**${g.totalCount}**${g.oldestDays >= 5 ? `, ${g.oldestDays}d` : ''})`
+      )
+      .join(', ');
+    watchBullets.push(copy.waitingOnLine(peopleSummary));
+  }
+
+  if (data.activeProposedDecisions.length > 0) {
+    watchBullets.push(
+      copy.decisionPendingLine(
+        data.activeProposedDecisions.length,
+        data.recentAgreedDecisions.length
+      )
+    );
+  }
+
+  if (data.signals.staleItems.length > 0 || data.signals.silentProjects.length > 0) {
+    const silentNames = data.signals.silentProjects
+      .slice(0, 2)
+      .map((sp) => `${sp.project.name} (${sp.daysSinceLastNote}d)`)
+      .join(', ');
+    watchBullets.push(copy.driftSignalLine(data.signals.staleItems.length, silentNames));
+  }
+
+  // Surface any explicit retro comments on Today's Focus tasks so AI/local overview calls them out
+  const commentedFocusTasks = data.focusTodayTasks
+    .filter((t) => Boolean(getTaskRetroPlan(directory.dailyRetro, t)?.comment))
+    .slice(0, 2);
+  for (const ct of commentedFocusTasks) {
+    const comment = getTaskRetroPlan(directory.dailyRetro, ct)?.comment;
+    watchBullets.push(`- **${ct.text}** ([[${ct.noteTitle}]]) — *${comment}*`);
+  }
+
+  if (watchBullets.length > 0) {
+    overviewLines.push('', `### ${copy.watchlistSignalsHeading}`, ...watchBullets);
   }
 
   const overviewMarkdown = overviewLines.join('\n');
@@ -708,83 +954,94 @@ export function composeFullDailyNoteMarkdown(
     copy.autoUpdatedBanner(
       humanDate,
       data.todayDate,
-      data.sourceNotes.length,
-      data.allOpenTasks.length,
-      data.allDecisions.length
+      data.focusTodayTasks.length,
+      data.tomorrowTasks.length,
+      data.activeProposedDecisions.length
     ),
     '',
     sanitizeRollupMarkdown(overviewMarkdown.trim(), language),
   ];
 
-  // Action Items Breakdown
+  // Daily Retro & Steering Log (if present)
+  const effectiveSteering = data.todaySteeringNote || data.carryoverSteeringNote;
+  if (effectiveSteering || data.highSignalNotes.length > 0) {
+    sections.push('', '---', '', `## ${copy.retroSectionHeading}`);
+    if (effectiveSteering) {
+      sections.push(`> **AI Steering:** ${effectiveSteering}`);
+    }
+    for (const hn of data.highSignalNotes.slice(0, 5)) {
+      const fb = getNoteRetroFeedback(directory.dailyRetro, hn.id);
+      sections.push(
+        `- **★ [[${hn.title || copy.untitledNote}]]** (${hn.date})${
+          fb?.comment ? ` — *${fb.comment}*` : ''
+        }`
+      );
+    }
+  }
+
+  // Horizon-Bucketed Action Items
   if (data.allOpenTasks.length > 0 || data.recentlyCompletedTasks.length > 0) {
     sections.push('', '---', '', `## ${copy.actionItemsRollupHeading}`);
 
-    if (data.overdueTasks.length > 0 || data.dueTodayTasks.length > 0) {
-      sections.push('', `### ${copy.dueTodayAndOverdueHeading}`);
-      for (const t of [...data.overdueTasks, ...data.dueTodayTasks]) {
-        sections.push(formatTaskRollupBullet(t, data.todayDate, language));
+    if (data.focusTodayTasks.length > 0) {
+      sections.push('', `### ${copy.todaysFocusHeading}`);
+      for (const t of data.focusTodayTasks.slice(0, 10)) {
+        sections.push(formatTaskRollupBullet(t, data.todayDate, directory, language));
       }
     }
 
-    const highAndDoing = [...data.highPriorityOpenTasks, ...data.inProgressTasks].filter(
-      (t, idx, arr) =>
-        arr.findIndex((x) => x.id === t.id) === idx &&
-        !data.overdueTasks.some((o) => o.id === t.id) &&
-        !data.dueTodayTasks.some((d) => d.id === t.id)
-    );
-    if (highAndDoing.length > 0) {
-      sections.push('', `### ${copy.highPriorityAndInProgressHeading}`);
-      for (const t of highAndDoing) {
-        sections.push(formatTaskRollupBullet(t, data.todayDate, language));
+    if (data.tomorrowTasks.length > 0) {
+      sections.push('', `### ${copy.tomorrowHorizonHeading}`);
+      for (const t of data.tomorrowTasks.slice(0, 8)) {
+        sections.push(formatTaskRollupBullet(t, data.todayDate, directory, language));
       }
     }
 
-    if (data.waitingTasks.length > 0) {
-      sections.push('', `### ${copy.waitingBlockedHeading}`);
-      for (const t of data.waitingTasks) {
-        sections.push(formatTaskRollupBullet(t, data.todayDate, language));
+    if (data.thisWeekTasks.length > 0) {
+      sections.push('', `### ${copy.thisWeekHorizonHeading}`);
+      for (const t of data.thisWeekTasks.slice(0, 10)) {
+        sections.push(formatTaskRollupBullet(t, data.todayDate, directory, language));
       }
     }
 
-    if (data.otherOpenTasks.length > 0) {
-      sections.push('', `### ${copy.otherOpenTasksHeading}`);
-      for (const t of data.otherOpenTasks.slice(0, 12)) {
-        sections.push(formatTaskRollupBullet(t, data.todayDate, language));
+    if (data.sometimeTasks.length > 0) {
+      sections.push('', `### ${copy.sometimeParkedHeading(data.sometimeTasks.length)}`);
+      for (const t of data.sometimeTasks.slice(0, 6)) {
+        sections.push(formatTaskRollupBullet(t, data.todayDate, directory, language));
       }
     }
 
     if (data.recentlyCompletedTasks.length > 0) {
       sections.push('', `### ${copy.recentlyCompletedHeading(data.recentlyCompletedTasks.length)}`);
       for (const t of data.recentlyCompletedTasks.slice(0, 6)) {
-        sections.push(formatTaskRollupBullet(t, data.todayDate, language));
+        sections.push(formatTaskRollupBullet(t, data.todayDate, directory, language));
       }
     }
   }
 
   // Decisions Breakdown
-  if (data.proposedDecisions.length > 0 || data.recentAgreedDecisions.length > 0) {
+  if (data.activeProposedDecisions.length > 0 || data.recentAgreedDecisions.length > 0) {
     sections.push('', '---', '', `## ${copy.decisionsRegisterHeading}`);
 
-    if (data.proposedDecisions.length > 0) {
+    if (data.activeProposedDecisions.length > 0) {
       sections.push('', `### ${copy.pendingDecisionsHeading}`);
-      for (const d of data.proposedDecisions) {
-        sections.push(formatDecisionRollupBullet(d, language));
+      for (const d of data.activeProposedDecisions) {
+        sections.push(formatDecisionRollupBullet(d, directory, language));
       }
     }
 
     if (data.recentAgreedDecisions.length > 0) {
       sections.push('', `### ${copy.recentAgreedDecisionsHeading}`);
-      for (const d of data.recentAgreedDecisions.slice(0, 10)) {
-        sections.push(formatDecisionRollupBullet(d, language));
+      for (const d of data.recentAgreedDecisions.slice(0, 8)) {
+        sections.push(formatDecisionRollupBullet(d, directory, language));
       }
     }
   }
 
-  // Recent Notes Summary
-  if (data.recentNotes.length > 0) {
+  // Filtered Recent Notes Summary (excluding low-rated archive notes)
+  if (data.visibleRecentNotes.length > 0) {
     sections.push('', '---', '', `## ${copy.recentNotesHeading}`);
-    for (const n of data.recentNotes.slice(0, 10)) {
+    for (const n of data.visibleRecentNotes.slice(0, 8)) {
       const client = n.clientId ? directory.clients.find((c) => c.id === n.clientId) : null;
       const proj = n.projectId ? directory.projects.find((p) => p.id === n.projectId) : null;
       const contextStr = client
@@ -810,12 +1067,17 @@ export function composeFullDailyNoteMarkdown(
               .map((l) => `#${l}`)
               .join(' ')}`
           : '';
+      const fb = getNoteRetroFeedback(directory.dailyRetro, n.id);
+      const signalBadge = fb?.rating === 'high' ? '★ ' : '';
       const rawPreview = stripMarkdownFormatting(n.body);
-      const snippet =
-        rawPreview.length > 180 ? `${rawPreview.slice(0, 180).trimEnd()}…` : rawPreview;
+      const snippet = fb?.comment
+        ? `*${copy.retroNoteLabel}: ${fb.comment}*`
+        : rawPreview.length > 160
+        ? `${rawPreview.slice(0, 160).trimEnd()}…`
+        : rawPreview;
 
       sections.push(
-        `- **${n.date} — [[${n.title || copy.untitledNote}]]** (${contextStr}${peopleStr}${labelsStr})${
+        `- **${signalBadge}${n.date} — [[${n.title || copy.untitledNote}]]** (${contextStr}${peopleStr}${labelsStr})${
           snippet ? `\n  ${snippet}` : ''
         }`
       );
@@ -852,71 +1114,126 @@ export async function generateDailyBriefingWithAiOrFallback(
     }
 
     try {
-      const tasksContext = data.allOpenTasks
-        .slice(0, 20)
-        .map(
-          (t) =>
-            `- [${t.status.toUpperCase()}] ${t.text} (Owner: ${t.owner || 'Unassigned'}, Due: ${
-              t.dueDate || 'None'
-            }, Priority: ${t.priority || 'normal'}, Source: [[${t.noteTitle}]])`
-        )
-        .join('\n');
+      const retroStore = directory.dailyRetro;
+
+      const formatTaskForPrompt = (t: ParsedTask, horizonLabel: string) => {
+        const plan = getTaskRetroPlan(retroStore, t);
+        const commentPart = plan?.comment ? ` | User Retro Comment: "${plan.comment}"` : '';
+        const starPart = plan?.starred ? ' [★ USER STARRED]' : '';
+        return `- [${horizonLabel} · ${t.status.toUpperCase()}]${starPart} ${t.text} (Owner: ${
+          t.owner ? formatPersonMention(t.owner) : 'Unassigned'
+        }, Due: ${t.dueDate || 'None'}, Priority: ${t.priority || 'normal'}, Source: [[${
+          t.noteTitle
+        }]])${commentPart}`;
+      };
+
+      const focusTasksContext = [
+        ...data.focusTodayTasks.slice(0, 10).map((t) => formatTaskForPrompt(t, 'TODAY')),
+        ...data.tomorrowTasks.slice(0, 6).map((t) => formatTaskForPrompt(t, 'TOMORROW')),
+        ...data.thisWeekTasks.slice(0, 6).map((t) => formatTaskForPrompt(t, 'THIS_WEEK')),
+      ].join('\n');
 
       const decisionsContext = [
-        ...data.proposedDecisions.slice(0, 8),
-        ...data.recentAgreedDecisions.slice(0, 8),
+        ...data.activeProposedDecisions.slice(0, 8),
+        ...data.recentAgreedDecisions.slice(0, 5),
       ]
-        .map(
-          (d) =>
-            `- [${d.status.toUpperCase()}] ${d.text}${
-              d.rationale ? ` (Rationale: ${d.rationale})` : ''
-            } (Source: [[${d.noteTitle}]], ${d.noteDate})`
-        )
+        .map((d) => {
+          const fb = getDecisionRetroFeedback(retroStore, d);
+          const ratingTag = fb?.rating === 'high' ? ' [★ KEY DECISION]' : '';
+          const commentPart = fb?.comment ? ` | User Retro Comment: "${fb.comment}"` : '';
+          return `- [${d.status.toUpperCase()}]${ratingTag} ${d.text}${
+            d.rationale ? ` (Rationale: ${d.rationale})` : ''
+          } (Source: [[${d.noteTitle}]], ${d.noteDate})${commentPart}`;
+        })
         .join('\n');
 
-      const notesContext = data.recentNotes
-        .slice(0, 8)
+      const notesContext = data.visibleRecentNotes
+        .slice(0, 7)
         .map((n) => {
           const client = n.clientId
             ? directory.clients.find((c) => c.id === n.clientId)?.name
             : null;
+          const fb = getNoteRetroFeedback(retroStore, n.id);
+          const signalTag = fb?.rating === 'high' ? ' [★ HIGH SIGNAL]' : '';
+          const commentLine = fb?.comment ? `\nUser Retro Takeaway: "${fb.comment}"` : '';
           const title = n.title || 'Untitled Note';
-          return `[[${title}]] (Topic: ${title}, ${n.date}${client ? ` · ${client}` : ''}):\n${n.body.slice(
+          return `[[${title}]]${signalTag} (${n.date}${client ? ` · ${client}` : ''}):${commentLine}\n${n.body.slice(
             0,
-            900
+            750
           )}`;
         })
         .join('\n\n');
 
+      const waitingContext = data.signals.waitingByPerson
+        .map(
+          (g) =>
+            `- ${formatPersonMention(g.personName)}: ${g.totalCount} item(s), oldest ${g.oldestDays}d`
+        )
+        .join('\n');
+
+      const driftContext = [
+        ...data.signals.staleItems.slice(0, 5).map(
+          (s) => `- [${s.kind.toUpperCase()} · ${s.ageDays}d] ${s.title} ([[${s.noteTitle}]])`
+        ),
+        ...data.signals.silentProjects.map(
+          (sp) => `- [SILENT_PROJECT · ${sp.daysSinceLastNote}d] ${sp.project.name}`
+        ),
+      ].join('\n');
+
+      const steeringLines: string[] = [];
+      if (data.todaySteeringNote) {
+        steeringLines.push(`Today's Retro Steering Note: "${data.todaySteeringNote}"`);
+      }
+      if (data.carryoverSteeringNote && data.carryoverSteeringNote !== data.todaySteeringNote) {
+        steeringLines.push(
+          `Yesterday Evening's Commute Retro Note for Today: "${data.carryoverSteeringNote}"`
+        );
+      }
+
       const languageInstruction =
         language === 'en'
-          ? 'Write the entire Daily Briefing in English.'
-          : `Write the ENTIRE Daily Briefing (all prose, bullet points, status tags, and summaries) in ${langMeta?.englishName || language} (${langMeta?.label || language}), translating any English task/decision descriptions naturally if helpful while keeping proper nouns, exact [[Note Title]] links, @[Full Name] mentions, and #label tags intact.`;
+          ? 'Write the entire synthesis in English.'
+          : `Write the ENTIRE synthesis (all prose, bullet points, and status callouts) in ${langMeta?.englishName || language} (${langMeta?.label || language}), keeping proper nouns, exact [[Note Title]] links, @[Full Name] mentions, and #label tags intact.`;
 
-      const systemPrompt = `You are an executive Chief-of-Staff AI synthesizing a crisp, high-signal Daily Briefing for ${humanDate} (${data.todayDate}).
+      const systemPrompt = `You are a calm, razor-sharp executive Chief-of-Staff AI writing the top synthesis card of a Daily Briefing for ${humanDate} (${data.todayDate}).
 ${languageInstruction}
-Write in clean Markdown using these exact section headings:
+
+CRITICAL ANTI-CLUTTER GOAL:
+Interactive task cards and decision cards are ALREADY displayed right below your synthesis in the UI. DO NOT dump or repeat a raw inventory of tasks!
+Instead, keep your entire response under 170 words using ONLY these concise sections (omit a section if empty):
+
 ### ${copy.executivePulseHeading} — ${humanDate}
-(2-3 high-signal bullet points summarizing today's focus, key client/internal momentum, and urgent risks)
-### ${copy.topPrioritiesHeading}
-(Prioritized action items focusing on overdue, due today, high-priority, and in-progress tasks with @[Full Name] owners and due dates)
-### ${copy.blockersHeading}
-(Proposed decisions needing sign-off and waiting/blocked items)
+(2–3 crisp bullets honoring the user's Retro Steering Note first, summarizing today's true focus vs. parked horizons, and connecting cross-note priorities)
+### ${copy.highSignalTakeawaysHeading}
+(1–3 bullets distilling insights from ★ HIGH SIGNAL notes, user retro comments, and active client/project momentum)
+### ${copy.watchlistSignalsHeading}
+(1–3 bullets highlighting batch follow-ups by @[Full Name], stalled/unassigned drift risks, or key decisions needing sign-off)
 
 IMPORTANT RULES:
-- Cite source notes inline using [[Exact Note Title]].
-- Mention people using @[Full Name] and topics using #label.
-- Do NOT use raw "- [ ]" or "- [D:...]" checkbox syntax; instead use bold status tags in the target language (e.g. "- **[${copy.dueToday} · !HIGH]**" or "- **[${copy.statusLabels.proposed}]**") so items are formatted as an executive briefing.`;
+- Treat User Retro Steering Notes, ★ ratings, horizon buckets, and per-item User Retro Comments as ground-truth executive intent.
+- Cite source notes inline using [[Exact Note Title]], people using @[Full Name], and themes using #label.
+- Never use raw "- [ ]" or "- [D:...]" checkbox syntax.`;
 
       const userPrompt = `Today's Date: ${data.todayDate}
 
-Open Tasks (${data.allOpenTasks.length} total, ${data.overdueTasks.length} overdue, ${data.dueTodayTasks.length} due today):
-${tasksContext || 'None'}
+User Daily Retro Steering (Highest Priority):
+${steeringLines.join('\n') || 'None'}
 
-Decisions (${data.proposedDecisions.length} proposed, ${data.recentAgreedDecisions.length} recently agreed):
+Horizon Counts: ${data.focusTodayTasks.length} in Today's Focus (${data.overdueTasks.length} overdue), ${data.tomorrowTasks.length} Tomorrow, ${data.thisWeekTasks.length} This Week, ${data.sometimeTasks.length} parked in Sometime (excluded below).
+
+Prioritized Tasks & User Comments:
+${focusTasksContext || 'None'}
+
+Active Decisions & User Comments:
 ${decisionsContext || 'None'}
 
-Recent Workspace Notes:
+Waiting-on-Person Follow-up Clusters:
+${waitingContext || 'None'}
+
+Drift / Staleness Signals:
+${driftContext || 'None'}
+
+Recent High-Signal & Active Notes (${data.hiddenLowSignalNotesCount} low-signal notes filtered out):
 ${notesContext || 'None'}`;
 
       const llmRes = await callConfiguredLlmDetailed(systemPrompt, userPrompt, config, {

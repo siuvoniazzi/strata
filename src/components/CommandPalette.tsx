@@ -56,6 +56,7 @@ interface CommandPaletteProps {
   onOpenPersonNotes: (personName: string) => void;
   onSwitchMainView: (view: 'notes' | 'tasks' | 'decisions' | 'reports' | 'people') => void;
   onOpenDailyBriefing?: () => void;
+  onOpenDailyRetro?: () => void;
   onOpenDailyReportNote?: () => void;
   onTriggerAiStructure: () => void;
   onToggleTheme: () => void;
@@ -98,6 +99,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   onOpenPersonNotes,
   onSwitchMainView,
   onOpenDailyBriefing,
+  onOpenDailyRetro,
   onOpenDailyReportNote,
   onTriggerAiStructure,
   onToggleTheme,
@@ -232,11 +234,22 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         icon: <Users size={14} />,
         action: () => onSwitchMainView('people'),
       },
+      ...(onOpenDailyRetro
+        ? [
+            {
+              id: 'act-daily-retro',
+              title: 'Start Daily Retro — Rate Notes, Slot Task Horizons & Steer AI',
+              category: 'Daily Briefing',
+              icon: <Sparkles size={14} />,
+              action: onOpenDailyRetro,
+            },
+          ]
+        : []),
       ...(onOpenDailyBriefing
         ? [
             {
               id: 'view-daily-briefing',
-              title: 'Open Daily Briefing & AI Overview (Today’s Priorities, Tasks & Decisions)',
+              title: 'Open Daily Brief & Chief-of-Staff Synthesis',
               category: 'Daily Briefing',
               icon: <Sun size={14} />,
               action: onOpenDailyBriefing,
@@ -366,6 +379,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     onTriggerAiStructure,
     onSwitchMainView,
     onOpenDailyBriefing,
+    onOpenDailyRetro,
     onOpenDailyReportNote,
     onConnectFolder,
     onToggleTheme,

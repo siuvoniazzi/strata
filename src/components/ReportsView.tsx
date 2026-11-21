@@ -3,6 +3,8 @@ import {
   AlertTriangle,
   CalendarCheck,
   Check,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Copy,
   ExternalLink,
@@ -11,11 +13,14 @@ import {
   Filter,
   Gavel,
   Loader2,
+  MoreHorizontal,
   Printer,
   RefreshCw,
   Sparkles,
+  Star,
   Sun,
   Trash2,
+  Users,
 } from 'lucide-react';
 import type {
   AiConfig,
@@ -24,6 +29,7 @@ import type {
   Note,
   ParsedDecision,
   ParsedTask,
+  TaskHorizonBucket,
   TaskStatus,
   WorkspaceDirectory,
 } from '../types';
@@ -41,6 +47,14 @@ import {
   getTodayDateString,
   type PersistedDailyBriefingState,
 } from '../utils/dailyBriefing';
+import {
+  addDaysIso,
+  getDecisionRetroFeedback,
+  getNoteRetroFeedback,
+  getTaskRetroPlan,
+  isTaskActivelyOverdue,
+  resolveEffectiveTaskHorizon,
+} from '../utils/dailyRetro';
 import {
   extractInlineMentions,
   getAllNoteLabels,
@@ -70,6 +84,12 @@ interface ReportsViewProps {
   isRefreshingDailyBriefing?: boolean;
   onRefreshDailyBriefing?: (recentWindowDays?: number) => Promise<void>;
   onOpenDailyReportNote?: () => void;
+  onOpenDailyRetro?: () => void;
+  onTriageTaskHorizon?: (
+    task: ParsedTask,
+    bucket: TaskHorizonBucket,
+    targetDate?: string | null
+  ) => void;
   onModeChange?: (mode: ReportsHubMode) => void;
   onOpenNote: (noteId: string) => void;
   onOpenNoteByTitle?: (noteTitle: string) => void;
@@ -105,6 +125,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   isRefreshingDailyBriefing = false,
   onRefreshDailyBriefing,
   onOpenDailyReportNote,
+  onOpenDailyRetro,
+  onTriageTaskHorizon,
   onModeChange,
   onOpenNote,
   onOpenNoteByTitle,
@@ -131,7 +153,13 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
   // Daily Briefing local controls
   const [dailyWindowDays, setDailyWindowDays] = useState<number>(7);
-  const [dailyTaskTab, setDailyTaskTab] = useState<'focus' | 'urgent' | 'all' | 'done'>('focus');
+  const [dailyTaskTab, setDailyTaskTab] = useState<
+    'today' | 'tomorrow' | 'this-week' | 'sometime' | 'done'
+  >('today');
+  const [showAllTodayFocus, setShowAllTodayFocus] = useState(false);
+  const [showAgreedDecisions, setShowAgreedDecisions] = useState(false);
+  const [showAllRecentNotes, setShowAllRecentNotes] = useState(false);
+  const [showDailyUtilityMenu, setShowDailyUtilityMenu] = useState(false);
   const [dailyCopied, setDailyCopied] = useState(false);
 
   const allPeopleNames = useMemo(() => {
@@ -406,21 +434,26 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   );
 
   const displayedDailyTasks = useMemo(() => {
-    if (dailyTaskTab === 'urgent') {
-      return [...dailyData.overdueTasks, ...dailyData.dueTodayTasks];
-    }
-    if (dailyTaskTab === 'all') {
-      return dailyData.allOpenTasks;
-    }
-    if (dailyTaskTab === 'done') {
-      return dailyData.recentlyCompletedTasks;
-    }
-    return dailyData.urgentAndFocusTasks.length > 0
-      ? dailyData.urgentAndFocusTasks
-      : dailyData.allOpenTasks;
-  }, [dailyData, dailyTaskTab]);
+    if (dailyTaskTab === 'tomorrow') return dailyData.tomorrowTasks;
+    if (dailyTaskTab === 'this-week') return dailyData.thisWeekTasks;
+    if (dailyTaskTab === 'sometime') return dailyData.sometimeTasks;
+    if (dailyTaskTab === 'done') return dailyData.recentlyCompletedTasks;
+    return showAllTodayFocus
+      ? dailyData.focusTodayTasks
+      : dailyData.focusTodayTasks.slice(0, 6);
+  }, [dailyData, dailyTaskTab, showAllTodayFocus]);
 
-  const urgentCount = dailyData.overdueTasks.length + dailyData.dueTodayTasks.length;
+  const driftCount =
+    dailyData.signals.staleItems.length + dailyData.signals.silentProjects.length;
+  const hasSignalsPanel =
+    dailyData.signals.waitingByPerson.length > 0 ||
+    dailyData.signals.staleItems.length > 0 ||
+    dailyData.signals.silentProjects.length > 0;
+  const effectiveSteeringNote =
+    dailyData.todaySteeringNote || dailyData.carryoverSteeringNote;
+  const visibleNotesSlice = showAllRecentNotes
+    ? dailyData.visibleRecentNotes
+    : dailyData.visibleRecentNotes.slice(0, 4);
 
   return (
     <div className={embeddedInOverlay ? 'overlay-report-view' : 'page-scroll'}>
@@ -437,9 +470,9 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               onClick={() => switchHubMode('daily')}
             >
               <Sun size={14} />
-              <span>Daily Briefing &amp; Overview</span>
+              <span>Daily Brief</span>
               <span className="reports-mode-badge">
-                {urgentCount > 0 ? `${urgentCount} due/overdue` : 'Today'}
+                {dailyData.focusTodayTasks.length} focus
               </span>
             </button>
 
@@ -460,18 +493,25 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
         {hubMode === 'daily' ? (
           <>
-            {/* Daily Briefing Header */}
-            <div className="page-header">
+            {/* Decluttered Daily Brief Header */}
+            <div className="page-header daily-clean-header">
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                  <h1 className="page-h1">Daily Briefing — {formatHumanDate(todayDate, briefingLanguage)}</h1>
-                  <span className="daily-live-pill">
-                    <CalendarCheck size={12} /> Auto-Updates Daily
-                  </span>
+                  <h1 className="page-h1">
+                    {formatHumanDate(todayDate, briefingLanguage)}
+                  </h1>
+                  {dailyData.retroQueue.isCompletedToday ? (
+                    <span className="daily-live-pill">
+                      <CalendarCheck size={12} /> Retro Complete
+                    </span>
+                  ) : dailyData.retroQueue.totalPendingCount > 0 ? (
+                    <span className="daily-retro-pending-pill">
+                      {dailyData.retroQueue.totalPendingCount} to triage
+                    </span>
+                  ) : null}
                 </div>
                 <p className="page-subtitle">
-                  AI-synthesized executive overview, today&apos;s top priorities, deadlines, pending decisions, and recent
-                  note summaries — automatically synced with your{' '}
+                  High-signal synthesis shaped by your Daily Retro &amp; synced to{' '}
                   <button
                     type="button"
                     className="inline-note-jump-btn"
@@ -484,121 +524,212 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     }}
                   >
                     [[Daily Briefing — {todayDate}]]
-                  </button>{' '}
-                  note.
+                  </button>
                 </p>
               </div>
 
-              <div className="no-print" style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-                <select
-                  className="meta-select"
-                  aria-label="Recent activity window"
-                  value={dailyWindowDays}
-                  onChange={(e) => {
-                    const nextDays = Number(e.target.value);
-                    setDailyWindowDays(nextDays);
-                  }}
-                >
-                  <option value={2}>Recent Window: Last 48 Hours</option>
-                  <option value={7}>Recent Window: Last 7 Days</option>
-                  <option value={14}>Recent Window: Last 14 Days</option>
-                  <option value={30}>Recent Window: Last 30 Days</option>
-                </select>
+              <div className="no-print daily-header-actions">
+                {onOpenDailyRetro && (
+                  <button
+                    id="btn-open-daily-retro"
+                    type="button"
+                    className={`btn ${
+                      dailyData.retroQueue.isCompletedToday ? 'btn-soft' : 'btn-primary'
+                    } daily-retro-launch-btn`}
+                    onClick={onOpenDailyRetro}
+                    title="Rate today's notes, slot tasks into horizons, and steer AI"
+                  >
+                    {dailyData.retroQueue.isCompletedToday ? (
+                      <Check size={14} />
+                    ) : (
+                      <Sparkles size={14} />
+                    )}
+                    <span>
+                      {dailyData.retroQueue.isCompletedToday
+                        ? 'Edit Daily Retro'
+                        : dailyData.retroQueue.totalPendingCount > 0
+                        ? `Daily Retro (${dailyData.retroQueue.totalPendingCount})`
+                        : 'Daily Retro'}
+                    </span>
+                  </button>
+                )}
 
                 <button
                   id="btn-refresh-daily-briefing"
                   type="button"
-                  className="btn btn-primary"
+                  className={`btn ${onOpenDailyRetro && !dailyData.retroQueue.isCompletedToday ? '' : 'btn-primary'}`}
                   disabled={isRefreshingDailyBriefing}
                   onClick={() => void onRefreshDailyBriefing?.(dailyWindowDays)}
-                  title="Synthesize fresh Daily Briefing with configured AI engine and update Daily Report note"
+                  title="Synthesize fresh Daily Brief"
                 >
                   {isRefreshingDailyBriefing ? (
                     <Loader2 size={14} className="ai-spin" />
                   ) : (
-                    <Sparkles size={14} />
+                    <RefreshCw size={13} />
                   )}
-                  {isRefreshingDailyBriefing
-                    ? 'Synthesizing Daily Briefing…'
-                    : aiConfig.provider === 'local'
-                    ? 'Refresh Daily Briefing'
-                    : 'Synthesize Daily Briefing with AI'}
+                  <span>
+                    {isRefreshingDailyBriefing
+                      ? 'Synthesizing…'
+                      : aiConfig.provider === 'local'
+                      ? 'Refresh'
+                      : 'Synthesize'}
+                  </span>
                 </button>
 
-                {onOpenDailyReportNote && (
+                <div className="daily-overflow-wrap">
                   <button
-                    id="btn-open-daily-report-note"
                     type="button"
-                    className="btn btn-soft"
-                    onClick={onOpenDailyReportNote}
-                    title="Open the auto-updated Daily Briefing note in the editor"
+                    className="btn btn-icon"
+                    aria-label="More briefing options"
+                    aria-expanded={showDailyUtilityMenu}
+                    onClick={() => setShowDailyUtilityMenu((v) => !v)}
+                    title="Window, Copy, Print & Note options"
                   >
-                    <FileText size={14} />
-                    Open Daily Report Note
+                    <MoreHorizontal size={15} />
                   </button>
-                )}
 
-                <button type="button" className="btn" onClick={handleCopyDailyDigest}>
-                  {dailyCopied ? <Check size={14} /> : <Copy size={14} />}
-                  {dailyCopied ? 'Copied Digest!' : 'Copy Daily Digest'}
-                </button>
+                  {showDailyUtilityMenu && (
+                    <div className="daily-overflow-menu">
+                      <div className="daily-overflow-field">
+                        <span>Activity window</span>
+                        <select
+                          className="meta-select"
+                          aria-label="Recent activity window"
+                          value={dailyWindowDays}
+                          onChange={(e) => {
+                            setDailyWindowDays(Number(e.target.value));
+                          }}
+                        >
+                          <option value={2}>Last 48 Hours</option>
+                          <option value={7}>Last 7 Days</option>
+                          <option value={14}>Last 14 Days</option>
+                          <option value={30}>Last 30 Days</option>
+                        </select>
+                      </div>
 
-                <button type="button" className="btn" onClick={() => window.print()}>
-                  <Printer size={14} /> Print / PDF
-                </button>
+                      {onOpenDailyReportNote && (
+                        <button
+                          id="btn-open-daily-report-note"
+                          type="button"
+                          className="daily-overflow-item"
+                          onClick={() => {
+                            setShowDailyUtilityMenu(false);
+                            onOpenDailyReportNote();
+                          }}
+                        >
+                          <FileText size={13} /> Open Daily Report .md
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        className="daily-overflow-item"
+                        onClick={() => {
+                          void handleCopyDailyDigest();
+                          setShowDailyUtilityMenu(false);
+                        }}
+                      >
+                        {dailyCopied ? <Check size={13} /> : <Copy size={13} />}
+                        {dailyCopied ? 'Copied Digest!' : 'Copy Daily Digest'}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="daily-overflow-item"
+                        onClick={() => {
+                          setShowDailyUtilityMenu(false);
+                          window.print();
+                        }}
+                      >
+                        <Printer size={13} /> Print / Save PDF
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
-            {/* 5-Card Daily Pulse KPI Strip */}
-            <div className="stat-strip">
-              <div className={`stat-box ${urgentCount > 0 ? 'stat-box-urgent' : ''}`}>
-                <div className="stat-value">{urgentCount}</div>
-                <div className="stat-label">
-                  Due Today &amp; Overdue ({dailyData.overdueTasks.length} overdue · {dailyData.dueTodayTasks.length}{' '}
-                  today)
-                </div>
-              </div>
-              <div className="stat-box">
-                <div className="stat-value">
-                  {dailyData.highPriorityOpenTasks.length + dailyData.inProgressTasks.length}
-                </div>
-                <div className="stat-label">
-                  High Priority &amp; Doing ({dailyData.highPriorityOpenTasks.length} !high ·{' '}
-                  {dailyData.inProgressTasks.length} doing)
-                </div>
-              </div>
-              <div className="stat-box">
-                <div className="stat-value">
-                  {dailyData.waitingTasks.length + dailyData.proposedDecisions.length}
-                </div>
-                <div className="stat-label">
-                  Waiting &amp; Pending ({dailyData.waitingTasks.length} waiting ·{' '}
-                  {dailyData.proposedDecisions.length} proposed)
-                </div>
-              </div>
-              <div className="stat-box">
-                <div className="stat-value">{dailyData.recentAgreedDecisions.length}</div>
-                <div className="stat-label">
-                  Recent Agreed Decisions ({dailyData.allDecisions.length} total)
-                </div>
-              </div>
-              <div className="stat-box">
-                <div className="stat-value">{dailyData.recentNotes.length}</div>
-                <div className="stat-label">
-                  Recent Notes ({dailyData.todayNotes.length} active today)
-                </div>
-              </div>
+            {/* Compact Signal Pulse Strip (Replaces bulky 5-card KPI grid) */}
+            <div className="daily-signal-strip no-print" role="region" aria-label="Daily Signals">
+              <button
+                type="button"
+                className={`signal-pill ${dailyTaskTab === 'today' ? 'active' : ''}`}
+                onClick={() => setDailyTaskTab('today')}
+              >
+                <Sun size={12} />
+                <strong>{dailyData.focusTodayTasks.length}</strong>
+                <span>Today&apos;s Focus</span>
+              </button>
+
+              {dailyData.overdueTasks.length > 0 && (
+                <button
+                  type="button"
+                  className="signal-pill is-urgent"
+                  onClick={() => setDailyTaskTab('today')}
+                >
+                  <AlertTriangle size={12} />
+                  <strong>{dailyData.overdueTasks.length}</strong>
+                  <span>Overdue</span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                className={`signal-pill ${dailyTaskTab === 'tomorrow' ? 'active' : ''}`}
+                onClick={() => setDailyTaskTab('tomorrow')}
+              >
+                <strong>{dailyData.tomorrowTasks.length}</strong>
+                <span>Tomorrow</span>
+              </button>
+
+              {dailyData.signals.waitingByPerson.length > 0 && (
+                <a href="#daily-signals-panel" className="signal-pill is-amber">
+                  <Users size={12} />
+                  <strong>{dailyData.signals.waitingByPerson.length}</strong>
+                  <span>People Waiting</span>
+                </a>
+              )}
+
+              {dailyData.activeProposedDecisions.length > 0 && (
+                <a href="#daily-decisions-panel" className="signal-pill is-amber">
+                  <Gavel size={12} />
+                  <strong>{dailyData.activeProposedDecisions.length}</strong>
+                  <span>Needs Sign-off</span>
+                </a>
+              )}
+
+              {driftCount > 0 && (
+                <a href="#daily-signals-panel" className="signal-pill">
+                  <Clock size={12} />
+                  <strong>{driftCount}</strong>
+                  <span>Drift / Stale</span>
+                </a>
+              )}
+
+              {dailyData.signals.untriagedInboxCount > 0 && (
+                <button
+                  type="button"
+                  className="signal-pill"
+                  onClick={() => {
+                    setClientId('__inbox__');
+                    switchHubMode('explorer');
+                  }}
+                >
+                  <strong>{dailyData.signals.untriagedInboxCount}</strong>
+                  <span>Inbox</span>
+                </button>
+              )}
             </div>
 
-            {/* AI Daily Executive Overview & Top Priorities Panel */}
+            {/* Chief-of-Staff Synthesis Panel (Non-duplicative insights) */}
             <div className="surface-panel daily-overview-panel">
               <div className="daily-panel-header">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                   <span className="daily-ai-badge">
                     <Sparkles size={13} />
-                    <span>Daily Executive Overview &amp; Top Priorities</span>
+                    <span>Chief-of-Staff Synthesis</span>
                   </span>
-                  <span className="due-chip">Engine: {activeDailyProvider}</span>
+                  <span className="due-chip">{activeDailyProvider}</span>
                   <AiPrivacyInlineControls
                     report={activeDailyPrivacyReport}
                     isOpen={showDailyPrivacyPrompt}
@@ -606,7 +737,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                   />
                   {dailyBriefingState?.generatedAt && (
                     <span className="due-chip">
-                      <Clock size={11} /> Updated{' '}
+                      <Clock size={11} />{' '}
                       {new Date(dailyBriefingState.generatedAt).toLocaleTimeString([], {
                         hour: '2-digit',
                         minute: '2-digit',
@@ -614,30 +745,24 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     </span>
                   )}
                 </div>
+              </div>
 
-                <div className="no-print" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                  {onOpenDailyReportNote && (
+              {effectiveSteeringNote && (
+                <div className="daily-steering-banner">
+                  <div>
+                    <strong>Your Retro Steering:</strong> &ldquo;{effectiveSteeringNote}&rdquo;
+                  </div>
+                  {onOpenDailyRetro && (
                     <button
                       type="button"
-                      className="btn btn-xs btn-soft"
-                      onClick={onOpenDailyReportNote}
-                      title="View or edit the synced Daily Briefing note in the workspace editor"
+                      className="retro-link-btn no-print"
+                      onClick={onOpenDailyRetro}
                     >
-                      <ExternalLink size={12} /> View in Note Editor
+                      Edit
                     </button>
                   )}
-                  <button
-                    type="button"
-                    className="btn btn-xs btn-ghost"
-                    onClick={() => void onRefreshDailyBriefing?.(dailyWindowDays)}
-                    disabled={isRefreshingDailyBriefing}
-                    title="Re-synthesize today's overview"
-                  >
-                    <RefreshCw size={12} className={isRefreshingDailyBriefing ? 'ai-spin' : ''} />
-                    Regenerate
-                  </button>
                 </div>
-              </div>
+              )}
 
               <AiPrivacyPromptDrawer
                 report={activeDailyPrivacyReport}
@@ -646,8 +771,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
               {isRefreshingDailyBriefing ? (
                 <AiLoadingState
-                  title="Synthesizing Today's Executive Overview & Priorities…"
-                  subtitle={`Analyzing ${dailyData.sourceNotes.length} note(s), ${dailyData.allOpenTasks.length} open task(s), and ${dailyData.allDecisions.length} decision(s)`}
+                  title="Synthesizing Today's Brief…"
+                  subtitle={`Distilling ${dailyData.focusTodayTasks.length} focus item(s), ${dailyData.highSignalNotes.length} high-signal note(s), and workspace signals`}
                   providerLabel={formatAiEngineLabel(aiConfig)}
                 />
               ) : (
@@ -665,65 +790,78 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
               )}
             </div>
 
-            {/* Today's Action Items & Priorities (2-Way Synced with Source Notes) */}
+            {/* Horizon-Driven Tasks Panel */}
             <div className="surface-panel">
               <div className="daily-panel-header">
-                <strong style={{ fontSize: 14.5 }}>
-                  Action Items &amp; Priorities ({dailyData.allOpenTasks.length} Open ·{' '}
-                  {dailyData.recentlyCompletedTasks.length} Completed Recently)
-                </strong>
+                <strong style={{ fontSize: 14.5 }}>Action Horizons</strong>
 
-                <div className="no-print" style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                <div className="no-print daily-horizon-tabs">
                   <button
                     type="button"
-                    className={`btn btn-xs ${dailyTaskTab === 'focus' ? 'btn-primary' : ''}`}
-                    onClick={() => setDailyTaskTab('focus')}
+                    className={`btn btn-xs ${dailyTaskTab === 'today' ? 'btn-primary' : ''}`}
+                    onClick={() => setDailyTaskTab('today')}
                   >
-                    Priority Focus ({dailyData.urgentAndFocusTasks.length})
+                    Today ({dailyData.focusTodayTasks.length})
                   </button>
                   <button
                     type="button"
-                    className={`btn btn-xs ${dailyTaskTab === 'urgent' ? 'btn-primary' : ''}`}
-                    onClick={() => setDailyTaskTab('urgent')}
+                    className={`btn btn-xs ${dailyTaskTab === 'tomorrow' ? 'btn-primary' : ''}`}
+                    onClick={() => setDailyTaskTab('tomorrow')}
                   >
-                    Due Today &amp; Overdue ({urgentCount})
+                    Tomorrow ({dailyData.tomorrowTasks.length})
                   </button>
                   <button
                     type="button"
-                    className={`btn btn-xs ${dailyTaskTab === 'all' ? 'btn-primary' : ''}`}
-                    onClick={() => setDailyTaskTab('all')}
+                    className={`btn btn-xs ${dailyTaskTab === 'this-week' ? 'btn-primary' : ''}`}
+                    onClick={() => setDailyTaskTab('this-week')}
                   >
-                    All Open ({dailyData.allOpenTasks.length})
+                    This Week ({dailyData.thisWeekTasks.length})
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-xs ${dailyTaskTab === 'sometime' ? 'btn-primary' : ''}`}
+                    onClick={() => setDailyTaskTab('sometime')}
+                  >
+                    Sometime ({dailyData.sometimeTasks.length})
                   </button>
                   <button
                     type="button"
                     className={`btn btn-xs ${dailyTaskTab === 'done' ? 'btn-primary' : ''}`}
                     onClick={() => setDailyTaskTab('done')}
                   >
-                    Completed ({dailyData.recentlyCompletedTasks.length})
+                    Done ({dailyData.recentlyCompletedTasks.length})
                   </button>
                 </div>
               </div>
 
               {displayedDailyTasks.length === 0 ? (
-                <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>
-                  {dailyTaskTab === 'urgent'
-                    ? 'No overdue or due-today tasks — you are caught up on immediate deadlines!'
-                    : dailyTaskTab === 'done'
-                    ? 'No completed tasks in the selected window yet.'
-                    : 'No open action items across your notes.'}
-                </span>
+                <div className="daily-calm-empty">
+                  <span>
+                    {dailyTaskTab === 'today'
+                      ? 'Nothing urgent in Today’s Focus — enjoy deep work or pull an item from Tomorrow / This Week.'
+                      : dailyTaskTab === 'tomorrow'
+                      ? 'Nothing queued specifically for tomorrow yet.'
+                      : dailyTaskTab === 'this-week'
+                      ? 'No tasks slotted for This Week.'
+                      : dailyTaskTab === 'sometime'
+                      ? 'No tasks parked in Sometime.'
+                      : 'No completed tasks in the selected window yet.'}
+                  </span>
+                </div>
               ) : (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {displayedDailyTasks.map((t) => {
-                    const nextStatus = TASK_CYCLE[(TASK_CYCLE.indexOf(t.status) + 1) % TASK_CYCLE.length];
+                    const nextStatus =
+                      TASK_CYCLE[(TASK_CYCLE.indexOf(t.status) + 1) % TASK_CYCLE.length];
                     const inlineMentions = extractInlineMentions(t.text, directory.people);
                     const ownerAlreadyInline = Boolean(
                       t.owner &&
                         inlineMentions.some((m) => m.toLowerCase() === t.owner!.toLowerCase())
                     );
-                    const isOverdue = Boolean(
-                      t.status !== 'done' && t.dueDate && t.dueDate < todayDate
+                    const isOverdue = isTaskActivelyOverdue(
+                      t,
+                      directory.dailyRetro,
+                      todayDate
                     );
                     const isDueToday = Boolean(
                       t.status !== 'done' && t.dueDate === todayDate
@@ -731,6 +869,12 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     const taskClient = t.clientId
                       ? directory.clients.find((c) => c.id === t.clientId)
                       : null;
+                    const plan = getTaskRetroPlan(directory.dailyRetro, t);
+                    const effectiveHorizon = resolveEffectiveTaskHorizon(
+                      t,
+                      directory.dailyRetro,
+                      todayDate
+                    );
 
                     return (
                       <div
@@ -739,36 +883,50 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           isOverdue ? 'task-card-overdue' : isDueToday ? 'task-card-due-today' : ''
                         }`}
                       >
-                        <div className="task-left">
-                          <button
-                            type="button"
-                            className={`status-badge status-${t.status}`}
-                            onClick={() => onUpdateTaskStatus(t, nextStatus)}
-                            title="Click to update task status directly in source .md note"
-                          >
-                            {t.status}
-                          </button>
-
-                          {isOverdue && (
-                            <span className="priority-high" title={`Overdue since ${t.dueDate}`}>
-                              <AlertTriangle size={10} style={{ marginRight: 3, verticalAlign: '-1px' }} />
-                              OVERDUE · {t.dueDate}
-                            </span>
-                          )}
-                          {isDueToday && (
-                            <span className="daily-due-today-badge">DUE TODAY</span>
-                          )}
-
-                          <span className="task-text">{renderInline(t.text)}</span>
-
-                          {t.owner && !ownerAlreadyInline && (
+                        <div className="task-left" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' }}>
                             <button
                               type="button"
-                              className="pill pill-person"
-                              onClick={() => applyPersonFilter(t.owner!)}
+                              className={`status-badge status-${t.status}`}
+                              onClick={() => onUpdateTaskStatus(t, nextStatus)}
+                              title="Click to update task status directly in source .md note"
                             >
-                              @{t.owner}
+                              {t.status}
                             </button>
+
+                            {plan?.starred && (
+                              <span className="retro-star-chip" title="Top Focus from Daily Retro">
+                                <Star size={10} fill="currentColor" /> Focus
+                              </span>
+                            )}
+
+                            {isOverdue && (
+                              <span className="priority-high" title={`Overdue since ${t.dueDate}`}>
+                                <AlertTriangle size={10} style={{ marginRight: 3, verticalAlign: '-1px' }} />
+                                {t.dueDate}
+                              </span>
+                            )}
+                            {isDueToday && (
+                              <span className="daily-due-today-badge">TODAY</span>
+                            )}
+
+                            <span className="task-text">{renderInline(t.text)}</span>
+
+                            {t.owner && !ownerAlreadyInline && (
+                              <button
+                                type="button"
+                                className="pill pill-person"
+                                onClick={() => applyPersonFilter(t.owner!)}
+                              >
+                                @{t.owner}
+                              </button>
+                            )}
+                          </div>
+
+                          {plan?.comment && (
+                            <div className="retro-inline-comment">
+                              <span>Retro note: {plan.comment}</span>
+                            </div>
                           )}
                         </div>
 
@@ -776,6 +934,29 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                           {t.priority === 'high' && <span className="priority-high">!HIGH</span>}
                           {t.dueDate && !isOverdue && !isDueToday && (
                             <span className="due-chip">due {t.dueDate}</span>
+                          )}
+                          {onTriageTaskHorizon && t.status !== 'done' && (
+                            <select
+                              className="task-horizon-select no-print"
+                              aria-label="Task horizon"
+                              value={plan?.bucket === 'date' ? 'date' : effectiveHorizon}
+                              onChange={(e) => {
+                                const val = e.target.value as TaskHorizonBucket;
+                                if (val === 'tomorrow') {
+                                  onTriageTaskHorizon(t, 'tomorrow', addDaysIso(todayDate, 1));
+                                } else {
+                                  onTriageTaskHorizon(t, val);
+                                }
+                              }}
+                            >
+                              <option value="today">Today</option>
+                              <option value="tomorrow">Tomorrow</option>
+                              <option value="this-week">This Week</option>
+                              <option value="sometime">Sometime</option>
+                              {plan?.bucket === 'date' && plan.targetDate && (
+                                <option value="date">{plan.targetDate}</option>
+                              )}
+                            </select>
                           )}
                           {taskClient && (
                             <span
@@ -811,33 +992,177 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       </div>
                     );
                   })}
+
+                  {dailyTaskTab === 'today' && dailyData.focusTodayTasks.length > 6 && (
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-ghost no-print"
+                      style={{ alignSelf: 'flex-start', marginTop: 4 }}
+                      onClick={() => setShowAllTodayFocus((v) => !v)}
+                    >
+                      {showAllTodayFocus ? (
+                        <>
+                          <ChevronUp size={13} /> Show top 6 only
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown size={13} /> Show all {dailyData.focusTodayTasks.length} focus tasks
+                        </>
+                      )}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Decisions Radar (Pending Sign-off & Recent Agreements) */}
-            <div className="surface-panel">
-              <div className="daily-panel-header">
-                <strong style={{ fontSize: 14.5 }}>
-                  Decisions Radar ({dailyData.proposedDecisions.length} Pending Sign-off ·{' '}
-                  {dailyData.recentAgreedDecisions.length} Recently Agreed)
-                </strong>
-              </div>
+            {/* High-Value Workspace Signals: People Follow-ups & Drift Radar */}
+            {hasSignalsPanel && (
+              <div id="daily-signals-panel" className="surface-panel">
+                <div className="daily-panel-header" style={{ marginBottom: 8 }}>
+                  <strong style={{ fontSize: 14.5 }}>Follow-ups &amp; Drift Signals</strong>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    Batched nudges &amp; stalled workstreams
+                  </span>
+                </div>
 
-              {dailyData.proposedDecisions.length === 0 &&
-              dailyData.recentAgreedDecisions.length === 0 ? (
-                <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>
-                  No active or proposed decisions documented yet. Use <code>- [D:agreed]</code> or{' '}
-                  <code>- [D:proposed]</code> in any note.
-                </span>
-              ) : (
+                <div className="daily-signals-grid">
+                  {dailyData.signals.waitingByPerson.length > 0 && (
+                    <div className="signal-column">
+                      <div className="signal-column-title">
+                        <Users size={13} /> Batch Follow-ups by Person
+                      </div>
+                      {dailyData.signals.waitingByPerson.map((group) => (
+                        <div key={group.personName} className="signal-person-card">
+                          <div className="signal-person-top">
+                            <button
+                              type="button"
+                              className="pill pill-person"
+                              onClick={() => applyPersonFilter(group.personName)}
+                            >
+                              @{group.personName}
+                            </button>
+                            <span className="due-chip">
+                              {group.totalCount} item{group.totalCount === 1 ? '' : 's'}
+                              {group.oldestDays >= 3 ? ` · ${group.oldestDays}d` : ''}
+                            </span>
+                          </div>
+                          <ul className="signal-mini-list">
+                            {group.tasks.slice(0, 2).map((t) => (
+                              <li key={t.id}>
+                                <button
+                                  type="button"
+                                  className="signal-item-link"
+                                  onClick={() => onOpenNote(t.noteId)}
+                                >
+                                  {t.text}
+                                </button>
+                              </li>
+                            ))}
+                            {group.decisions.slice(0, 1).map((d) => (
+                              <li key={d.id}>
+                                <button
+                                  type="button"
+                                  className="signal-item-link"
+                                  onClick={() => onOpenNote(d.noteId)}
+                                >
+                                  [Sign-off] {d.text}
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {(dailyData.signals.staleItems.length > 0 ||
+                    dailyData.signals.silentProjects.length > 0) && (
+                    <div className="signal-column">
+                      <div className="signal-column-title">
+                        <Clock size={13} /> Stalled, Unassigned &amp; Quiet Streams
+                      </div>
+                      {dailyData.signals.staleItems.slice(0, 4).map((item) => (
+                        <div key={item.id} className="signal-drift-row">
+                          <div style={{ minWidth: 0 }}>
+                            <span className="signal-drift-tag">
+                              {item.kind === 'unassigned-urgent'
+                                ? 'No Owner'
+                                : `${item.ageDays}d waiting`}
+                            </span>{' '}
+                            <button
+                              type="button"
+                              className="signal-item-link"
+                              onClick={() => onOpenNote(item.noteId)}
+                            >
+                              {item.title}
+                            </button>
+                          </div>
+                          <span className="due-chip">{item.noteTitle}</span>
+                        </div>
+                      ))}
+
+                      {dailyData.signals.silentProjects.map((sp) => (
+                        <div key={sp.project.id} className="signal-drift-row">
+                          <div>
+                            <span className="signal-drift-tag">
+                              Quiet {sp.daysSinceLastNote}d
+                            </span>{' '}
+                            <button
+                              type="button"
+                              className="signal-item-link"
+                              onClick={() => {
+                                setClientId(sp.project.clientId || '__internal__');
+                                setProjectId(sp.project.id);
+                                switchHubMode('explorer');
+                              }}
+                            >
+                              {sp.project.name}
+                              {sp.clientName ? ` (${sp.clientName})` : ''}
+                            </button>
+                          </div>
+                          <span className="due-chip">Active project</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Streamlined Decisions Radar (Pending Sign-off upfront; Agreed collapsible) */}
+            {(dailyData.activeProposedDecisions.length > 0 ||
+              dailyData.recentAgreedDecisions.length > 0) && (
+              <div id="daily-decisions-panel" className="surface-panel">
+                <div className="daily-panel-header">
+                  <strong style={{ fontSize: 14.5 }}>
+                    Decisions ({dailyData.activeProposedDecisions.length} Needs Sign-off)
+                  </strong>
+                  {dailyData.recentAgreedDecisions.length > 0 && (
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-ghost no-print"
+                      onClick={() => setShowAgreedDecisions((v) => !v)}
+                    >
+                      {showAgreedDecisions
+                        ? 'Hide Agreed'
+                        : `Show ${dailyData.recentAgreedDecisions.length} Agreed`}
+                    </button>
+                  )}
+                </div>
+
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {[...dailyData.proposedDecisions, ...dailyData.recentAgreedDecisions].map((d) => {
+                  {[
+                    ...dailyData.activeProposedDecisions,
+                    ...(showAgreedDecisions || dailyData.activeProposedDecisions.length === 0
+                      ? dailyData.recentAgreedDecisions.slice(0, 4)
+                      : []),
+                  ].map((d) => {
                     const nextStatus =
                       DEC_CYCLE[(DEC_CYCLE.indexOf(d.status) + 1) % DEC_CYCLE.length];
                     const decClient = d.clientId
                       ? directory.clients.find((c) => c.id === d.clientId)
                       : null;
+                    const fb = getDecisionRetroFeedback(directory.dailyRetro, d);
 
                     return (
                       <div
@@ -863,6 +1188,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                             >
                               <Gavel size={11} /> {d.status}
                             </button>
+                            {fb?.rating === 'high' && (
+                              <span className="retro-star-chip">
+                                <Star size={10} fill="currentColor" /> Key
+                              </span>
+                            )}
                             {d.status === 'proposed' && (
                               <span className="daily-due-today-badge">Needs Sign-off</span>
                             )}
@@ -907,31 +1237,48 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                             Rationale: {renderInline(d.rationale)}
                           </div>
                         )}
+                        {fb?.comment && (
+                          <div className="retro-inline-comment" style={{ marginTop: 4 }}>
+                            <span>Retro note: {fb.comment}</span>
+                          </div>
+                        )}
                       </div>
                     );
                   })}
                 </div>
-              )}
-            </div>
-
-            {/* Recent Notes & Activity Rollup */}
-            <div className="surface-panel">
-              <div className="daily-panel-header">
-                <strong style={{ fontSize: 14.5 }}>
-                  Recent Notes &amp; Summaries ({dailyData.recentNotes.length})
-                </strong>
-                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                  Click any note card to open in editor
-                </span>
               </div>
+            )}
 
-              {dailyData.recentNotes.length === 0 ? (
-                <span style={{ color: 'var(--text-muted)', fontSize: 13 }}>
-                  No source notes in workspace yet.
-                </span>
-              ) : (
+            {/* High-Signal & Recent Notes (Filtered & Capped by Default) */}
+            {dailyData.visibleRecentNotes.length > 0 && (
+              <div className="surface-panel">
+                <div className="daily-panel-header">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <strong style={{ fontSize: 14.5 }}>
+                      High-Signal &amp; Recent Notes ({dailyData.visibleRecentNotes.length})
+                    </strong>
+                    {dailyData.hiddenLowSignalNotesCount > 0 && (
+                      <span className="due-chip">
+                        {dailyData.hiddenLowSignalNotesCount} low-signal muted
+                      </span>
+                    )}
+                  </div>
+
+                  {dailyData.visibleRecentNotes.length > 4 && (
+                    <button
+                      type="button"
+                      className="btn btn-xs btn-ghost no-print"
+                      onClick={() => setShowAllRecentNotes((v) => !v)}
+                    >
+                      {showAllRecentNotes
+                        ? 'Show top 4'
+                        : `Show all ${dailyData.visibleRecentNotes.length}`}
+                    </button>
+                  )}
+                </div>
+
                 <div className="report-notes-grid">
-                  {dailyData.recentNotes.map((n) => {
+                  {visibleNotesSlice.map((n) => {
                     const noteClient = n.clientId
                       ? directory.clients.find((c) => c.id === n.clientId)
                       : undefined;
@@ -946,11 +1293,14 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                       ])
                     );
                     const parsedItems = parseNoteItems(n, directory.people);
-                    const noteOpenTasks = parsedItems.tasks.filter((t) => t.status !== 'done').length;
+                    const noteOpenTasks = parsedItems.tasks.filter(
+                      (t) => t.status !== 'done'
+                    ).length;
+                    const fb = getNoteRetroFeedback(directory.dailyRetro, n.id);
                     const cleanPreview = stripMarkdownFormatting(n.body);
                     const snippet =
-                      cleanPreview.length > 210
-                        ? `${cleanPreview.slice(0, 210).trimEnd()}…`
+                      cleanPreview.length > 180
+                        ? `${cleanPreview.slice(0, 180).trimEnd()}…`
                         : cleanPreview;
                     const isToday =
                       n.date === todayDate || n.updatedAt.slice(0, 10) === todayDate;
@@ -975,6 +1325,11 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                             <span className="report-note-card-title">
                               {n.title || 'Untitled Note'}
                             </span>
+                            {fb?.rating === 'high' && (
+                              <span className="retro-star-chip">
+                                <Star size={10} fill="currentColor" /> High Signal
+                              </span>
+                            )}
                             {isToday && <span className="report-origin-badge">Today</span>}
                           </div>
 
@@ -1008,27 +1363,24 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                               </span>
                             ) : null}
 
-                            {parsedItems.decisions.length > 0 && (
-                              <span className="due-chip">
-                                {parsedItems.decisions.length} decision
-                                {parsedItems.decisions.length === 1 ? '' : 's'}
-                              </span>
-                            )}
                             {noteOpenTasks > 0 && (
-                              <span className="due-chip">{noteOpenTasks} open task(s)</span>
+                              <span className="due-chip">{noteOpenTasks} open</span>
                             )}
                             <span className="due-chip">{n.date}</span>
-                            <span className="report-note-open-hint no-print">
-                              <ExternalLink size={11} /> Open
-                            </span>
                           </div>
                         </div>
+
+                        {fb?.comment && (
+                          <div className="retro-inline-comment">
+                            <span>Takeaway: {fb.comment}</span>
+                          </div>
+                        )}
 
                         {snippet && <div className="report-note-card-snippet">{snippet}</div>}
 
                         {(noteLabels.length > 0 || notePeople.length > 0) && (
                           <div className="report-note-card-pills">
-                            {notePeople.slice(0, 5).map((pName) => (
+                            {notePeople.slice(0, 4).map((pName) => (
                               <button
                                 key={`p-${pName}`}
                                 type="button"
@@ -1041,7 +1393,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                                 @{pName}
                               </button>
                             ))}
-                            {noteLabels.slice(0, 6).map((lbl) => (
+                            {noteLabels.slice(0, 4).map((lbl) => (
                               <button
                                 key={`l-${lbl}`}
                                 type="button"
@@ -1060,8 +1412,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
                     );
                   })}
                 </div>
-              )}
-            </div>
+              </div>
+            )}
           </>
         ) : (
           <>

@@ -78,12 +78,66 @@ export interface ParsedDecision {
   labels: string[];
 }
 
+export type RetroSignalRating = 'high' | 'normal' | 'low';
+
+export type TaskHorizonBucket = 'today' | 'tomorrow' | 'this-week' | 'sometime' | 'date';
+
+export interface NoteRetroFeedback {
+  noteId: string;
+  rating: RetroSignalRating;
+  comment?: string;
+  reviewedDate: string; // YYYY-MM-DD
+  updatedAt: string; // ISO timestamp
+}
+
+export interface TaskRetroPlan {
+  key: string;
+  taskId?: string;
+  noteId: string;
+  taskText: string;
+  bucket: TaskHorizonBucket;
+  /** Target ISO date (YYYY-MM-DD) when bucket is 'tomorrow', 'date', or 'today' */
+  targetDate?: string | null;
+  /** End-of-horizon ISO date (YYYY-MM-DD) when bucket is 'this-week' */
+  untilDate?: string | null;
+  starred?: boolean;
+  comment?: string;
+  reviewedDate: string; // YYYY-MM-DD
+  updatedAt: string; // ISO timestamp
+}
+
+export interface DecisionRetroFeedback {
+  key: string;
+  decisionId?: string;
+  noteId: string;
+  decisionText: string;
+  rating: RetroSignalRating;
+  comment?: string;
+  reviewedDate: string; // YYYY-MM-DD
+  updatedAt: string; // ISO timestamp
+}
+
+export interface DailyRetroDayEntry {
+  date: string; // YYYY-MM-DD
+  steeringNote?: string;
+  completedAt?: string | null;
+  updatedAt: string; // ISO timestamp
+}
+
+export interface DailyRetroStore {
+  notes: Record<string, NoteRetroFeedback>;
+  tasks: Record<string, TaskRetroPlan>;
+  decisions: Record<string, DecisionRetroFeedback>;
+  days: Record<string, DailyRetroDayEntry>;
+}
+
 export interface WorkspaceDirectory {
   clients: Client[];
   projects: Project[];
   people: Person[];
   customLabels: string[];
   sensitiveTerms?: string[];
+  dailyRetro?: DailyRetroStore;
 }
 
 export type AiProviderType = 'local' | 'openai' | 'azure' | 'gemini' | 'anthropic';

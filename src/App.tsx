@@ -23,6 +23,7 @@ import {
   RotateCcw,
   Search,
   Settings,
+  Sparkles,
   Sun,
   Trash2,
   Upload,
@@ -32,6 +33,7 @@ import {
 import { AiSettingsModal, AiStructureModal } from './components/AiStructureModal';
 import { CommandPalette } from './components/CommandPalette';
 import { ContextTimeline } from './components/ContextTimeline';
+import { DailyRetroModal } from './components/DailyRetroModal';
 import {
   DecisionsGlobalView,
   PeopleDirectoryView,
@@ -57,7 +59,9 @@ import type {
   ParsedTask,
   Person,
   Project,
+  RetroSignalRating,
   SyncTombstones,
+  TaskHorizonBucket,
   TaskStatus,
   WorkspaceDirectory,
   WorkspacePreferences,
@@ -80,6 +84,15 @@ import {
   type PersistedDailyBriefingState,
   saveDailyBriefingState,
 } from './utils/dailyBriefing';
+import {
+  addDaysIso,
+  isTaskActivelyOverdue,
+  resolveEffectiveTaskHorizon,
+  upsertDailyRetroDayInDirectory,
+  upsertDecisionRetroInDirectory,
+  upsertNoteRetroInDirectory,
+  upsertTaskRetroInDirectory,
+} from './utils/dailyRetro';
 import {
   consumeUrlGoogleDriveParams,
   GoogleDriveDirectoryHandle,
@@ -289,6 +302,7 @@ export function App() {
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [showCommandPalette, setShowCommandPalette] = useState(false);
   const [showSyncModal, setShowSyncModal] = useState(false);
+  const [showDailyRetro, setShowDailyRetro] = useState(false);
 
   // Local / OneDrive / Google Drive Folder Sync State
   const [dirHandle, setDirHandle] = useState<FsDirectoryHandle | null>(null);
@@ -1053,7 +1067,8 @@ export function App() {
         showCommandPalette ||
         showAiStructure ||
         showAiSettings ||
-        document.querySelector('.modal-backdrop, .lightbox-backdrop')
+        showDailyRetro ||
+        document.querySelector('.modal-backdrop, .lightbox-backdrop, .retro-backdrop')
       ) {
         return;
       }
@@ -1154,6 +1169,7 @@ export function App() {
     showAiSettings,
     showAiStructure,
     showCommandPalette,
+    showDailyRetro,
     workspaceToast,
   ]);
 
@@ -1258,7 +1274,11 @@ export function App() {
       for (const t of items.tasks) {
         if (t.status !== 'done') {
           openTasks++;
-          if (t.dueDate && t.dueDate <= today) {
+          if (
+            isTaskActivelyOverdue(t, directory.dailyRetro, today) ||
+            (t.dueDate === today &&
+              resolveEffectiveTaskHorizon(t, directory.dailyRetro, today) === 'today')
+          ) {
             dailyUrgentCount++;
           }
         }
@@ -1266,7 +1286,7 @@ export function App() {
       totalDecisions += items.decisions.length;
     }
     return { openTasks, totalDecisions, inboxCount, dailyUrgentCount };
-  }, [notes, directory.people]);
+  }, [notes, directory.people, directory.dailyRetro]);
 
   const filteredNotesList = useMemo(() => {
     const q = listSearch.trim().toLowerCase();
@@ -1944,6 +1964,159 @@ export function App() {
       commitNoteToStateAndDisk({ ...target, body: nextBody, updatedAt: new Date().toISOString() });
     },
     [notes, commitNoteToStateAndDisk, pushWorkspaceHistory]
+  );
+
+  const handleRateNoteRetro = useCallback(
+    (noteId: string, rating: RetroSignalRating, comment?: string) => {
+      const today = getTodayDateString();
+      setDirectory((prev) => {
+        const next = upsertNoteRetroInDirectory(prev, {
+          noteId,
+          rating,
+          comment,
+          todayDate: today,
+        });
+        directoryRef.current = next;
+        return next;
+      });
+    },
+    []
+  );
+
+  const handleTriageTaskRetro = useCallback(
+    (
+      task: ParsedTask,
+      updates: {
+        bucket?: TaskHorizonBucket;
+        targetDate?: string | null;
+        starred?: boolean;
+        comment?: string;
+        status?: TaskStatus;
+      }
+    ) => {
+      const today = getTodayDateString();
+      const targetNote = notesRef.current.find((n) => n.id === task.noteId);
+
+      // Two-way sync status & concrete date changes back to source .md note
+      if (targetNote) {
+        let nextDueDateUpdate: string | null | undefined = undefined;
+        if (updates.bucket === 'tomorrow') {
+          nextDueDateUpdate = updates.targetDate || addDaysIso(today, 1);
+        } else if (updates.bucket === 'date' && updates.targetDate) {
+          nextDueDateUpdate = updates.targetDate;
+        } else if (
+          (updates.bucket === 'sometime' || updates.bucket === 'this-week') &&
+          task.dueDate &&
+          task.dueDate < today
+        ) {
+          // Clear stale past overdue deadline when user explicitly moves task to This Week or Sometime
+          nextDueDateUpdate = null;
+        }
+
+        if (updates.status !== undefined || nextDueDateUpdate !== undefined) {
+          const nextBody = updateTaskInBody(targetNote.body, task.lineIndex, {
+            ...(updates.status !== undefined ? { status: updates.status } : {}),
+            ...(nextDueDateUpdate !== undefined ? { dueDate: nextDueDateUpdate } : {}),
+          });
+          if (nextBody !== targetNote.body) {
+            commitNoteToStateAndDisk({
+              ...targetNote,
+              body: nextBody,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
+      if (
+        updates.bucket !== undefined ||
+        updates.starred !== undefined ||
+        updates.comment !== undefined
+      ) {
+        setDirectory((prev) => {
+          const next = upsertTaskRetroInDirectory(prev, task, {
+            bucket: updates.bucket,
+            targetDate: updates.targetDate,
+            starred: updates.starred,
+            comment: updates.comment,
+            todayDate: today,
+          });
+          directoryRef.current = next;
+          return next;
+        });
+      }
+    },
+    [commitNoteToStateAndDisk]
+  );
+
+  const handleReviewDecisionRetro = useCallback(
+    (
+      decision: ParsedDecision,
+      updates: {
+        rating?: RetroSignalRating;
+        comment?: string;
+        status?: DecisionStatus;
+      }
+    ) => {
+      const today = getTodayDateString();
+      if (updates.status !== undefined && updates.status !== decision.status) {
+        const targetNote = notesRef.current.find((n) => n.id === decision.noteId);
+        if (targetNote) {
+          const nextBody = updateDecisionInBody(targetNote.body, decision.lineIndex, {
+            status: updates.status,
+          });
+          if (nextBody !== targetNote.body) {
+            commitNoteToStateAndDisk({
+              ...targetNote,
+              body: nextBody,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
+      if (updates.rating !== undefined || updates.comment !== undefined) {
+        setDirectory((prev) => {
+          const next = upsertDecisionRetroInDirectory(prev, decision, {
+            rating: updates.rating,
+            comment: updates.comment,
+            todayDate: today,
+          });
+          directoryRef.current = next;
+          return next;
+        });
+      }
+    },
+    [commitNoteToStateAndDisk]
+  );
+
+  const handleSaveRetroSteering = useCallback((steeringNote: string) => {
+    const today = getTodayDateString();
+    setDirectory((prev) => {
+      const next = upsertDailyRetroDayInDirectory(prev, {
+        todayDate: today,
+        steeringNote,
+      });
+      directoryRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const handleCompleteDailyRetro = useCallback(
+    async (steeringNote: string) => {
+      const today = getTodayDateString();
+      const nextDir = upsertDailyRetroDayInDirectory(directoryRef.current, {
+        todayDate: today,
+        steeringNote,
+        markCompleted: true,
+      });
+      directoryRef.current = nextDir;
+      setDirectory(nextDir);
+      setShowDailyRetro(false);
+      showToastMessage('Daily Retro saved — refreshing Daily Brief', null);
+      await handleRefreshDailyBriefing(7);
+    },
+    [handleRefreshDailyBriefing, showToastMessage]
   );
 
   const runFullWorkspaceSync = useCallback(
@@ -3336,6 +3509,10 @@ export function App() {
             isRefreshingDailyBriefing={isRefreshingDailyBriefing}
             onRefreshDailyBriefing={handleRefreshDailyBriefing}
             onOpenDailyReportNote={handleOpenDailyReportNote}
+            onOpenDailyRetro={() => setShowDailyRetro(true)}
+            onTriageTaskHorizon={(task, bucket, targetDate) =>
+              handleTriageTaskRetro(task, { bucket, targetDate })
+            }
             onModeChange={(nextMode) => {
               setReportInitialFilter((prev) => ({ ...prev, mode: nextMode }));
             }}
@@ -3432,6 +3609,22 @@ export function App() {
           New Note
         </button>
       )}
+
+      {/* Mobile Floating Commuter Daily Retro Action on Daily Brief */}
+      {isMobile &&
+        mainView === 'reports' &&
+        reportInitialFilter.mode !== 'explorer' &&
+        !showDailyRetro && (
+          <button
+            type="button"
+            className="mobile-fab no-print"
+            onClick={() => setShowDailyRetro(true)}
+            aria-label="Start Daily Retro"
+          >
+            <Sparkles size={17} />
+            Daily Retro
+          </button>
+        )}
 
       {/* Mobile Bottom Navigation Bar */}
       <nav className="mobile-bottom-nav no-print" aria-label="Primary Mobile Navigation">
@@ -3555,7 +3748,13 @@ export function App() {
           directory={directory}
           allLabels={allWorkspaceLabels}
           aiConfig={aiConfig}
-          suspendEscape={showCommandPalette || showAiStructure || showAiSettings || showSyncModal}
+          suspendEscape={
+            showCommandPalette ||
+            showAiStructure ||
+            showAiSettings ||
+            showSyncModal ||
+            showDailyRetro
+          }
           onNotify={(msg) => showToastMessage(msg, null)}
           onBack={popOverlay}
           onClose={closeOverlay}
@@ -3780,6 +3979,7 @@ export function App() {
             setReportInitialFilter({ mode: 'daily' });
             switchPrimaryView('reports');
           }}
+          onOpenDailyRetro={() => setShowDailyRetro(true)}
           onOpenDailyReportNote={handleOpenDailyReportNote}
           onTriggerAiStructure={() => {
             switchPrimaryView('notes');
@@ -3808,6 +4008,22 @@ export function App() {
           onRedoWorkspace={() => {
             handleRedoWorkspace();
           }}
+        />
+      )}
+
+      {showDailyRetro && (
+        <DailyRetroModal
+          notes={notes}
+          directory={directory}
+          todayDate={getTodayDateString()}
+          isRefreshingBriefing={isRefreshingDailyBriefing}
+          onClose={() => setShowDailyRetro(false)}
+          onOpenNote={openNoteEditor}
+          onRateNote={handleRateNoteRetro}
+          onTriageTask={handleTriageTaskRetro}
+          onReviewDecision={handleReviewDecisionRetro}
+          onSaveSteeringNote={handleSaveRetroSteering}
+          onCompleteRetro={handleCompleteDailyRetro}
         />
       )}
     </div>
